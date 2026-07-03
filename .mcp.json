@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "mcp-docs-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@assistant-ui/mcp-docs-server"
+      ]
+    },
+    "aws-api": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "awslabs.aws-api-mcp-server@latest"
+      ],
+      "env": {
+        "AWS_REGION": "us-east-2"
+      }
+    }
+  }
+}

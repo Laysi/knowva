@@ -1,0 +1,24 @@
+[package]
+name = "km-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.103"
+aws-config = { version = "1.8.18", features = ["behavior-version-latest", "credentials-login"] }
+aws-sdk-bedrockruntime = "1.135.0"
+axum = { version = "0.8.9", features = ["multipart"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+dotenvy = "0.15.7"
+futures = "0.3.32"
+pgvector = { version = "0.4.2", features = ["sqlx"] }
+regex = "1.11.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate"] }
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-stream = "0.1.18"
+tower-http = { version = "0.7.0", features = ["fs", "cors", "limit"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+uuid = { version = "1.23.4", features = ["v4", "serde"] }
