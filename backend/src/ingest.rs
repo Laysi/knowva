@@ -1,7 +1,7 @@
 use crate::AppState;
+use axum::Json;
 use axum::extract::{Multipart, Path as AxumPath, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -9,7 +9,7 @@ use uuid::Uuid;
 const MAX_CHUNK_CHARS: usize = 2000;
 const HARD_MAX_CHUNK_CHARS: usize = 3000;
 const OVERLAP_CHARS: usize = 200;
-// Bedrock Converse caps document blocks at 4.5MB; stay under it with a friendly error.
+// Keep legacy image transcription payloads bounded until page-based ingestion replaces this path.
 const MAX_TRANSCRIBE_BYTES: usize = 4_000_000;
 
 #[derive(Debug, Serialize)]
@@ -41,9 +41,9 @@ pub async fn upload_document(
         }
     }
 
-    let file_bytes = file_bytes.ok_or((StatusCode::BAD_REQUEST, "missing file field".to_string()))?;
-    let original_filename =
-        original_filename.unwrap_or_else(|| "upload".to_string());
+    let file_bytes =
+        file_bytes.ok_or((StatusCode::BAD_REQUEST, "missing file field".to_string()))?;
+    let original_filename = original_filename.unwrap_or_else(|| "upload".to_string());
 
     let id = Uuid::new_v4();
     let ext = std::path::Path::new(&original_filename)
@@ -124,7 +124,7 @@ async fn process_document(state: Arc<AppState>, id: Uuid, storage_path: String, 
                 .await;
                 return;
             }
-            match state.llm.transcribe_file(&ext, bytes).await {
+            match state.models.transcribe_file(&ext, bytes).await {
                 Ok(md) => {
                     // Models often wrap the transcript in a ```markdown fence despite the prompt.
                     let md = strip_code_fences(&md);
@@ -156,7 +156,7 @@ async fn process_document(state: Arc<AppState>, id: Uuid, storage_path: String, 
 
     // Step 3: embeddings + insert.
     for (idx, chunk) in chunks.iter().enumerate() {
-        let embedding = match state.llm.embed_passage(chunk).await {
+        let embedding = match state.models.embed_passage(chunk).await {
             Ok(v) => v,
             Err(e) => {
                 set_failed(&state, id, &format!("embedding failed: {e}")).await;
@@ -183,14 +183,13 @@ async fn process_document(state: Arc<AppState>, id: Uuid, storage_path: String, 
     // Step 4: summary + tags (best-effort).
     let (summary, tags) = generate_summary_and_tags(&state, &markdown).await;
 
-    let update_result = sqlx::query(
-        "UPDATE documents SET status = 'ready', summary = $2, tags = $3 WHERE id = $1",
-    )
-    .bind(id)
-    .bind(summary)
-    .bind(tags)
-    .execute(&state.pool)
-    .await;
+    let update_result =
+        sqlx::query("UPDATE documents SET status = 'ready', summary = $2, tags = $3 WHERE id = $1")
+            .bind(id)
+            .bind(summary)
+            .bind(tags)
+            .execute(&state.pool)
+            .await;
 
     if let Err(e) = update_result {
         set_failed(&state, id, &format!("final update failed: {e}")).await;
@@ -254,10 +253,7 @@ fn chunk_markdown(markdown: &str) -> Vec<String> {
             continue;
         }
         let combined_len = current.chars().count() + section.chars().count();
-        if combined_len <= MAX_CHUNK_CHARS {
-            current.push('\n');
-            current.push_str(&section);
-        } else if combined_len <= HARD_MAX_CHUNK_CHARS {
+        if combined_len <= HARD_MAX_CHUNK_CHARS {
             current.push('\n');
             current.push_str(&section);
         } else {
@@ -269,7 +265,10 @@ fn chunk_markdown(markdown: &str) -> Vec<String> {
         merged.push(current);
     }
 
-    merged.into_iter().filter(|c| !c.trim().is_empty()).collect()
+    merged
+        .into_iter()
+        .filter(|c| !c.trim().is_empty())
+        .collect()
 }
 
 fn split_oversized(section: &str) -> Vec<String> {
@@ -301,7 +300,10 @@ fn split_oversized(section: &str) -> Vec<String> {
         while current.chars().count() > HARD_MAX_CHUNK_CHARS {
             let take_count = MAX_CHUNK_CHARS;
             let piece: String = current.chars().take(take_count).collect();
-            let remainder: String = current.chars().skip(take_count.saturating_sub(OVERLAP_CHARS)).collect();
+            let remainder: String = current
+                .chars()
+                .skip(take_count.saturating_sub(OVERLAP_CHARS))
+                .collect();
             result.push(piece);
             current = remainder;
         }
@@ -322,8 +324,8 @@ async fn generate_summary_and_tags(
     );
 
     let result = state
-        .llm
-        .converse_once(crate::llm::SYSTEM_PROMPT, &prompt)
+        .models
+        .chat_once(crate::cloud_models::SYSTEM_PROMPT, &prompt)
         .await;
 
     let raw = match result {
@@ -407,10 +409,10 @@ pub async fn delete_document(
     if let Ok(mut entries) = tokio::fs::read_dir(&state.files_dir).await {
         let prefix = format!("{id}.");
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&prefix) {
-                    let _ = tokio::fs::remove_file(entry.path()).await;
-                }
+            if let Some(name) = entry.file_name().to_str()
+                && name.starts_with(&prefix)
+            {
+                let _ = tokio::fs::remove_file(entry.path()).await;
             }
         }
     }

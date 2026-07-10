@@ -18,7 +18,7 @@ pub struct SourceRef {
 
 /// Embeds the query text and retrieves the top-8 most similar chunks from ready documents.
 pub async fn retrieve(state: &AppState, query: &str) -> anyhow::Result<Vec<RetrievedChunk>> {
-    let embedding = state.llm.embed_query(query).await?;
+    let embedding = state.models.embed_query(query).await?;
     let vector = pgvector::Vector::from(embedding);
 
     let rows = sqlx::query_as::<_, RetrievedChunk>(
@@ -38,12 +38,17 @@ pub async fn retrieve(state: &AppState, query: &str) -> anyhow::Result<Vec<Retri
 /// Builds the RAG-augmented system prompt from retrieved chunks.
 pub fn build_rag_system_prompt(chunks: &[RetrievedChunk]) -> String {
     let mut prompt = String::new();
-    prompt.push_str(crate::llm::SYSTEM_PROMPT);
+    prompt.push_str(crate::cloud_models::SYSTEM_PROMPT);
     prompt.push_str(
         "\n\n以下是知識庫檢索到的段落,回答時優先依據這些內容,並在回答中標註出處檔名;若段落與問題無關或不足,請直接說明知識庫沒有相關資料。\n\n",
     );
     for (i, chunk) in chunks.iter().enumerate() {
-        prompt.push_str(&format!("[{}] {}\n{}\n\n", i + 1, chunk.filename, chunk.content));
+        prompt.push_str(&format!(
+            "[{}] {}\n{}\n\n",
+            i + 1,
+            chunk.filename,
+            chunk.content
+        ));
     }
     prompt
 }
