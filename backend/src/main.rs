@@ -1,13 +1,15 @@
 mod bedrock;
 mod ingest;
+mod llm;
+mod nvidia;
 mod search;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use bedrock::{ChatMessage, SseEvent};
 use futures::StreamExt;
+use llm::{ChatMessage, Llm, SseEvent};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -22,9 +24,7 @@ use tower_http::services::{ServeDir, ServeFile};
 #[derive(Clone)]
 pub struct AppState {
     pool: PgPool,
-    bedrock_client: aws_sdk_bedrockruntime::Client,
-    chat_model_id: String,
-    embed_model_id: String,
+    llm: Llm,
     files_dir: String,
 }
 
@@ -36,10 +36,6 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://km:km@localhost:5432/km".to_string());
-    let chat_model_id = std::env::var("BEDROCK_CHAT_MODEL_ID")
-        .unwrap_or_else(|_| "us.amazon.nova-2-lite-v1:0".to_string());
-    let embed_model_id = std::env::var("BEDROCK_EMBED_MODEL_ID")
-        .unwrap_or_else(|_| "amazon.titan-embed-text-v2:0".to_string());
     let files_dir = std::env::var("FILES_DIR").unwrap_or_else(|_| "./data/files".to_string());
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -53,14 +49,66 @@ async fn main() -> anyhow::Result<()> {
 
     sqlx::migrate!().run(&pool).await?;
 
-    let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let bedrock_client = aws_sdk_bedrockruntime::Client::new(&aws_config);
+    let provider = std::env::var("MODEL_PROVIDER").unwrap_or_else(|_| "bedrock".to_string());
+    let llm = match provider.as_str() {
+        "bedrock" => {
+            let chat_model = std::env::var("BEDROCK_CHAT_MODEL_ID")
+                .unwrap_or_else(|_| "us.amazon.nova-2-lite-v1:0".to_string());
+            let embed_model = std::env::var("BEDROCK_EMBED_MODEL_ID")
+                .unwrap_or_else(|_| "amazon.titan-embed-text-v2:0".to_string());
+            let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let client = aws_sdk_bedrockruntime::Client::new(&aws_config);
+            tracing::info!(
+                "model provider: bedrock (chat={chat_model}, embed={embed_model})"
+            );
+            Llm::Bedrock {
+                client,
+                chat_model,
+                embed_model,
+            }
+        }
+        "nvidia" => {
+            let api_key = std::env::var("NVIDIA_API_KEY").unwrap_or_default();
+            if api_key.trim().is_empty() {
+                anyhow::bail!(
+                    "MODEL_PROVIDER=nvidia requires NVIDIA_API_KEY to be set in .env (get one at build.nvidia.com)"
+                );
+            }
+            let chat_model = std::env::var("NVIDIA_CHAT_MODEL")
+                .unwrap_or_else(|_| "nvidia/nemotron-3-super-120b-a12b".to_string());
+            let embed_model = std::env::var("NVIDIA_EMBED_MODEL")
+                .unwrap_or_else(|_| "nvidia/llama-nemotron-embed-1b-v2".to_string());
+            // Empty = don't send `dimensions` (natively-1024 models reject the field).
+            let embed_dimensions = match std::env::var("NVIDIA_EMBED_DIMENSIONS") {
+                Ok(s) if s.trim().is_empty() => None,
+                Ok(s) => Some(s.trim().parse::<u32>().map_err(|_| {
+                    anyhow::anyhow!("NVIDIA_EMBED_DIMENSIONS must be a number or empty, got {s:?}")
+                })?),
+                Err(_) => Some(1024),
+            };
+            let base_url = std::env::var("NVIDIA_BASE_URL")
+                .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
+            tracing::info!(
+                "model provider: nvidia (chat={chat_model}, embed={embed_model}, dims={embed_dimensions:?}, base_url={base_url})"
+            );
+            Llm::Nvidia(nvidia::NvidiaClient::new(
+                api_key,
+                base_url,
+                chat_model,
+                embed_model,
+                embed_dimensions,
+            ))
+        }
+        other => {
+            anyhow::bail!(
+                "invalid MODEL_PROVIDER={other:?}; valid values are \"bedrock\" or \"nvidia\""
+            );
+        }
+    };
 
     let state = Arc::new(AppState {
         pool,
-        bedrock_client,
-        chat_model_id,
-        embed_model_id,
+        llm,
         files_dir,
     });
 
@@ -136,8 +184,7 @@ async fn chat(
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
 
-    let client = state.bedrock_client.clone();
-    let model_id = state.chat_model_id.clone();
+    let llm = state.llm.clone();
 
     let last_user_text = req
         .messages
@@ -148,7 +195,10 @@ async fn chat(
 
     tokio::spawn(async move {
         let retrieval = match &last_user_text {
-            Some(text) if !text.trim().is_empty() => search::retrieve(&state, text).await.ok(),
+            Some(text) if !text.trim().is_empty() => search::retrieve(&state, text)
+                .await
+                .map_err(|e| tracing::warn!("retrieval failed, falling back to plain chat: {e}"))
+                .ok(),
             _ => None,
         };
 
@@ -158,13 +208,11 @@ async fn chat(
                 let sources = search::dedupe_sources(&chunks);
 
                 let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
-                let stream_task = tokio::spawn(bedrock::stream_chat_with_system(
-                    client,
-                    model_id,
-                    system_prompt,
-                    req.messages,
-                    inner_tx,
-                ));
+                let llm2 = llm.clone();
+                let stream_task = tokio::spawn(async move {
+                    llm2.stream_chat_with_system(system_prompt, req.messages, inner_tx)
+                        .await
+                });
 
                 while let Some(event) = inner_rx.recv().await {
                     match event {
@@ -186,7 +234,7 @@ async fn chat(
                 let _ = stream_task.await;
             }
             _ => {
-                bedrock::stream_chat(client, model_id, req.messages, tx).await;
+                llm.stream_chat(req.messages, tx).await;
             }
         }
     });

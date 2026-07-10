@@ -1,4 +1,3 @@
-use crate::bedrock;
 use crate::AppState;
 use axum::extract::{Multipart, Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -10,6 +9,8 @@ use uuid::Uuid;
 const MAX_CHUNK_CHARS: usize = 2000;
 const HARD_MAX_CHUNK_CHARS: usize = 3000;
 const OVERLAP_CHARS: usize = 200;
+// Bedrock Converse caps document blocks at 4.5MB; stay under it with a friendly error.
+const MAX_TRANSCRIBE_BYTES: usize = 4_000_000;
 
 #[derive(Debug, Serialize)]
 pub struct UploadResponse {
@@ -105,19 +106,40 @@ async fn process_document(state: Arc<AppState>, id: Uuid, storage_path: String, 
                 return;
             }
         },
-        _ => match run_markitdown(&storage_path).await {
-            Ok(md) => {
-                let md_path = derive_md_path(&storage_path);
-                if let Err(e) = tokio::fs::write(&md_path, &md).await {
-                    tracing::warn!("failed to write converted markdown for {id}: {e}");
+        // Everything else goes to the multimodal model as-is (VLM transcription).
+        _ => {
+            let bytes = match tokio::fs::read(&storage_path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    set_failed(&state, id, &format!("failed to read file: {e}")).await;
+                    return;
                 }
-                md
-            }
-            Err(e) => {
-                set_failed(&state, id, &e).await;
+            };
+            if bytes.len() > MAX_TRANSCRIBE_BYTES {
+                set_failed(
+                    &state,
+                    id,
+                    "檔案超過 4MB 上限(模型直讀限制),請壓縮或拆分後再上傳",
+                )
+                .await;
                 return;
             }
-        },
+            match state.llm.transcribe_file(&ext, bytes).await {
+                Ok(md) => {
+                    // Models often wrap the transcript in a ```markdown fence despite the prompt.
+                    let md = strip_code_fences(&md);
+                    let md_path = derive_md_path(&storage_path);
+                    if let Err(e) = tokio::fs::write(&md_path, &md).await {
+                        tracing::warn!("failed to write converted markdown for {id}: {e}");
+                    }
+                    md
+                }
+                Err(e) => {
+                    set_failed(&state, id, &e.to_string()).await;
+                    return;
+                }
+            }
+        }
     };
 
     if markdown.trim().is_empty() {
@@ -134,14 +156,13 @@ async fn process_document(state: Arc<AppState>, id: Uuid, storage_path: String, 
 
     // Step 3: embeddings + insert.
     for (idx, chunk) in chunks.iter().enumerate() {
-        let embedding =
-            match bedrock::embed_text(&state.bedrock_client, &state.embed_model_id, chunk).await {
-                Ok(v) => v,
-                Err(e) => {
-                    set_failed(&state, id, &format!("embedding failed: {e}")).await;
-                    return;
-                }
-            };
+        let embedding = match state.llm.embed_passage(chunk).await {
+            Ok(v) => v,
+            Err(e) => {
+                set_failed(&state, id, &format!("embedding failed: {e}")).await;
+                return;
+            }
+        };
         let vector = pgvector::Vector::from(embedding);
 
         if let Err(e) = sqlx::query(
@@ -181,51 +202,6 @@ fn derive_md_path(storage_path: &str) -> String {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("doc");
     let parent = path.parent().and_then(|p| p.to_str()).unwrap_or(".");
     format!("{parent}/{stem}.md")
-}
-
-async fn run_markitdown(storage_path: &str) -> Result<String, String> {
-    let candidates = ["markitdown", "~/.local/bin/markitdown"];
-    let home = std::env::var("HOME").unwrap_or_default();
-
-    for candidate in candidates {
-        let bin = if candidate.starts_with("~/") {
-            format!("{home}/{}", &candidate[2..])
-        } else {
-            candidate.to_string()
-        };
-
-        let output = tokio::process::Command::new(&bin)
-            .arg(storage_path)
-            .output()
-            .await;
-
-        match output {
-            Ok(out) => {
-                if out.status.success() && !out.stdout.is_empty() {
-                    return Ok(String::from_utf8_lossy(&out.stdout).to_string());
-                } else {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let snippet: String = stderr.chars().take(500).collect();
-                    return Err(format!(
-                        "markitdown exited with {}: {}",
-                        out.status,
-                        if snippet.is_empty() {
-                            "(no stderr, empty output)".to_string()
-                        } else {
-                            snippet
-                        }
-                    ));
-                }
-            }
-            Err(e) => {
-                // Binary not found at this candidate path; try next.
-                tracing::debug!("markitdown candidate {bin} unavailable: {e}");
-                continue;
-            }
-        }
-    }
-
-    Err("markitdown binary not found in PATH or ~/.local/bin".to_string())
 }
 
 /// Split markdown by headings, merge adjacent sections up to ~2000 chars (hard max 3000),
@@ -345,13 +321,10 @@ async fn generate_summary_and_tags(
         "請閱讀以下文件內容,並以嚴格 JSON 格式回覆(不要加任何說明文字或 markdown 標記),格式為 {{\"summary\":\"繁體中文,100字以內\",\"tags\":[\"3到6個繁體中文短標籤\"]}}。\n\n文件內容:\n{excerpt}"
     );
 
-    let result = bedrock::converse_once(
-        &state.bedrock_client,
-        &state.chat_model_id,
-        bedrock::SYSTEM_PROMPT,
-        &prompt,
-    )
-    .await;
+    let result = state
+        .llm
+        .converse_once(crate::llm::SYSTEM_PROMPT, &prompt)
+        .await;
 
     let raw = match result {
         Ok(text) => text,
@@ -363,7 +336,17 @@ async fn generate_summary_and_tags(
 
     let cleaned = strip_code_fences(&raw);
 
-    match serde_json::from_str::<serde_json::Value>(&cleaned) {
+    // Models sometimes preface/suffix the JSON with chatter; salvage the outermost {...} span.
+    let parsed = serde_json::from_str::<serde_json::Value>(&cleaned).or_else(|e| {
+        match (cleaned.find('{'), cleaned.rfind('}')) {
+            (Some(start), Some(end)) if start < end => {
+                serde_json::from_str::<serde_json::Value>(&cleaned[start..=end])
+            }
+            _ => Err(e),
+        }
+    });
+
+    match parsed {
         Ok(value) => {
             let summary = value
                 .get("summary")
@@ -386,7 +369,11 @@ async fn generate_summary_and_tags(
 fn strip_code_fences(text: &str) -> String {
     let trimmed = text.trim();
     if let Some(rest) = trimmed.strip_prefix("```") {
-        let rest = rest.trim_start_matches("json").trim_start();
+        // Drop the language tag (json, markdown, …) that may sit right after the fence,
+        // with or without a following newline.
+        let rest = rest
+            .trim_start_matches(|c: char| c.is_ascii_alphanumeric())
+            .trim_start();
         if let Some(end) = rest.rfind("```") {
             return rest[..end].trim().to_string();
         }

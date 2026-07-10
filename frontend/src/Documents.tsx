@@ -165,7 +165,7 @@ export const Documents = () => {
           </span>
           <div className="dropzone-text">
             <strong>{uploading ? "上傳與解析中…" : "拖曳檔案到這裡,或點擊選擇檔案"}</strong>
-            <span>支援 PDF、Word、Excel、PowerPoint、TXT、Markdown</span>
+            <span>支援 PDF、Word、Excel、CSV、HTML、圖片、TXT/MD(單檔 ≤ 4MB;PPT 請先匯出 PDF)</span>
           </div>
         </div>
 

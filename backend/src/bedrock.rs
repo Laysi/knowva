@@ -1,33 +1,15 @@
 use anyhow::{anyhow, Result};
 use aws_sdk_bedrockruntime::primitives::Blob;
+use aws_sdk_bedrockruntime::error::DisplayErrorContext;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ContentBlockDelta, ConversationRole, ConverseStreamOutput, Message,
-    SystemContentBlock,
+    ContentBlock, ContentBlockDelta, ConversationRole, ConverseStreamOutput, DocumentBlock,
+    DocumentFormat, DocumentSource, ImageBlock, ImageFormat, ImageSource, InferenceConfiguration,
+    Message, SystemContentBlock,
 };
 use aws_sdk_bedrockruntime::Client as BedrockClient;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 
-pub const SYSTEM_PROMPT: &str = "你是企業內部的 AI 知識管理助理,依據知識庫內容協助回答問題與整理資訊。一律使用繁體中文回答。";
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-pub enum SseEvent {
-    #[serde(rename = "text-delta")]
-    TextDelta { text: String },
-    #[serde(rename = "sources")]
-    Sources { sources: Vec<crate::search::SourceRef> },
-    #[serde(rename = "done")]
-    Done,
-    #[serde(rename = "error")]
-    Error { message: String },
-}
+use crate::llm::{ChatMessage, SseEvent};
 
 fn to_bedrock_message(msg: &ChatMessage) -> Message {
     let role = if msg.role == "assistant" {
@@ -44,16 +26,6 @@ fn to_bedrock_message(msg: &ChatMessage) -> Message {
 
 /// Drives a ConverseStream call, sending SSE-shaped events into `tx`.
 /// Never panics; all failures are surfaced as `SseEvent::Error`.
-pub async fn stream_chat(
-    client: BedrockClient,
-    model_id: String,
-    messages: Vec<ChatMessage>,
-    tx: Sender<SseEvent>,
-) {
-    stream_chat_with_system(client, model_id, SYSTEM_PROMPT.to_string(), messages, tx).await
-}
-
-/// Same as `stream_chat` but with a caller-supplied system prompt (used for RAG-augmented chat).
 pub async fn stream_chat_with_system(
     client: BedrockClient,
     model_id: String,
@@ -111,9 +83,6 @@ pub async fn stream_chat_with_system(
     }
 }
 
-#[allow(dead_code)]
-pub type BedrockResult<T> = Result<T>;
-
 /// Calls Titan Text Embeddings V2 via invoke_model, returns the 1024-dim embedding.
 pub async fn embed_text(
     client: &BedrockClient,
@@ -149,6 +118,88 @@ pub async fn embed_text(
         .collect();
 
     Ok(vec)
+}
+
+/// Transcribes an uploaded file into Markdown by sending it to the multimodal model as a
+/// Converse document/image block — no local conversion tooling involved.
+pub async fn transcribe_file(
+    client: &BedrockClient,
+    model_id: &str,
+    ext: &str,
+    bytes: Vec<u8>,
+) -> Result<String> {
+    let content = match ext {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => {
+            let format = match ext {
+                "png" => ImageFormat::Png,
+                "jpg" | "jpeg" => ImageFormat::Jpeg,
+                "gif" => ImageFormat::Gif,
+                _ => ImageFormat::Webp,
+            };
+            ContentBlock::Image(
+                ImageBlock::builder()
+                    .format(format)
+                    .source(ImageSource::Bytes(Blob::new(bytes)))
+                    .build()?,
+            )
+        }
+        _ => {
+            let format = match ext {
+                "pdf" => DocumentFormat::Pdf,
+                "doc" => DocumentFormat::Doc,
+                "docx" => DocumentFormat::Docx,
+                "xls" => DocumentFormat::Xls,
+                "xlsx" => DocumentFormat::Xlsx,
+                "csv" => DocumentFormat::Csv,
+                "html" | "htm" => DocumentFormat::Html,
+                _ => {
+                    return Err(anyhow!(
+                        "不支援的檔案格式 .{ext}(支援 PDF、Word、Excel、CSV、HTML、PNG/JPG/GIF/WebP、Markdown、TXT;PPT 請先匯出為 PDF)"
+                    ));
+                }
+            };
+            // Bedrock restricts document names to a narrow character set; use a fixed safe name.
+            ContentBlock::Document(
+                DocumentBlock::builder()
+                    .format(format)
+                    .name("document")
+                    .source(DocumentSource::Bytes(Blob::new(bytes)))
+                    .build()?,
+            )
+        }
+    };
+
+    let message = Message::builder()
+        .role(ConversationRole::User)
+        .content(content)
+        .content(ContentBlock::Text(crate::llm::TRANSCRIBE_PROMPT.to_string()))
+        .build()?;
+
+    let output = client
+        .converse()
+        .model_id(model_id)
+        .messages(message)
+        .inference_config(
+            InferenceConfiguration::builder()
+                .max_tokens(8000)
+                .temperature(0.1)
+                .build(),
+        )
+        .send()
+        .await
+        .map_err(|e| anyhow!("converse (transcribe) failed: {}", DisplayErrorContext(&e)))?;
+
+    let text = output
+        .output
+        .and_then(|o| o.as_message().ok().cloned())
+        .and_then(|m| {
+            m.content
+                .into_iter()
+                .find_map(|c| c.as_text().ok().cloned())
+        })
+        .ok_or_else(|| anyhow!("no text content in transcribe response"))?;
+
+    Ok(text)
 }
 
 /// One-shot (non-streaming) Converse call, used for summary/tags generation.

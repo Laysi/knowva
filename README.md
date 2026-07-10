@@ -5,7 +5,7 @@
 
 ## 功能
 
-- **文件處理管線**:上傳後自動以 markitdown 轉 Markdown → 標題感知切塊 → Titan 向量化 → 寫入 pgvector;並由 LLM 產生文件摘要與標籤
+- **文件處理管線**:上傳後由多模態模型直讀轉錄為 Markdown(PDF/Word/Excel/CSV/HTML/圖片)→ 標題感知切塊 → 向量化 → 寫入 pgvector;並由 LLM 產生文件摘要與標籤
 - **RAG 問答**:pgvector 餘弦相似度 top-8 檢索,Nova 2 Lite 串流回答,結尾附引用來源;知識庫無資料時自動退回一般對話
 - **文件管理**:處理狀態(處理中/完成/失敗)、摘要、標籤、段落數、刪除
 
@@ -21,8 +21,7 @@
 
 ## 前置需求
 
-- Docker、Rust toolchain、Node.js、Python 3.10+
-- `pipx install "markitdown[all]"`(需在 PATH 或 `~/.local/bin`)
+- Docker、Rust toolchain、Node.js
 - AWS 憑證(`aws login` 或 default chain 的其他來源),帳號已開通上述兩個 Bedrock 模型
 - 對外連線僅需 `bedrock-runtime.<region>.amazonaws.com`
 
@@ -54,7 +53,7 @@ cd frontend && npm run build    # 打包後由後端直接在 :8080 服務
 ## 已知限制(demo 取捨)
 
 - 無登入驗證與權限控管;聊天記錄僅存於前端狀態
-- 掃描型 PDF 不支援(無 OCR)
+- 文件直送模型轉錄:單檔上限 4MB;PPT 請先匯出 PDF;掃描件判讀品質視模型而定
 - 僅向量檢索,無混合搜尋與 rerank
 - `aws login` session 過期時聊天會回 `{"type":"error","message":"dispatch failure"}`,重新執行 `aws login` 即可,無需重啟伺服器
 

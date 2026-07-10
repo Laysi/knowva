@@ -22,7 +22,7 @@
 
 ```
 前端上傳 → axum 存檔到本機 → tokio::spawn 背景處理:
-  markitdown 轉成 Markdown(TXT/MD 直接讀;轉檔結果存原檔旁)
+  多模態模型直讀轉錄為 Markdown(TXT/MD 直接讀;轉錄結果存原檔旁)
   → 依標題切段、過長再切塊(約 800 token,10% 重疊)
   → Bedrock 產生 embedding → 寫入 pgvector
   → Nova 2 Lite 產生文件摘要與標籤 → status = ready
@@ -40,7 +40,7 @@
 
 - 不做登入驗證、不做多租戶、不做權限
 - 不用 job queue / Redis:上傳後直接 `tokio::spawn`,狀態記在 `documents.status`
-- 統一用 markitdown(Python CLI,後端以子行程呼叫)轉 Markdown:支援 PDF、DOCX、XLSX、PPTX;TXT/MD 直接讀;掃描 PDF 不支援
+- 不用本地轉檔工具(markitdown 品質不佳,2026-07-10 棄用):非 MD/TXT 檔直送多模態模型轉錄為 Markdown,支援 PDF、Word、Excel、CSV、HTML、圖片;單檔 ≤4MB;PPT 需先匯出 PDF
 - 檢索只用向量搜尋,不做混合搜尋、不做 rerank
 - 聊天記錄不落地,只存在前端狀態
 - 開發時前端跑 Vite dev server(proxy 到後端);打包後由 axum 服務靜態檔案
@@ -93,7 +93,7 @@ ai-km-demo/
 │   ├── src/
 │   │   ├── main.rs       # 路由、啟動
 │   │   ├── bedrock.rs    # Nova 2 Lite(converse_stream)+ Titan embedding
-│   │   ├── ingest.rs     # markitdown 轉檔、切塊、embedding、摘要
+│   │   ├── ingest.rs     # VLM 直讀轉錄、切塊、embedding、摘要
 │   │   ├── search.rs     # pgvector 相似度查詢
 │   │   └── db.rs
 │   ├── migrations/
@@ -115,7 +115,7 @@ FILES_DIR=./data/files
 
 地端只需開放對 `bedrock-runtime.<region>.amazonaws.com` 的 HTTPS 出站連線。
 
-前置需求:Docker、Rust toolchain、Node.js、Python 3.10+ 並 `pipx install "markitdown[all]"`。
+前置需求:Docker、Rust toolchain、Node.js。
 
 ## 實作步驟
 
