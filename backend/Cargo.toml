@@ -5,8 +5,6 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.103"
-aws-config = { version = "1.8.18", features = ["behavior-version-latest", "credentials-login"] }
-aws-sdk-bedrockruntime = "1.135.0"
 axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.22"
 chrono = { version = "0.4.45", features = ["serde"] }
