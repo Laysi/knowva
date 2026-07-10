@@ -1,6 +1,10 @@
 pub mod cloud_models;
+mod embedding;
 mod ingest;
 mod search;
+
+#[cfg(test)]
+mod database_tests;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -66,16 +70,7 @@ async fn main() -> anyhow::Result<()> {
         files_dir,
     });
 
-    let api_routes = Router::new()
-        .route("/api/health", get(health))
-        .route(
-            "/api/documents",
-            get(list_documents).post(ingest::upload_document),
-        )
-        .route("/api/documents/{id}", delete(ingest::delete_document))
-        .route("/api/chat", post(chat))
-        .layer(DefaultBodyLimit::max(50 * 1_048_576))
-        .with_state(state);
+    let api_routes = api_router(state);
 
     let app = api_routes.layer(CorsLayer::permissive());
 
@@ -96,6 +91,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn api_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/api/health", get(health))
+        .route(
+            "/api/documents",
+            get(list_documents).post(ingest::upload_document),
+        )
+        .route("/api/documents/{id}", delete(ingest::delete_document))
+        .route("/api/chat", post(chat))
+        .layer(DefaultBodyLimit::max(50 * 1_048_576))
+        .with_state(state)
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
@@ -109,6 +117,9 @@ struct DocumentRow {
     tags: Option<Vec<String>>,
     error: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
+    page_count: i64,
+    unit_count: i64,
+    // Kept during the MVP API transition for clients that still display chunk_count.
     chunk_count: i64,
 }
 
@@ -117,8 +128,10 @@ async fn list_documents(
 ) -> Result<Json<Vec<DocumentRow>>, (axum::http::StatusCode, String)> {
     let rows = sqlx::query_as::<_, DocumentRow>(
         "SELECT d.id, d.filename, d.status, d.summary, d.tags, d.error, d.created_at, \
-         (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id) AS chunk_count \
-         FROM documents d ORDER BY d.created_at DESC",
+         COUNT(u.id) FILTER (WHERE u.kind = 'page') AS page_count, \
+         COUNT(u.id) AS unit_count, COUNT(u.id) AS chunk_count \
+         FROM documents d LEFT JOIN document_units u ON u.document_id = d.id \
+         GROUP BY d.id ORDER BY d.created_at DESC",
     )
     .fetch_all(&state.pool)
     .await
@@ -233,6 +246,7 @@ mod tests {
         let sources = vec![search::SourceRef {
             document_id,
             filename: "source.pdf".to_string(),
+            page_number: Some(1),
         }];
 
         inner_tx

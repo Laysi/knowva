@@ -512,6 +512,25 @@ impl CloudModelClient {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let endpoint = |path: &str| {
+            Url::parse(&format!("http://127.0.0.1/{path}"))
+                .expect("static test endpoint must be valid")
+        };
+        let config = CloudModelConfig {
+            api_key: "test-api-key".to_string(),
+            chat_endpoint: endpoint("chat/completions"),
+            embed_endpoint: endpoint("embeddings"),
+            rerank_endpoint: endpoint("ranking"),
+            chat_model: "test/gemma-4".to_string(),
+            embed_model: DEFAULT_EMBED_MODEL_ID.to_string(),
+            rerank_model: DEFAULT_RERANK_MODEL_ID.to_string(),
+            request_timeout: Duration::from_secs(1),
+        };
+        Self::new(config).expect("static cloud model test config must be valid")
+    }
+
     pub async fn stream_chat(&self, messages: Vec<ChatMessage>, tx: Sender<SseEvent>) {
         self.stream_chat_with_system(SYSTEM_PROMPT.to_string(), messages, tx)
             .await;
