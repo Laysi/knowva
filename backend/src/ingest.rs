@@ -163,10 +163,18 @@ async fn process_document(state: Arc<AppState>, id: Uuid, storage_path: String, 
                 return;
             }
         };
-        let vector = pgvector::Vector::from(embedding);
+        let vector = match crate::embedding::to_halfvec(embedding) {
+            Ok(vector) => vector,
+            Err(e) => {
+                set_failed(&state, id, &format!("embedding rejected: {e}")).await;
+                return;
+            }
+        };
 
         if let Err(e) = sqlx::query(
-            "INSERT INTO chunks (document_id, chunk_index, content, embedding) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO document_units \
+             (document_id, kind, unit_index, content, embedding) \
+             VALUES ($1, 'text', $2, $3, $4)",
         )
         .bind(id)
         .bind(idx as i32)
