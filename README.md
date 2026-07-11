@@ -12,7 +12,7 @@
 | 向量嵌入 | `nvidia/llama-nemotron-embed-vl-1b-v2`，輸出 2048 維 float embedding |
 | 精排 | `nvidia/llama-nemotron-rerank-vl-1b-v2` |
 
-後端保留 OpenAI-compatible `/chat/completions` SSE，並提供 typed embedding 與 reranking client。頁面化 ingestion 已採模型無關的 artifact staging：PDF、Office 與圖片產生可追蹤頁圖，MD/TXT 產生標題感知文字單元；下一階段才會以固定 Nemotron Embed VL 建立 `halfvec(2048)` 檢索單元。
+後端保留 OpenAI-compatible `/chat/completions` SSE，並提供 typed embedding 與 reranking client。頁面化 ingestion 先以模型無關的 artifact staging 產生可追蹤頁圖或標題感知文字單元，再用固定 Nemotron Embed VL 建立同一個 `halfvec(2048)` 檢索空間：文字 query 使用 `query/text`，MD/TXT 使用 `passage/text`，無文字層頁面使用 `passage/image`，有同頁文字時使用 `passage/text_image`。
 
 ## 技術架構
 
@@ -153,7 +153,9 @@ FILES_DIR/{document_id}/
         └── 0002.png
 ```
 
-`page_artifacts` 保存 1-based `page_number`、圖片路徑、尺寸與可空的 PDF 文字層；掃描頁沒有文字仍是有效頁面。極端 PDF MediaBox 仍依設定 DPI 縮放，但輸出單邊上限為 8192 px，避免 native bitmap 無界配置。MD/TXT 不製造假頁碼，改存 `text_artifacts`。此階段完全不呼叫模型，也不製造零向量：artifact 完成時 `artifact_status=ready`，但文件仍維持 `status=processing`，直到後續 embedding 階段產生真正的 2048 維向量。
+`page_artifacts` 保存 1-based `page_number`、圖片路徑、尺寸與可空的 PDF 文字層；掃描頁沒有文字仍是有效頁面。極端 PDF MediaBox 仍依設定 DPI 縮放，但輸出單邊上限為 8192 px，避免 native bitmap 無界配置。MD/TXT 不製造假頁碼，改存 `text_artifacts`。artifact 發布完成後，每份文件最多同時處理四個 embedding unit；只有所有回應都恰為 2048 維 finite float、artifact 與 unit 計數一致，才在單一 transaction 內替換 `document_units` 並把文件設為 `ready`。任一 unit 失敗時已完成的 artifact 保持 `artifact_status=ready`，文件則為 `failed`，不會留下可搜尋的部分新結果。
+
+頁圖只以記憶體中的 PNG/JPEG data URL 送出，不會傳送本機 artifact path；decoded image 上限 25 MiB、整體 embedding request 上限 36 MiB。Embedding 對 408、429、5xx、transport error 與 timeout 最多嘗試三次並使用 exponential backoff + jitter，其他 4xx 立即失敗。HTTP error snippet、API key、Authorization 與 base64 圖片資料都會在記錄前限長或遮蔽。
 
 ## 驗證
 
@@ -164,7 +166,7 @@ proto exec rust -- cargo clippy --all-targets -- -D warnings
 proto exec rust -- cargo test
 ```
 
-一般測試會產生並驗證合成 fixture，但不要求開發機預裝外部轉檔工具。安裝 Pdfium 與 LibreOffice 後，可明確執行真實轉換 smoke test：
+一般測試以本機 mock cloud endpoint 驗證四種 embedding payload、有限重試與 transaction/DB 契約，不會呼叫真實雲端。安裝 Pdfium 與 LibreOffice 後，可明確執行 native fixture smoke；它也會確認原生 PDF 使用 image+text embedding、掃描 PDF 使用 image-only embedding：
 
 ```bash
 cd backend
@@ -175,5 +177,14 @@ proto exec rust -- cargo test page_artifacts::tests::generated_pdf_and_office_fi
 ```
 
 fixture 的來源、預期頁數與涵蓋範圍見 [backend/tests/fixtures/README.md](backend/tests/fixtures/README.md)。
+
+若要選擇性驗證真實 NVIDIA endpoint，先在 `.env` 填妥 `NVIDIA_API_KEY`、`GEMMA_4_MODEL_ID` 與需要覆寫的 `CLOUD_EMBED_URL`，再明確執行下列 ignored test。它會各送一次 text query、text passage、image passage 與 image+text passage（共四次雲端呼叫）；一般 `cargo test` 與 CI 不會執行：
+
+```bash
+cd backend
+proto exec rust -- cargo test \
+  cloud_models::tests::real_nemotron_embed_vl_smoke_covers_all_input_modalities \
+  -- --ignored --exact --nocapture
+```
 
 詳細 MVP 規劃見 [docs/mvp-now.md](docs/mvp-now.md)。

@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use pgvector::HalfVector;
 
 pub const EMBEDDING_DIMENSIONS: usize = 2048;
+const HALF_MAX_FINITE: f32 = 65_504.0;
 
 /// Validates the model boundary before converting an embedding to PostgreSQL halfvec.
 /// pgvector also enforces the typmod, but checking here leaves a provider-facing error
@@ -16,6 +17,12 @@ pub fn to_halfvec(values: Vec<f32>) -> Result<HalfVector> {
 
     if let Some(index) = values.iter().position(|value| !value.is_finite()) {
         bail!("embedding contains a non-finite value at index {index}");
+    }
+    if let Some(index) = values
+        .iter()
+        .position(|value| value.abs() > HALF_MAX_FINITE)
+    {
+        bail!("embedding value at index {index} cannot be represented as finite halfvec");
     }
 
     Ok(HalfVector::from_f32_slice(&values))
@@ -46,5 +53,15 @@ mod tests {
 
         let error = to_halfvec(values).unwrap_err().to_string();
         assert!(error.contains("index 7"));
+    }
+
+    #[test]
+    fn rejects_values_that_overflow_halfvec() {
+        let mut values = vec![0.0; EMBEDDING_DIMENSIONS];
+        values[9] = f32::MAX;
+
+        let error = to_halfvec(values).unwrap_err().to_string();
+        assert!(error.contains("index 9"));
+        assert!(error.contains("finite halfvec"));
     }
 }

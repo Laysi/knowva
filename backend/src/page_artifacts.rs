@@ -582,6 +582,61 @@ fn summarize_output(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct EmbeddingMockState {
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn embedding_mock(
+        State(state): State<EmbeddingMockState>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        state
+            .requests
+            .lock()
+            .expect("embedding request lock")
+            .push(request);
+        Json(serde_json::json!({
+            "data": [{
+                "index": 0,
+                "embedding": vec![0.25_f32; crate::cloud_models::EMBEDDING_DIMENSIONS]
+            }]
+        }))
+    }
+
+    async fn spawn_embedding_mock() -> (
+        crate::cloud_models::CloudModelClient,
+        EmbeddingMockState,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let state = EmbeddingMockState {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/embeddings", post(embedding_mock))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind embedding mock");
+        let address = listener.local_addr().expect("embedding mock address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve embedding mock");
+        });
+        let endpoint = format!("http://{address}/embeddings");
+        let client = crate::cloud_models::CloudModelClient::for_test_embed_endpoint(
+            &endpoint,
+            Duration::from_secs(1),
+        );
+        (client, state, server)
+    }
 
     fn test_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("km-page-artifacts-{label}-{}", Uuid::new_v4()))
@@ -644,6 +699,7 @@ mod tests {
     async fn generated_pdf_and_office_fixtures_preserve_page_order() -> anyhow::Result<()> {
         let root = test_dir("document-fixtures");
         let fixtures = crate::test_fixtures::write_all(&root)?;
+        let (models, embedding_mock, embedding_server) = spawn_embedding_mock().await;
         // Use the documented environment variables so callers can select an
         // explicit Pdfium library and LibreOffice executable for this smoke.
         let config = ArtifactConfig::from_env()?;
@@ -671,6 +727,15 @@ mod tests {
                 .as_deref()
                 .is_some_and(|text| text.contains("Native page two"))
         );
+        for page in &native_pages {
+            let image = tokio::fs::read(native_run.join(&page.relative_image_path)).await?;
+            let text = page
+                .extracted_text
+                .as_deref()
+                .expect("native fixture page has text");
+            let embedding = models.embed_image_text_passage(text, &image).await?;
+            assert_eq!(embedding.len(), crate::cloud_models::EMBEDDING_DIMENSIONS);
+        }
 
         let scanned_run = root.join("scanned-run");
         tokio::fs::create_dir(&scanned_run).await?;
@@ -679,6 +744,27 @@ mod tests {
         assert_eq!(scanned_pages[0].page_number, 1);
         assert!(scanned_pages[0].extracted_text.is_none());
         assert!(scanned_run.join("pages/0001.png").is_file());
+        let scanned_image =
+            tokio::fs::read(scanned_run.join(&scanned_pages[0].relative_image_path)).await?;
+        let embedding = models.embed_image_passage(&scanned_image).await?;
+        assert_eq!(embedding.len(), crate::cloud_models::EMBEDDING_DIMENSIONS);
+
+        {
+            let requests = embedding_mock.requests.lock().expect("request lock");
+            assert_eq!(requests.len(), 3);
+            assert!(requests[..2].iter().all(|request| {
+                request["model"] == crate::cloud_models::DEFAULT_EMBED_MODEL_ID
+                    && request["input_type"] == "passage"
+                    && request["modality"] == "text_image"
+            }));
+            assert_eq!(requests[2]["input_type"], "passage");
+            assert_eq!(requests[2]["modality"], "image");
+            assert!(requests.iter().all(|request| {
+                request["input"][0]
+                    .as_str()
+                    .is_some_and(|input| !input.contains(root.to_string_lossy().as_ref()))
+            }));
+        }
 
         let office_cases = [
             (
@@ -742,6 +828,7 @@ mod tests {
             }
         }
 
+        embedding_server.abort();
         tokio::fs::remove_dir_all(root).await?;
         Ok(())
     }

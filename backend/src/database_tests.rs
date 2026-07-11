@@ -1,11 +1,74 @@
 use super::*;
 use axum::body::{Body, to_bytes};
+use axum::extract::State;
 use axum::http::{Request, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
 use pgvector::HalfVector;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+#[derive(Clone)]
+struct EmbeddingMockState {
+    requests: Arc<Mutex<Vec<Value>>>,
+    fail: Arc<AtomicBool>,
+}
+
+async fn embedding_mock(
+    State(state): State<EmbeddingMockState>,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .requests
+        .lock()
+        .expect("embedding request lock")
+        .push(body);
+    if state.fail.load(Ordering::SeqCst) {
+        return (StatusCode::BAD_REQUEST, "deterministic embedding failure").into_response();
+    }
+
+    Json(serde_json::json!({
+        "data": [{
+            "index": 0,
+            "embedding": vec![0.25_f32; crate::embedding::EMBEDDING_DIMENSIONS]
+        }]
+    }))
+    .into_response()
+}
+
+async fn spawn_embedding_mock(
+    fail: bool,
+) -> (
+    CloudModelClient,
+    EmbeddingMockState,
+    tokio::task::JoinHandle<()>,
+) {
+    let state = EmbeddingMockState {
+        requests: Arc::new(Mutex::new(Vec::new())),
+        fail: Arc::new(AtomicBool::new(fail)),
+    };
+    let app = Router::new()
+        .route("/embeddings", post(embedding_mock))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind embedding mock");
+    let address = listener.local_addr().expect("embedding mock address");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve embedding mock");
+    });
+    let endpoint = format!("http://{address}/embeddings");
+    let client = CloudModelClient::for_test_embed_endpoint(&endpoint, Duration::from_secs(1));
+    (client, state, handle)
+}
 
 fn vector_with(values: &[(usize, f32)]) -> HalfVector {
     let mut vector = vec![0.0; crate::embedding::EMBEDDING_DIMENSIONS];
@@ -493,7 +556,7 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
 }
 
 #[sqlx::test]
-async fn image_artifact_publish_is_idempotent_and_never_fabricates_embeddings(
+async fn image_embedding_publish_is_idempotent_and_never_duplicates_units(
     pool: PgPool,
 ) -> anyhow::Result<()> {
     let document_id = Uuid::new_v4();
@@ -514,9 +577,10 @@ async fn image_artifact_publish_is_idempotent_and_never_fabricates_embeddings(
     .execute(&pool)
     .await?;
 
+    let (models, mock, server) = spawn_embedding_mock(false).await;
     let state = Arc::new(AppState {
         pool: pool.clone(),
-        models: CloudModelClient::for_test(),
+        models,
         files_dir: files_dir.to_string_lossy().into_owned(),
         artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
         document_locks: crate::ingest::DocumentLocks::default(),
@@ -540,7 +604,7 @@ async fn image_artifact_publish_is_idempotent_and_never_fabricates_embeddings(
             .bind(document_id)
             .fetch_one(&pool)
             .await?;
-    assert_eq!(state_row, ("processing".to_string(), "ready".to_string()));
+    assert_eq!(state_row, ("ready".to_string(), "ready".to_string()));
     assert!(std::path::Path::new(&first_artifact_dir).is_dir());
     assert!(
         std::path::Path::new(&first_artifact_dir)
@@ -579,12 +643,234 @@ async fn image_artifact_publish_is_idempotent_and_never_fabricates_embeddings(
             .fetch_one(&pool)
             .await?;
     assert_eq!(page_count, 1);
+    assert_eq!(unit_count, 1, "rerun must replace instead of duplicate");
+    let unit: (String, i32, i32, String, Option<String>, HalfVector) = sqlx::query_as(
+        "SELECT kind, unit_index, page_number, image_path, content, embedding \
+         FROM document_units WHERE document_id = $1",
+    )
+    .bind(document_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(unit.0, "page");
+    assert_eq!((unit.1, unit.2), (0, 1));
+    assert_eq!(unit.3, format!("{second_artifact_dir}/pages/0001.png"));
+    assert!(unit.4.is_none());
     assert_eq!(
-        unit_count, 0,
-        "issue #4 must not invent placeholder vectors"
+        unit.5.as_slice().len(),
+        crate::embedding::EMBEDDING_DIMENSIONS
+    );
+    assert_eq!(mock.requests.lock().expect("request lock").len(), 2);
+
+    server.abort();
+    tokio::fs::remove_dir_all(files_dir).await?;
+    Ok(())
+}
+
+#[sqlx::test]
+async fn embedding_failure_keeps_artifacts_ready_but_document_not_ready_and_retry_is_atomic(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let document_id = Uuid::new_v4();
+    let files_dir = std::env::temp_dir().join(format!("km-embedding-failure-{document_id}"));
+    let document_dir = files_dir.join(document_id.to_string());
+    let storage_path = document_dir.join("original.png");
+    tokio::fs::create_dir_all(&document_dir).await?;
+    image::RgbaImage::from_pixel(12, 8, image::Rgba([80, 40, 20, 255]))
+        .save_with_format(&storage_path, image::ImageFormat::Png)?;
+    sqlx::query(
+        "INSERT INTO documents \
+         (id, filename, storage_path, mime_type, status, artifact_status) \
+         VALUES ($1, 'failure.png', $2, 'image/png', 'processing', 'processing')",
+    )
+    .bind(document_id)
+    .bind(storage_path.to_string_lossy().as_ref())
+    .execute(&pool)
+    .await?;
+
+    let (models, mock, server) = spawn_embedding_mock(true).await;
+    let state = Arc::new(AppState {
+        pool: pool.clone(),
+        models,
+        files_dir: files_dir.to_string_lossy().into_owned(),
+        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
+        document_locks: crate::ingest::DocumentLocks::default(),
+    });
+    crate::ingest::process_document(
+        state.clone(),
+        document_id,
+        storage_path.clone(),
+        crate::page_artifacts::SourceKind::Image,
+    )
+    .await;
+
+    let failed: (String, String, Option<String>) =
+        sqlx::query_as("SELECT status, artifact_status, error FROM documents WHERE id = $1")
+            .bind(document_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(failed.0, "failed");
+    assert_eq!(
+        failed.1, "ready",
+        "completed artifacts must remain retryable"
+    );
+    let error = failed.2.expect("embedding failure is recorded");
+    assert!(error.contains("embedding-request"));
+    assert!(error.contains("unit=0"));
+    assert!(error.contains("page=1"));
+    assert!(!error.contains(storage_path.to_string_lossy().as_ref()));
+    assert!(!error.contains("base64"));
+    let failed_counts: (i64, i64) = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM page_artifacts WHERE document_id = $1), \
+           (SELECT count(*) FROM document_units WHERE document_id = $1)",
+    )
+    .bind(document_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(failed_counts, (1, 0));
+    assert_eq!(mock.requests.lock().expect("request lock").len(), 1);
+
+    mock.fail.store(false, Ordering::SeqCst);
+    crate::ingest::process_document(
+        state,
+        document_id,
+        storage_path,
+        crate::page_artifacts::SourceKind::Image,
+    )
+    .await;
+
+    let ready: (String, String, Option<String>) =
+        sqlx::query_as("SELECT status, artifact_status, error FROM documents WHERE id = $1")
+            .bind(document_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(ready, ("ready".to_string(), "ready".to_string(), None));
+    let ready_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM document_units WHERE document_id = $1")
+            .bind(document_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(ready_count, 1);
+    assert_eq!(mock.requests.lock().expect("request lock").len(), 2);
+
+    server.abort();
+    tokio::fs::remove_dir_all(files_dir).await?;
+    Ok(())
+}
+
+#[sqlx::test]
+async fn page_image_and_text_are_promoted_to_one_matching_halfvec_unit(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let document_id = Uuid::new_v4();
+    let root = std::env::temp_dir().join(format!("km-mixed-page-{document_id}"));
+    let artifact_dir = root.join("artifacts-fixture");
+    let page_path = artifact_dir.join("pages/0001.png");
+    tokio::fs::create_dir_all(page_path.parent().expect("page parent")).await?;
+    image::RgbaImage::from_pixel(16, 9, image::Rgba([10, 30, 50, 255]))
+        .save_with_format(&page_path, image::ImageFormat::Png)?;
+    let original_path = root.join("original.pdf");
+    tokio::fs::write(&original_path, b"fixture").await?;
+    sqlx::query(
+        "INSERT INTO documents \
+         (id, filename, storage_path, mime_type, status, artifact_status) \
+         VALUES ($1, 'mixed.pdf', $2, 'application/pdf', 'processing', 'ready')",
+    )
+    .bind(document_id)
+    .bind(original_path.to_string_lossy().as_ref())
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO document_artifact_sets \
+         (document_id, source_kind, artifact_dir, manifest_path) \
+         VALUES ($1, 'pdf', $2, $3)",
+    )
+    .bind(document_id)
+    .bind(artifact_dir.to_string_lossy().as_ref())
+    .bind(
+        artifact_dir
+            .join("manifest.json")
+            .to_string_lossy()
+            .as_ref(),
+    )
+    .execute(&pool)
+    .await?;
+    let page = crate::page_artifacts::PageArtifact {
+        document_id,
+        page_number: 1,
+        image_path: page_path.to_string_lossy().into_owned(),
+        width: 16,
+        height: 9,
+        extracted_text: Some("native same-page text".to_string()),
+    };
+    sqlx::query(
+        "INSERT INTO page_artifacts \
+         (document_id, page_number, image_path, width, height, extracted_text) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(document_id)
+    .bind(page.page_number)
+    .bind(&page.image_path)
+    .bind(page.width)
+    .bind(page.height)
+    .bind(&page.extracted_text)
+    .execute(&pool)
+    .await?;
+
+    let (models, mock, server) = spawn_embedding_mock(false).await;
+    let state = AppState {
+        pool: pool.clone(),
+        models,
+        files_dir: root.to_string_lossy().into_owned(),
+        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
+        document_locks: crate::ingest::DocumentLocks::default(),
+    };
+    crate::ingest::embed_published_artifacts_for_test(&state, document_id, &[page], &[])
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let status: (String, String) =
+        sqlx::query_as("SELECT status, artifact_status FROM documents WHERE id = $1")
+            .bind(document_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(status, ("ready".to_string(), "ready".to_string()));
+    let unit: (String, i32, i32, Option<String>, String, HalfVector) = sqlx::query_as(
+        "SELECT kind, unit_index, page_number, content, image_path, embedding \
+         FROM document_units WHERE document_id = $1",
+    )
+    .bind(document_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(unit.0, "page");
+    assert_eq!((unit.1, unit.2), (0, 1));
+    assert_eq!(unit.3.as_deref(), Some("native same-page text"));
+    assert_eq!(unit.4, page_path.to_string_lossy());
+    assert_eq!(
+        unit.5.as_slice().len(),
+        crate::embedding::EMBEDDING_DIMENSIONS
+    );
+    assert!(
+        unit.5
+            .as_slice()
+            .iter()
+            .all(|value| value.to_f32().is_finite())
     );
 
-    tokio::fs::remove_dir_all(files_dir).await?;
+    {
+        let requests = mock.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["input_type"], "passage");
+        assert_eq!(requests[0]["modality"], "text_image");
+        let input = requests[0]["input"][0]
+            .as_str()
+            .expect("mixed input string");
+        assert!(input.starts_with("native same-page text\n<img src=\"data:image/png;base64,"));
+        assert!(!input.contains(page_path.to_string_lossy().as_ref()));
+    }
+
+    server.abort();
+    tokio::fs::remove_dir_all(root).await?;
     Ok(())
 }
 
@@ -607,9 +893,10 @@ async fn failed_conversion_can_retry_without_partial_artifacts(pool: PgPool) -> 
     .execute(&pool)
     .await?;
 
+    let (models, mock, server) = spawn_embedding_mock(false).await;
     let state = Arc::new(AppState {
         pool: pool.clone(),
-        models: CloudModelClient::for_test(),
+        models,
         files_dir: files_dir.to_string_lossy().into_owned(),
         artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
         document_locks: crate::ingest::DocumentLocks::default(),
@@ -661,10 +948,7 @@ async fn failed_conversion_can_retry_without_partial_artifacts(pool: PgPool) -> 
             .bind(document_id)
             .fetch_one(&pool)
             .await?;
-    assert_eq!(
-        retry_statuses,
-        ("processing".to_string(), "ready".to_string())
-    );
+    assert_eq!(retry_statuses, ("ready".to_string(), "ready".to_string()));
     let counts: (i64, i64, i64) = sqlx::query_as(
         "SELECT \
            (SELECT count(*) FROM document_artifact_sets WHERE document_id = $1), \
@@ -674,8 +958,10 @@ async fn failed_conversion_can_retry_without_partial_artifacts(pool: PgPool) -> 
     .bind(document_id)
     .fetch_one(&pool)
     .await?;
-    assert_eq!(counts, (1, 1, 0));
+    assert_eq!(counts, (1, 1, 1));
+    assert_eq!(mock.requests.lock().expect("request lock").len(), 1);
 
+    server.abort();
     tokio::fs::remove_dir_all(files_dir).await?;
     Ok(())
 }
@@ -746,9 +1032,10 @@ async fn markdown_and_text_fixtures_keep_heading_aware_staging(pool: PgPool) -> 
     let root = std::env::temp_dir().join(format!("km-text-fixtures-{}", Uuid::new_v4()));
     let fixture_source_dir = root.join("sources");
     let fixtures = crate::test_fixtures::write_all(&fixture_source_dir)?;
+    let (models, mock, server) = spawn_embedding_mock(false).await;
     let state = Arc::new(AppState {
         pool: pool.clone(),
-        models: CloudModelClient::for_test(),
+        models,
         files_dir: root.to_string_lossy().into_owned(),
         artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
         document_locks: crate::ingest::DocumentLocks::default(),
@@ -809,10 +1096,23 @@ async fn markdown_and_text_fixtures_keep_heading_aware_staging(pool: PgPool) -> 
                 .await?;
         assert!(artifact_count >= 1);
         assert_eq!(page_count, 0);
-        assert_eq!(unit_count, 0);
-        assert_eq!(statuses, ("processing".to_string(), "ready".to_string()));
+        assert_eq!(unit_count, artifact_count);
+        assert_eq!(statuses, ("ready".to_string(), "ready".to_string()));
     }
 
+    {
+        let requests = mock.requests.lock().expect("request lock");
+        assert!(requests.len() >= 2);
+        assert!(requests.iter().all(|request| {
+            request["input_type"] == "passage"
+                && request["modality"] == "text"
+                && request["input"][0]
+                    .as_str()
+                    .is_some_and(|input| !input.trim().is_empty())
+        }));
+    }
+
+    server.abort();
     tokio::fs::remove_dir_all(root).await?;
     Ok(())
 }
