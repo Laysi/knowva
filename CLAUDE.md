@@ -28,8 +28,8 @@ The backend requires `NVIDIA_API_KEY` and a confirmed `GEMMA_4_MODEL_ID`. Shared
   - Routes: `GET /api/health`, `GET|POST /api/documents`, `DELETE /api/documents/{id}`, and `POST /api/chat`.
   - `cloud_models.rs` owns fail-fast configuration, typed chat/embed/rerank payloads, the unified safe error type, and OpenAI-compatible chat SSE parsing.
   - SSE events remain `text-delta`, optional `sources`, then `done`; failures emit `error`. When sources exist they must precede `done`.
-  - `ingest.rs` owns upload, atomic artifact publishing, staging persistence, and delete/retry cleanup. New documents remain `processing` after artifacts are ready until the later embedding issue promotes them into searchable units.
-  - `page_artifacts.rs` uses Pdfium for PDF rasterization/text-layer extraction, normalizes images, and runs isolated headless LibreOffice conversion for DOCX/PPTX/XLSX. This stage never calls a model or fabricates embeddings.
+  - `ingest.rs` owns upload, atomic artifact publishing, bounded-concurrency Embed VL promotion, transactional/idempotent `document_units` replacement, and delete/retry cleanup. A document becomes `ready` only after every staged artifact has one validated embedding and the counts match.
+  - `page_artifacts.rs` uses Pdfium for PDF rasterization/text-layer extraction, normalizes images, and runs isolated headless LibreOffice conversion for DOCX/PPTX/XLSX. Artifact conversion itself never calls a model or fabricates embeddings; ingestion embeds the published artifacts afterward.
   - `search.rs` contains the current dense retrieval path. Hybrid retrieval and reranking integration are later MVP work.
 - `frontend/` is Vite + React TypeScript + assistant-ui with plain CSS.
 - SQLx migrations run automatically at backend startup.
@@ -41,6 +41,8 @@ The backend requires `NVIDIA_API_KEY` and a confirmed `GEMMA_4_MODEL_ID`. Shared
 - Model HTTP errors use a maximum 500-character sanitized snippet and expose HTTP status, timeout, and retryability through one error type.
 - The Gemma model ID has no repository default. Embed and rerank settings may only vendor-qualify their locked family names.
 - Do not send an embedding dimension-reduction parameter; the fixed Embed VL response is validated as 2048 dimensions.
+- Embed query input is text-only. Passage input may be text, image-only, or same-page image+text. Images are sent as bounded PNG/JPEG data URLs, never as local artifact paths; logs/errors must redact data URLs and long base64 strings.
+- Embedding retries are finite exponential backoff with jitter for 408, 429, 5xx, transport errors, and timeouts. Other 4xx responses fail immediately.
 
 ## Document conversion
 
@@ -48,7 +50,8 @@ The backend requires `NVIDIA_API_KEY` and a confirmed `GEMMA_4_MODEL_ID`. Shared
 - LibreOffice is only required for DOCX/PPTX/XLSX and is selected with `LIBREOFFICE_BIN`.
 - The runtime image pins Pdfium Chromium 7763 by architecture and includes LibreOffice plus Noto CJK fonts; it runs as the non-root `km` user.
 - The default page render setting is 180 DPI and conversion timeout is 120 seconds; see `.env.example`.
-- The real PDF/Office fixture smoke test is explicitly ignored on machines without both native dependencies. The `native-test` image target provides a reproducible opt-in run; its command and expected page counts are documented in `README.md` and `backend/tests/fixtures/README.md`.
+- The real PDF/Office fixture smoke test is explicitly ignored on machines without both native dependencies. It also verifies native PDF image+text and scanned PDF image-only requests against a mock endpoint. The `native-test` image target provides a reproducible opt-in run; its command and expected page counts are documented in `README.md` and `backend/tests/fixtures/README.md`.
+- A separate ignored real-cloud Embed VL smoke covers all four input shapes and must only be run explicitly with configured credentials; normal tests and CI use deterministic mock endpoints.
 
 ## Working tree safety
 

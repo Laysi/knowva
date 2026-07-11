@@ -1,10 +1,13 @@
 use crate::AppState;
+use crate::cloud_models::{CloudModelClient, CloudModelError, MAX_EMBED_IMAGE_BYTES};
 use crate::page_artifacts::{
     ArtifactError, ArtifactManifest, PageArtifact, SourceKind, TextArtifact,
 };
 use axum::Json;
 use axum::extract::{Multipart, Path as AxumPath, State};
 use axum::http::StatusCode;
+use futures::{StreamExt, TryStreamExt, stream};
+use pgvector::HalfVector;
 use serde::Serialize;
 use sqlx::{Postgres, Transaction};
 use std::collections::HashMap;
@@ -18,6 +21,9 @@ const MAX_CHUNK_CHARS: usize = 2_000;
 const HARD_MAX_CHUNK_CHARS: usize = 3_000;
 const OVERLAP_CHARS: usize = 200;
 const MAX_ERROR_CHARS: usize = 1_000;
+const EMBEDDING_CONCURRENCY: usize = 4;
+const EMBED_IMAGE_SHORT_SIDE_LIMIT: i32 = 8_192;
+const EMBED_IMAGE_LONG_SIDE_LIMIT: i32 = 16_384;
 pub const MAX_UPLOAD_BYTES: usize = 50 * 1_048_576;
 pub const MULTIPART_BODY_LIMIT_BYTES: usize = MAX_UPLOAD_BYTES + 1_048_576;
 
@@ -60,7 +66,75 @@ struct PreparedArtifactSet {
     text_units: Vec<TextArtifact>,
 }
 
-/// POST /api/documents - save one supported file and start model-free artifact conversion.
+#[derive(Debug, Clone)]
+enum PendingEmbeddingUnit {
+    Page(PageArtifact),
+    Text(TextArtifact),
+}
+
+#[derive(Debug)]
+struct EmbeddedUnit {
+    kind: &'static str,
+    unit_index: i32,
+    page_number: Option<i32>,
+    content: Option<String>,
+    image_path: Option<String>,
+    embedding: HalfVector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmbeddingStageError {
+    stage: &'static str,
+    unit_kind: Option<&'static str>,
+    unit_index: Option<i32>,
+    page_number: Option<i32>,
+    message: String,
+}
+
+impl EmbeddingStageError {
+    fn document(stage: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            stage,
+            unit_kind: None,
+            unit_index: None,
+            page_number: None,
+            message: message.into(),
+        }
+    }
+
+    fn unit(
+        stage: &'static str,
+        unit_kind: &'static str,
+        unit_index: i32,
+        page_number: Option<i32>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            unit_kind: Some(unit_kind),
+            unit_index: Some(unit_index),
+            page_number,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for EmbeddingStageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.stage)?;
+        if let (Some(kind), Some(index)) = (self.unit_kind, self.unit_index) {
+            write!(formatter, ": {kind} unit={index}")?;
+        }
+        if let Some(page) = self.page_number {
+            write!(formatter, " page={page}")?;
+        }
+        write!(formatter, ": {}", self.message)
+    }
+}
+
+impl std::error::Error for EmbeddingStageError {}
+
+/// POST /api/documents - save one supported file, publish artifacts, then embed every unit.
 pub async fn upload_document(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
@@ -229,8 +303,38 @@ async fn set_failed(state: &AppState, id: Uuid, error: &str) {
     }
 }
 
+async fn set_embedding_failed(state: &AppState, id: Uuid, error: &EmbeddingStageError) {
+    let snippet = bounded_error(&error.to_string());
+    if let Err(db_error) =
+        sqlx::query("UPDATE documents SET status = 'failed', error = $2 WHERE id = $1")
+            .bind(id)
+            .bind(&snippet)
+            .execute(&state.pool)
+            .await
+    {
+        tracing::warn!(document_id = %id, "failed to persist embedding error: {db_error}");
+    }
+    tracing::warn!(
+        document_id = %id,
+        stage = error.stage,
+        unit_kind = ?error.unit_kind,
+        unit_index = ?error.unit_index,
+        page_number = ?error.page_number,
+        error = %snippet,
+        "document embedding failed"
+    );
+}
+
 fn bounded_error(error: &str) -> String {
-    error.chars().take(MAX_ERROR_CHARS).collect()
+    let data_urls = regex::Regex::new(r"(?i)data:image/(?:png|jpeg);base64,[A-Za-z0-9+/=_-]*")
+        .expect("valid data URL regex");
+    let without_images = data_urls.replace_all(error, "[REDACTED-IMAGE-DATA]");
+    let long_base64 = regex::Regex::new(r"[A-Za-z0-9+/]{64,}={0,2}").expect("valid base64 regex");
+    long_base64
+        .replace_all(&without_images, "[REDACTED-BASE64]")
+        .chars()
+        .take(MAX_ERROR_CHARS)
+        .collect()
 }
 
 pub(crate) async fn process_document(
@@ -332,6 +436,18 @@ pub(crate) async fn process_document(
     }
 
     cleanup_obsolete_artifact_runs(&document_dir, &artifact_dir).await;
+
+    let embedded_units =
+        match embed_artifact_units(&state.models, &prepared.pages, &prepared.text_units).await {
+            Ok(units) => units,
+            Err(error) => {
+                set_embedding_failed(&state, id, &error).await;
+                return;
+            }
+        };
+    if let Err(error) = persist_embedded_units(&state, id, &embedded_units).await {
+        set_embedding_failed(&state, id, &error).await;
+    }
 }
 
 async fn prepare_artifact_set(
@@ -530,6 +646,314 @@ async fn persist_artifact_set(
         .await
         .map_err(artifact_db_error)?;
     transaction.commit().await.map_err(artifact_db_error)
+}
+
+async fn embed_artifact_units(
+    models: &CloudModelClient,
+    pages: &[PageArtifact],
+    text_units: &[TextArtifact],
+) -> Result<Vec<EmbeddedUnit>, EmbeddingStageError> {
+    let pending = pages
+        .iter()
+        .cloned()
+        .map(PendingEmbeddingUnit::Page)
+        .chain(text_units.iter().cloned().map(PendingEmbeddingUnit::Text))
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Err(EmbeddingStageError::document(
+            "embedding-prepare",
+            "artifact set contains no units",
+        ));
+    }
+
+    let mut embedded = stream::iter(pending)
+        .map(|unit| embed_artifact_unit(models, unit))
+        .buffer_unordered(EMBEDDING_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    embedded.sort_by_key(|unit| (unit.kind, unit.unit_index));
+    Ok(embedded)
+}
+
+async fn embed_artifact_unit(
+    models: &CloudModelClient,
+    unit: PendingEmbeddingUnit,
+) -> Result<EmbeddedUnit, EmbeddingStageError> {
+    match unit {
+        PendingEmbeddingUnit::Text(text) => {
+            let embedding = models
+                .embed_passage(&text.content)
+                .await
+                .map_err(|error| embedding_model_error("text", text.unit_index, None, error))?;
+            let embedding = crate::embedding::to_halfvec(embedding).map_err(|error| {
+                EmbeddingStageError::unit(
+                    "embedding-validate",
+                    "text",
+                    text.unit_index,
+                    None,
+                    error.to_string(),
+                )
+            })?;
+            Ok(EmbeddedUnit {
+                kind: "text",
+                unit_index: text.unit_index,
+                page_number: None,
+                content: Some(text.content),
+                image_path: None,
+                embedding,
+            })
+        }
+        PendingEmbeddingUnit::Page(page) => {
+            let unit_index = page.page_number.checked_sub(1).ok_or_else(|| {
+                EmbeddingStageError::unit(
+                    "embedding-prepare",
+                    "page",
+                    0,
+                    Some(page.page_number),
+                    "page number must be one-based",
+                )
+            })?;
+            validate_embed_image_dimensions(&page, unit_index)?;
+            let metadata = tokio::fs::metadata(&page.image_path)
+                .await
+                .map_err(|error| {
+                    EmbeddingStageError::unit(
+                        "embedding-image-read",
+                        "page",
+                        unit_index,
+                        Some(page.page_number),
+                        format!("cannot inspect page image artifact: {error}"),
+                    )
+                })?;
+            if !metadata.is_file() {
+                return Err(EmbeddingStageError::unit(
+                    "embedding-image-read",
+                    "page",
+                    unit_index,
+                    Some(page.page_number),
+                    "page image artifact is not a regular file",
+                ));
+            }
+            if metadata.len() > MAX_EMBED_IMAGE_BYTES as u64 {
+                return Err(EmbeddingStageError::unit(
+                    "embedding-image-read",
+                    "page",
+                    unit_index,
+                    Some(page.page_number),
+                    format!(
+                        "page image is {} bytes; maximum is {MAX_EMBED_IMAGE_BYTES} bytes",
+                        metadata.len()
+                    ),
+                ));
+            }
+            let image = tokio::fs::read(&page.image_path).await.map_err(|error| {
+                EmbeddingStageError::unit(
+                    "embedding-image-read",
+                    "page",
+                    unit_index,
+                    Some(page.page_number),
+                    format!("cannot read page image artifact: {error}"),
+                )
+            })?;
+            let embedding = match page
+                .extracted_text
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+            {
+                Some(text) => models.embed_image_text_passage(text, &image).await,
+                None => models.embed_image_passage(&image).await,
+            }
+            .map_err(|error| {
+                embedding_model_error("page", unit_index, Some(page.page_number), error)
+            })?;
+            let embedding = crate::embedding::to_halfvec(embedding).map_err(|error| {
+                EmbeddingStageError::unit(
+                    "embedding-validate",
+                    "page",
+                    unit_index,
+                    Some(page.page_number),
+                    error.to_string(),
+                )
+            })?;
+            Ok(EmbeddedUnit {
+                kind: "page",
+                unit_index,
+                page_number: Some(page.page_number),
+                content: page.extracted_text,
+                image_path: Some(page.image_path),
+                embedding,
+            })
+        }
+    }
+}
+
+fn embedding_model_error(
+    unit_kind: &'static str,
+    unit_index: i32,
+    page_number: Option<i32>,
+    error: CloudModelError,
+) -> EmbeddingStageError {
+    let stage = match &error {
+        CloudModelError::InvalidRequest { .. } => "embedding-input",
+        CloudModelError::InvalidResponse { .. } => "embedding-response",
+        CloudModelError::Http { .. }
+        | CloudModelError::Timeout { .. }
+        | CloudModelError::Transport { .. } => "embedding-request",
+    };
+    EmbeddingStageError::unit(stage, unit_kind, unit_index, page_number, error.to_string())
+}
+
+fn validate_embed_image_dimensions(
+    page: &PageArtifact,
+    unit_index: i32,
+) -> Result<(), EmbeddingStageError> {
+    let fits_vendor_limit = (page.width <= EMBED_IMAGE_SHORT_SIDE_LIMIT
+        && page.height <= EMBED_IMAGE_LONG_SIDE_LIMIT)
+        || (page.width <= EMBED_IMAGE_LONG_SIDE_LIMIT
+            && page.height <= EMBED_IMAGE_SHORT_SIDE_LIMIT);
+    if page.width <= 0 || page.height <= 0 || !fits_vendor_limit {
+        return Err(EmbeddingStageError::unit(
+            "embedding-image-validate",
+            "page",
+            unit_index,
+            Some(page.page_number),
+            format!(
+                "page image dimensions {}x{} exceed the supported orientation limits",
+                page.width, page.height
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn persist_embedded_units(
+    state: &AppState,
+    document_id: Uuid,
+    units: &[EmbeddedUnit],
+) -> Result<(), EmbeddingStageError> {
+    let expected_count = i64::try_from(units.len()).map_err(|_| {
+        EmbeddingStageError::document(
+            "embedding-db",
+            "unit count exceeds the database tracking range",
+        )
+    })?;
+    if expected_count == 0 {
+        return Err(EmbeddingStageError::document(
+            "embedding-db",
+            "cannot publish an empty embedding set",
+        ));
+    }
+
+    let mut transaction = state.pool.begin().await.map_err(embedding_db_error)?;
+    let document_state: Option<(String, String)> =
+        sqlx::query_as("SELECT status, artifact_status FROM documents WHERE id = $1 FOR UPDATE")
+            .bind(document_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(embedding_db_error)?;
+    let Some((status, artifact_status)) = document_state else {
+        return Err(EmbeddingStageError::document(
+            "embedding-db",
+            "document was deleted before embedding publication",
+        ));
+    };
+    if status != "processing" || artifact_status != "ready" {
+        return Err(EmbeddingStageError::document(
+            "embedding-db",
+            "document state changed before embedding publication",
+        ));
+    }
+
+    let artifact_count: i64 = sqlx::query_scalar(
+        "SELECT \
+           (SELECT count(*) FROM page_artifacts WHERE document_id = $1) + \
+           (SELECT count(*) FROM text_artifacts WHERE document_id = $1)",
+    )
+    .bind(document_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(embedding_db_error)?;
+    if artifact_count != expected_count {
+        return Err(EmbeddingStageError::document(
+            "embedding-db-count",
+            format!(
+                "artifact count {artifact_count} does not match embedded unit count {expected_count}"
+            ),
+        ));
+    }
+
+    sqlx::query("DELETE FROM document_units WHERE document_id = $1")
+        .bind(document_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(embedding_db_error)?;
+    for unit in units {
+        sqlx::query(
+            "INSERT INTO document_units \
+             (document_id, kind, unit_index, page_number, content, image_path, embedding) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(document_id)
+        .bind(unit.kind)
+        .bind(unit.unit_index)
+        .bind(unit.page_number)
+        .bind(&unit.content)
+        .bind(&unit.image_path)
+        .bind(&unit.embedding)
+        .execute(&mut *transaction)
+        .await
+        .map_err(embedding_db_error)?;
+    }
+
+    let stored_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM document_units WHERE document_id = $1")
+            .bind(document_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(embedding_db_error)?;
+    if stored_count != expected_count {
+        return Err(EmbeddingStageError::document(
+            "embedding-db-count",
+            format!(
+                "stored unit count {stored_count} does not match expected count {expected_count}"
+            ),
+        ));
+    }
+
+    let update = sqlx::query(
+        "UPDATE documents SET status = 'ready', error = NULL \
+         WHERE id = $1 AND status = 'processing' AND artifact_status = 'ready'",
+    )
+    .bind(document_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(embedding_db_error)?;
+    if update.rows_affected() != 1 {
+        return Err(EmbeddingStageError::document(
+            "embedding-db",
+            "document was not eligible to become ready",
+        ));
+    }
+    transaction.commit().await.map_err(embedding_db_error)
+}
+
+#[cfg(test)]
+pub(crate) async fn embed_published_artifacts_for_test(
+    state: &AppState,
+    document_id: Uuid,
+    pages: &[PageArtifact],
+    text_units: &[TextArtifact],
+) -> Result<(), String> {
+    let units = embed_artifact_units(&state.models, pages, text_units)
+        .await
+        .map_err(|error| error.to_string())?;
+    persist_embedded_units(state, document_id, &units)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn embedding_db_error(error: sqlx::Error) -> EmbeddingStageError {
+    EmbeddingStageError::document("embedding-db", format!("embedding write failed: {error}"))
 }
 
 async fn insert_pages(
@@ -803,5 +1227,36 @@ mod tests {
             extracted_text: None,
         }];
         assert!(validate_page_sequence(&pages).is_err());
+    }
+
+    #[test]
+    fn embedding_image_dimensions_follow_vendor_orientation_limits() {
+        let page = |width, height| PageArtifact {
+            document_id: Uuid::new_v4(),
+            page_number: 1,
+            image_path: "never-read.png".to_string(),
+            width,
+            height,
+            extracted_text: None,
+        };
+        assert!(validate_embed_image_dimensions(&page(8_192, 16_384), 0).is_ok());
+        assert!(validate_embed_image_dimensions(&page(16_384, 8_192), 0).is_ok());
+        let error = validate_embed_image_dimensions(&page(8_193, 8_193), 0)
+            .expect_err("both sides cannot exceed the short-side limit");
+        assert_eq!(error.stage, "embedding-image-validate");
+        assert_eq!(error.page_number, Some(1));
+    }
+
+    #[test]
+    fn persisted_error_snippets_redact_image_data_and_long_base64() {
+        let error = format!(
+            "page=2 data:image/png;base64,{} trailing",
+            "A".repeat(MAX_ERROR_CHARS + 100)
+        );
+        let bounded = bounded_error(&error);
+        assert!(bounded.contains("page=2"));
+        assert!(bounded.contains("[REDACTED-IMAGE-DATA]"));
+        assert!(!bounded.contains("data:image"));
+        assert!(bounded.chars().count() <= MAX_ERROR_CHARS);
     }
 }

@@ -1,3 +1,4 @@
+use base64::Engine;
 use futures::StreamExt;
 use reqwest::{Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -13,9 +14,14 @@ pub const RERANK_MODEL_FAMILY: &str = "llama-nemotron-rerank-vl-1b-v2";
 pub const DEFAULT_EMBED_MODEL_ID: &str = "nvidia/llama-nemotron-embed-vl-1b-v2";
 pub const DEFAULT_RERANK_MODEL_ID: &str = "nvidia/llama-nemotron-rerank-vl-1b-v2";
 pub const EMBEDDING_DIMENSIONS: usize = 2048;
+pub const MAX_EMBED_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 
 const DEFAULT_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const MAX_EMBED_REQUEST_BYTES: usize = 36 * 1024 * 1024;
+const DEFAULT_EMBED_MAX_ATTEMPTS: usize = 3;
+const DEFAULT_EMBED_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const DEFAULT_EMBED_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
@@ -413,14 +419,33 @@ pub struct ChatStreamDelta {
     pub content: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct EmbeddingRequest {
     pub model: String,
     pub input: Vec<String>,
     pub encoding_format: String,
+    pub embedding_type: String,
     pub input_type: String,
     pub modality: String,
     pub truncate: String,
+}
+
+impl fmt::Debug for EmbeddingRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EmbeddingRequest")
+            .field("model", &self.model)
+            .field(
+                "input",
+                &format_args!("[REDACTED; {} item(s)]", self.input.len()),
+            )
+            .field("encoding_format", &self.encoding_format)
+            .field("embedding_type", &self.embedding_type)
+            .field("input_type", &self.input_type)
+            .field("modality", &self.modality)
+            .field("truncate", &self.truncate)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,6 +500,25 @@ pub struct RerankResult {
     pub logit: f32,
 }
 
+#[derive(Debug, Clone)]
+struct EmbeddingRetryConfig {
+    max_attempts: usize,
+    base_delay: Duration,
+    max_delay: Duration,
+    jitter: bool,
+}
+
+impl Default for EmbeddingRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_EMBED_MAX_ATTEMPTS,
+            base_delay: DEFAULT_EMBED_RETRY_BASE_DELAY,
+            max_delay: DEFAULT_EMBED_RETRY_MAX_DELAY,
+            jitter: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CloudModelClient {
     http: reqwest::Client,
@@ -486,6 +530,9 @@ pub struct CloudModelClient {
     embed_model: String,
     rerank_model: String,
     request_timeout: Duration,
+    embedding_retry: EmbeddingRetryConfig,
+    #[cfg(test)]
+    embedding_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CloudModelClient {
@@ -508,6 +555,9 @@ impl CloudModelClient {
             embed_model: config.embed_model,
             rerank_model: config.rerank_model,
             request_timeout: config.request_timeout,
+            embedding_retry: EmbeddingRetryConfig::default(),
+            #[cfg(test)]
+            embedding_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -527,7 +577,33 @@ impl CloudModelClient {
             rerank_model: DEFAULT_RERANK_MODEL_ID.to_string(),
             request_timeout: Duration::from_secs(1),
         };
-        Self::new(config).expect("static cloud model test config must be valid")
+        let mut client = Self::new(config).expect("static cloud model test config must be valid");
+        client.embedding_retry = EmbeddingRetryConfig {
+            max_attempts: DEFAULT_EMBED_MAX_ATTEMPTS,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            jitter: false,
+        };
+        client
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_embed_endpoint(endpoint: &str, timeout: Duration) -> Self {
+        let mut client = Self::for_test();
+        client.embed_endpoint = Url::parse(endpoint).expect("test embed endpoint must be valid");
+        client.request_timeout = timeout;
+        client.http = reqwest::Client::builder()
+            .connect_timeout(timeout.min(Duration::from_millis(100)))
+            .timeout(timeout)
+            .build()
+            .expect("test HTTP client must be valid");
+        client
+    }
+
+    #[cfg(test)]
+    fn embedding_attempt_count(&self) -> usize {
+        self.embedding_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub async fn stream_chat(&self, messages: Vec<ChatMessage>, tx: Sender<SseEvent>) {
@@ -650,6 +726,27 @@ impl CloudModelClient {
         self.embed_text(text, "passage").await
     }
 
+    pub async fn embed_image_passage(&self, image: &[u8]) -> CloudModelResult<Vec<f32>> {
+        let data_url = image_data_url(image)?;
+        self.embed_input(data_url, "passage", "image").await
+    }
+
+    pub async fn embed_image_text_passage(
+        &self,
+        text: &str,
+        image: &[u8],
+    ) -> CloudModelResult<Vec<f32>> {
+        if text.trim().is_empty() {
+            return Err(CloudModelError::InvalidRequest {
+                operation: ModelOperation::Embed,
+                message: "text_image input requires non-empty text".to_string(),
+            });
+        }
+        let data_url = image_data_url(image)?;
+        let input = format!("{}\n<img src=\"{data_url}\"/>", text.trim());
+        self.embed_input(input, "passage", "text_image").await
+    }
+
     pub async fn embed_text(&self, text: &str, input_type: &str) -> CloudModelResult<Vec<f32>> {
         if text.trim().is_empty() {
             return Err(CloudModelError::InvalidRequest {
@@ -664,18 +761,40 @@ impl CloudModelClient {
             });
         }
 
+        self.embed_input(text.to_string(), input_type, "text").await
+    }
+
+    async fn embed_input(
+        &self,
+        input: String,
+        input_type: &str,
+        modality: &str,
+    ) -> CloudModelResult<Vec<f32>> {
         let request = EmbeddingRequest {
             model: self.embed_model.clone(),
-            input: vec![text.to_string()],
+            input: vec![input],
             encoding_format: "float".to_string(),
+            embedding_type: "float".to_string(),
             input_type: input_type.to_string(),
-            modality: "text".to_string(),
+            modality: modality.to_string(),
             truncate: "END".to_string(),
         };
-        let response = self
-            .send_json(ModelOperation::Embed, &self.embed_endpoint, &request)
-            .await?;
-        let response: EmbeddingResponse = self.decode_json(ModelOperation::Embed, response).await?;
+        let payload_size = serde_json::to_vec(&request)
+            .map_err(|_| CloudModelError::InvalidRequest {
+                operation: ModelOperation::Embed,
+                message: "request payload could not be serialized".to_string(),
+            })?
+            .len();
+        if payload_size > MAX_EMBED_REQUEST_BYTES {
+            return Err(CloudModelError::InvalidRequest {
+                operation: ModelOperation::Embed,
+                message: format!(
+                    "request payload is {payload_size} bytes; maximum is {MAX_EMBED_REQUEST_BYTES} bytes"
+                ),
+            });
+        }
+
+        let response = self.send_embedding_request(&request).await?;
         let embedding = response
             .data
             .into_iter()
@@ -685,17 +804,7 @@ impl CloudModelClient {
                 operation: ModelOperation::Embed,
                 message: "missing data[0].embedding".to_string(),
             })?;
-
-        if embedding.len() != EMBEDDING_DIMENSIONS {
-            return Err(CloudModelError::InvalidResponse {
-                operation: ModelOperation::Embed,
-                message: format!(
-                    "expected {EMBEDDING_DIMENSIONS} dimensions from {EMBED_MODEL_FAMILY}, received {}",
-                    embedding.len()
-                ),
-            });
-        }
-        Ok(embedding)
+        validate_embedding(embedding)
     }
 
     pub async fn rerank(
@@ -790,6 +899,58 @@ impl CloudModelClient {
         Ok(think_re.replace_all(&content, "").trim().to_string())
     }
 
+    async fn send_embedding_request(
+        &self,
+        request: &EmbeddingRequest,
+    ) -> CloudModelResult<EmbeddingResponse> {
+        for attempt in 1..=self.embedding_retry.max_attempts {
+            #[cfg(test)]
+            self.embedding_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let result = async {
+                let response = self
+                    .send_json(ModelOperation::Embed, &self.embed_endpoint, request)
+                    .await?;
+                self.decode_json(ModelOperation::Embed, response).await
+            }
+            .await;
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if error.is_retryable() && attempt < self.embedding_retry.max_attempts =>
+                {
+                    tokio::time::sleep(self.embedding_retry_delay(attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("embedding retry configuration always has at least one attempt")
+    }
+
+    fn embedding_retry_delay(&self, failed_attempt: usize) -> Duration {
+        let exponent = u32::try_from(failed_attempt.saturating_sub(1))
+            .unwrap_or(u32::MAX)
+            .min(31);
+        let multiplier = 1_u32 << exponent;
+        let exponential = self
+            .embedding_retry
+            .base_delay
+            .checked_mul(multiplier)
+            .unwrap_or(self.embedding_retry.max_delay)
+            .min(self.embedding_retry.max_delay);
+        if !self.embedding_retry.jitter || exponential.is_zero() {
+            return exponential;
+        }
+
+        // Equal jitter keeps a minimum delay while spreading retries over the
+        // upper half of the exponentially growing window.
+        let half = exponential / 2;
+        let jitter_window_ms = exponential.saturating_sub(half).as_millis();
+        let upper_bound = jitter_window_ms.saturating_add(1);
+        let random = (uuid::Uuid::new_v4().as_u128() % upper_bound) as u64;
+        half.saturating_add(Duration::from_millis(random))
+    }
+
     async fn send_json<T: Serialize + ?Sized>(
         &self,
         operation: ModelOperation,
@@ -829,7 +990,16 @@ impl CloudModelClient {
 
     async fn http_error(&self, operation: ModelOperation, response: Response) -> CloudModelError {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::with_capacity(4_096);
+        while body.len() < 4_096
+            && let Some(chunk) = stream.next().await
+        {
+            let Ok(chunk) = chunk else { break };
+            let remaining = 4_096 - body.len();
+            body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        let body = String::from_utf8_lossy(&body);
         CloudModelError::Http {
             operation,
             status,
@@ -860,20 +1030,77 @@ impl CloudModelClient {
         } else {
             text.replace(&self.api_key, "[REDACTED]")
         };
+        let data_urls = regex::Regex::new(r"(?i)data:image/(?:png|jpeg);base64,[A-Za-z0-9+/=_-]*")
+            .expect("valid data URL regex");
+        let without_images = data_urls
+            .replace_all(&without_key, "[REDACTED-IMAGE-DATA]")
+            .to_string();
+        let long_base64 =
+            regex::Regex::new(r"[A-Za-z0-9+/]{64,}={0,2}").expect("valid base64 regex");
+        let without_base64 = long_base64
+            .replace_all(&without_images, "[REDACTED-BASE64]")
+            .to_string();
         let auth_header = regex::Regex::new("(?i)authorization").expect("valid auth regex");
         auth_header
-            .replace_all(&without_key, "[REDACTED-HEADER]")
+            .replace_all(&without_base64, "[REDACTED-HEADER]")
             .to_string()
     }
+}
+
+fn image_data_url(image: &[u8]) -> CloudModelResult<String> {
+    if image.is_empty() {
+        return Err(CloudModelError::InvalidRequest {
+            operation: ModelOperation::Embed,
+            message: "image input must not be empty".to_string(),
+        });
+    }
+    if image.len() > MAX_EMBED_IMAGE_BYTES {
+        return Err(CloudModelError::InvalidRequest {
+            operation: ModelOperation::Embed,
+            message: format!(
+                "decoded image payload is {} bytes; maximum is {MAX_EMBED_IMAGE_BYTES} bytes",
+                image.len()
+            ),
+        });
+    }
+
+    let mime = if image.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if image.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else {
+        return Err(CloudModelError::InvalidRequest {
+            operation: ModelOperation::Embed,
+            message: "image input must be a PNG or JPEG payload".to_string(),
+        });
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(image);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+fn validate_embedding(embedding: Vec<f32>) -> CloudModelResult<Vec<f32>> {
+    if embedding.len() != EMBEDDING_DIMENSIONS {
+        return Err(CloudModelError::InvalidResponse {
+            operation: ModelOperation::Embed,
+            message: format!(
+                "expected {EMBEDDING_DIMENSIONS} dimensions from {EMBED_MODEL_FAMILY}, received {}",
+                embedding.len()
+            ),
+        });
+    }
+    if let Some(index) = embedding.iter().position(|value| !value.is_finite()) {
+        return Err(CloudModelError::InvalidResponse {
+            operation: ModelOperation::Embed,
+            message: format!("embedding contains a non-finite value at index {index}"),
+        });
+    }
+    Ok(embedding)
 }
 
 fn retryable_status(status: StatusCode) -> bool {
     matches!(
         status,
-        StatusCode::REQUEST_TIMEOUT
-            | StatusCode::CONFLICT
-            | StatusCode::TOO_EARLY
-            | StatusCode::TOO_MANY_REQUESTS
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
     ) || status.is_server_error()
 }
 
@@ -978,6 +1205,9 @@ mod tests {
         Success,
         EchoSecretError,
         Slow,
+        RetryOnce(StatusCode),
+        PermanentBadRequest,
+        WrongDimensions,
     }
 
     #[derive(Debug)]
@@ -1004,21 +1234,24 @@ mod tests {
         let bytes = to_bytes(body, usize::MAX).await.expect("read mock request");
         let body: serde_json::Value =
             serde_json::from_slice(&bytes).expect("mock request contains JSON");
-        state
-            .requests
-            .lock()
-            .expect("request lock")
-            .push(RecordedRequest {
+        let request_number = {
+            let mut requests = state.requests.lock().expect("request lock");
+            requests.push(RecordedRequest {
                 path: path.clone(),
                 authorization: authorization.clone(),
                 body: body.clone(),
             });
+            requests.len()
+        };
 
         match state.mode {
             MockMode::EchoSecretError => {
                 let response_body = format!(
-                    "Authorization: {} {}",
+                    "Authorization: {} echoed-input={} {}",
                     authorization.unwrap_or_default(),
+                    body.pointer("/input/0")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
                     "錯誤".repeat(700)
                 );
                 return (
@@ -1029,7 +1262,13 @@ mod tests {
                     .into_response();
             }
             MockMode::Slow => tokio::time::sleep(Duration::from_millis(100)).await,
-            MockMode::Success => {}
+            MockMode::RetryOnce(status) if request_number == 1 => {
+                return status.into_response();
+            }
+            MockMode::PermanentBadRequest => {
+                return (StatusCode::BAD_REQUEST, "invalid request").into_response();
+            }
+            MockMode::Success | MockMode::RetryOnce(_) | MockMode::WrongDimensions => {}
         }
 
         match path.as_str() {
@@ -1050,7 +1289,12 @@ mod tests {
             )
                 .into_response(),
             "/embeddings" | "/capabilities/embed" => {
-                let embedding = vec![0.25_f32; EMBEDDING_DIMENSIONS];
+                let dimensions = if matches!(state.mode, MockMode::WrongDimensions) {
+                    EMBEDDING_DIMENSIONS - 1
+                } else {
+                    EMBEDDING_DIMENSIONS
+                };
+                let embedding = vec![0.25_f32; dimensions];
                 let response_body = serde_json::json!({
                     "data": [{"index": 0, "embedding": embedding}]
                 })
@@ -1110,6 +1354,23 @@ mod tests {
             ("CLOUD_MODEL_BASE_URL", base_url),
         ])
         .expect("valid test config")
+    }
+
+    fn test_client(base_url: &str, api_key: &str, timeout: Duration) -> CloudModelClient {
+        let mut config = test_config(base_url, api_key);
+        config.request_timeout = timeout;
+        let mut client = CloudModelClient::new(config).expect("cloud client");
+        client.embedding_retry = EmbeddingRetryConfig {
+            max_attempts: DEFAULT_EMBED_MAX_ATTEMPTS,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            jitter: false,
+        };
+        client
+    }
+
+    fn minimal_png() -> Vec<u8> {
+        b"\x89PNG\r\n\x1a\nmock-png-payload".to_vec()
     }
 
     #[test]
@@ -1209,8 +1470,28 @@ mod tests {
         assert_eq!(text, "雲端回答");
         assert!(done);
 
-        let embedding = client.embed_query("query").await.expect("embedding");
-        assert_eq!(embedding.len(), EMBEDDING_DIMENSIONS);
+        let query_embedding = client.embed_query("query").await.expect("query embedding");
+        let passage_embedding = client
+            .embed_passage("passage")
+            .await
+            .expect("passage embedding");
+        let image = minimal_png();
+        let image_embedding = client
+            .embed_image_passage(&image)
+            .await
+            .expect("image embedding");
+        let mixed_embedding = client
+            .embed_image_text_passage("same-page text", &image)
+            .await
+            .expect("image and text embedding");
+        for embedding in [
+            query_embedding,
+            passage_embedding,
+            image_embedding,
+            mixed_embedding,
+        ] {
+            assert_eq!(embedding.len(), EMBEDDING_DIMENSIONS);
+        }
 
         let ranking = client
             .rerank(
@@ -1222,7 +1503,7 @@ mod tests {
         assert_eq!(ranking.rankings[0].index, 1);
 
         let requests = state.requests.lock().expect("request lock");
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 6);
         assert!(
             requests
                 .iter()
@@ -1236,14 +1517,39 @@ mod tests {
         assert_eq!(chat.body["model"], "hosted/google-gemma-4-test");
         assert_eq!(chat.body["stream"], true);
 
-        let embed = requests
+        let embeds = requests
             .iter()
-            .find(|request| request.path == "/capabilities/embed")
-            .expect("embed request");
-        assert_eq!(embed.body["model"], DEFAULT_EMBED_MODEL_ID);
-        assert_eq!(embed.body["input_type"], "query");
-        assert_eq!(embed.body["modality"], "text");
-        assert!(embed.body.get("dimensions").is_none());
+            .filter(|request| request.path == "/capabilities/embed")
+            .collect::<Vec<_>>();
+        assert_eq!(embeds.len(), 4);
+        assert!(embeds.iter().all(|request| {
+            request.body["model"] == DEFAULT_EMBED_MODEL_ID
+                && request.body["embedding_type"] == "float"
+                && request.body["encoding_format"] == "float"
+                && request.body["truncate"] == "END"
+                && request.body.get("dimensions").is_none()
+        }));
+        assert_eq!(embeds[0].body["input_type"], "query");
+        assert_eq!(embeds[0].body["modality"], "text");
+        assert_eq!(embeds[0].body["input"][0], "query");
+        assert_eq!(embeds[1].body["input_type"], "passage");
+        assert_eq!(embeds[1].body["modality"], "text");
+        assert_eq!(embeds[1].body["input"][0], "passage");
+        assert_eq!(embeds[2].body["input_type"], "passage");
+        assert_eq!(embeds[2].body["modality"], "image");
+        let image_input = embeds[2].body["input"][0]
+            .as_str()
+            .expect("image input string");
+        assert!(image_input.starts_with("data:image/png;base64,"));
+        assert!(!image_input.contains("/tmp/"));
+        assert!(!image_input.contains("pages/"));
+        assert_eq!(embeds[3].body["input_type"], "passage");
+        assert_eq!(embeds[3].body["modality"], "text_image");
+        let mixed_input = embeds[3].body["input"][0]
+            .as_str()
+            .expect("text_image input string");
+        assert!(mixed_input.starts_with("same-page text\n<img src=\"data:image/png;base64,"));
+        assert!(mixed_input.ends_with("\"/>"));
 
         let rerank = requests
             .iter()
@@ -1255,12 +1561,13 @@ mod tests {
 
     #[tokio::test]
     async fn http_errors_are_bounded_retryable_and_secret_safe() {
-        let (base_url, _state, server) = spawn_mock(MockMode::EchoSecretError).await;
-        let client = CloudModelClient::new(test_config(&base_url, "never-print-this-token"))
-            .expect("cloud client");
+        let (base_url, state, server) = spawn_mock(MockMode::EchoSecretError).await;
+        let client = test_client(&base_url, "never-print-this-token", Duration::from_secs(1));
+        let image = minimal_png();
+        let encoded_image = base64::engine::general_purpose::STANDARD.encode(&image);
 
         let error = client
-            .embed_query("query")
+            .embed_image_passage(&image)
             .await
             .expect_err("mock returns an error");
         assert_eq!(error.status(), Some(StatusCode::TOO_MANY_REQUESTS));
@@ -1277,15 +1584,54 @@ mod tests {
         let rendered = error.to_string().to_ascii_lowercase();
         assert!(!rendered.contains("never-print-this-token"));
         assert!(!rendered.contains("authorization"));
+        assert!(!rendered.contains("data:image"));
+        assert!(!rendered.contains(&encoded_image.to_ascii_lowercase()));
+        assert_eq!(client.embedding_attempt_count(), 3);
+        assert!(state.requests.lock().expect("request lock").len() <= 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retryable_http_statuses_retry_once_then_succeed() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let (base_url, state, server) = spawn_mock(MockMode::RetryOnce(status)).await;
+            let client = test_client(&base_url, "test-api-key", Duration::from_secs(1));
+
+            let embedding = client
+                .embed_passage("retry passage")
+                .await
+                .unwrap_or_else(|error| panic!("second attempt after {status} failed: {error}"));
+            assert_eq!(embedding.len(), EMBEDDING_DIMENSIONS);
+            assert_eq!(client.embedding_attempt_count(), 2);
+            assert_eq!(state.requests.lock().expect("request lock").len(), 2);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_client_error_is_not_retried() {
+        let (base_url, state, server) = spawn_mock(MockMode::PermanentBadRequest).await;
+        let client = test_client(&base_url, "test-api-key", Duration::from_secs(1));
+
+        let error = client
+            .embed_passage("invalid passage")
+            .await
+            .expect_err("400 must fail immediately");
+        assert_eq!(error.status(), Some(StatusCode::BAD_REQUEST));
+        assert!(!error.is_retryable());
+        assert_eq!(client.embedding_attempt_count(), 1);
+        assert_eq!(state.requests.lock().expect("request lock").len(), 1);
         server.abort();
     }
 
     #[tokio::test]
     async fn request_timeout_is_typed_and_retryable() {
-        let (base_url, _state, server) = spawn_mock(MockMode::Slow).await;
-        let mut config = test_config(&base_url, "test-api-key");
-        config.request_timeout = Duration::from_millis(10);
-        let client = CloudModelClient::new(config).expect("cloud client");
+        let (base_url, state, server) = spawn_mock(MockMode::Slow).await;
+        let client = test_client(&base_url, "test-api-key", Duration::from_millis(10));
 
         let error = client
             .embed_query("query")
@@ -1294,7 +1640,97 @@ mod tests {
         assert!(error.is_timeout());
         assert!(error.is_retryable());
         assert_eq!(error.status(), None);
+        assert_eq!(client.embedding_attempt_count(), 3);
+        assert!(state.requests.lock().expect("request lock").len() <= 3);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn wrong_embedding_dimensions_are_rejected_without_retry() {
+        let (base_url, state, server) = spawn_mock(MockMode::WrongDimensions).await;
+        let client = test_client(&base_url, "test-api-key", Duration::from_secs(1));
+
+        let error = client
+            .embed_query("query")
+            .await
+            .expect_err("2047-dimensional response must fail");
+        assert!(error.to_string().contains("expected 2048"));
+        assert!(!error.is_retryable());
+        assert_eq!(client.embedding_attempt_count(), 1);
+        assert_eq!(state.requests.lock().expect("request lock").len(), 1);
+        server.abort();
+    }
+
+    #[test]
+    fn embedding_validation_rejects_nan_and_infinity() {
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut embedding = vec![0.0; EMBEDDING_DIMENSIONS];
+            embedding[17] = invalid;
+            let error = validate_embedding(embedding).expect_err("non-finite value must fail");
+            assert!(error.to_string().contains("index 17"));
+            assert!(!error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn image_payload_rejects_unsupported_mime_and_oversize_data() {
+        let error = image_data_url(b"GIF89a").expect_err("GIF must not be sent");
+        assert!(error.to_string().contains("PNG or JPEG"));
+
+        let oversized = vec![0_u8; MAX_EMBED_IMAGE_BYTES + 1];
+        let error = image_data_url(&oversized).expect_err("oversize image must not be encoded");
+        assert!(error.to_string().contains("maximum"));
+    }
+
+    #[test]
+    fn only_contract_http_statuses_are_retryable() {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(retryable_status(status), "{status} should be retryable");
+        }
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::CONFLICT,
+            StatusCode::TOO_EARLY,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert!(!retryable_status(status), "{status} must fail immediately");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit NVIDIA cloud credentials and incurs four embedding calls"]
+    async fn real_nemotron_embed_vl_smoke_covers_all_input_modalities() -> anyhow::Result<()> {
+        dotenvy::dotenv().ok();
+        let client = CloudModelClient::new(CloudModelConfig::from_env()?)?;
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            16,
+            16,
+            image::Rgba([32, 64, 96, 255]),
+        ));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut cursor, image::ImageFormat::Png)?;
+        let image = cursor.into_inner();
+
+        let embeddings = [
+            client.embed_query("What is this document about?").await?,
+            client
+                .embed_passage("A short text document passage.")
+                .await?,
+            client.embed_image_passage(&image).await?,
+            client
+                .embed_image_text_passage("Text extracted from the same page.", &image)
+                .await?,
+        ];
+        assert!(embeddings.iter().all(|embedding| {
+            embedding.len() == EMBEDDING_DIMENSIONS
+                && embedding.iter().all(|value| value.is_finite())
+        }));
+        Ok(())
     }
 
     #[test]
