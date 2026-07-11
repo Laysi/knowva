@@ -7,7 +7,6 @@ use tokio::sync::mpsc::Sender;
 
 pub const SYSTEM_PROMPT: &str =
     "你是企業內部的 AI 知識管理助理,依據知識庫內容協助回答問題與整理資訊。一律使用繁體中文回答。";
-pub const TRANSCRIBE_PROMPT: &str = "請將這張文件頁面的內容完整轉錄為 Markdown:保留原有標題階層與段落順序;表格轉成 Markdown 表格;圖表與圖片改以文字簡述其內容與數據;保留所有數字、單位與代號。不要省略內容,不要輸出任何前言、評論或結尾說明,只輸出轉錄後的 Markdown。";
 
 pub const EMBED_MODEL_FAMILY: &str = "llama-nemotron-embed-vl-1b-v2";
 pub const RERANK_MODEL_FAMILY: &str = "llama-nemotron-rerank-vl-1b-v2";
@@ -637,52 +636,6 @@ impl CloudModelClient {
             2048,
             Some(0.2),
         );
-        let response = self
-            .send_json(ModelOperation::Chat, &self.chat_endpoint, &request)
-            .await?;
-        self.chat_content(response).await
-    }
-
-    pub async fn transcribe_file(
-        &self,
-        extension: &str,
-        bytes: Vec<u8>,
-    ) -> CloudModelResult<String> {
-        let mime = match extension {
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            _ => {
-                return Err(CloudModelError::InvalidRequest {
-                    operation: ModelOperation::Chat,
-                    message: "legacy whole-file transcription only accepts PNG/JPG/GIF/WebP; page conversion is handled by a later MVP issue".to_string(),
-                });
-            }
-        };
-
-        use base64::Engine as _;
-        let data_url = format!(
-            "data:{mime};base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        );
-        let request = ChatCompletionRequest {
-            model: self.chat_model.clone(),
-            messages: vec![ApiChatMessage {
-                role: "user".to_string(),
-                content: ApiChatContent::Parts(vec![
-                    ApiChatContentPart::Text {
-                        text: TRANSCRIBE_PROMPT.to_string(),
-                    },
-                    ApiChatContentPart::ImageUrl {
-                        image_url: ApiImageUrl { url: data_url },
-                    },
-                ]),
-            }],
-            stream: false,
-            max_tokens: 4096,
-            temperature: Some(0.1),
-        };
         let response = self
             .send_json(ModelOperation::Chat, &self.chat_endpoint, &request)
             .await?;

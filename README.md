@@ -12,7 +12,7 @@
 | 向量嵌入 | `nvidia/llama-nemotron-embed-vl-1b-v2`，輸出 2048 維 float embedding |
 | 精排 | `nvidia/llama-nemotron-rerank-vl-1b-v2` |
 
-後端保留 OpenAI-compatible `/chat/completions` SSE，並提供 typed embedding 與 reranking client。頁面化 ingestion、2048 維資料表 migration 與把 rerank 接入檢索流程由後續 MVP issue 完成。
+後端保留 OpenAI-compatible `/chat/completions` SSE，並提供 typed embedding 與 reranking client。頁面化 ingestion 已採模型無關的 artifact staging：PDF、Office 與圖片產生可追蹤頁圖，MD/TXT 產生標題感知文字單元；下一階段才會以固定 Nemotron Embed VL 建立 `halfvec(2048)` 檢索單元。
 
 ## 技術架構
 
@@ -22,11 +22,14 @@
 | 後端 | Rust（axum + tokio + sqlx），單一 binary |
 | 資料庫 | PostgreSQL 17 + pgvector |
 | 模型呼叫 | 單一 cloud-model HTTP client；Gemma 4 + Nemotron Embed/Rerank VL |
-| 檔案儲存 | `backend/data/files/` |
+| 檔案儲存 | `backend/data/files/{document_id}/`；原檔與每次完整 artifact run 分開保存 |
 
 ## 前置需求
 
-- Docker、Rust toolchain、Node.js
+- Docker（完整容器啟動只需要 Docker）
+- 本機開發另需 [proto](https://moonrepo.dev/proto)；repository 的 `.prototools` 會安裝固定版本的 Rust、Node.js 與 npm
+- 不使用容器轉檔時，主機需另裝 Pdfium 動態函式庫；可安裝在系統 library path，或以 `PDFIUM_LIBRARY_PATH` 指定檔案／目錄
+- 不使用容器處理 DOCX/PPTX/XLSX 時，主機需另裝 LibreOffice headless 與所需 CJK 字型
 - 可呼叫上述三個固定模型的雲端 API key
 - 由實際雲端端點確認過的 Gemma 4 model id
 
@@ -59,28 +62,68 @@ GEMMA_4_MODEL_ID=the-confirmed-cloud-gemma-4-id
 
 API key 或 Gemma 4 model id 缺失時，後端會在連接資料庫與接受流量前停止並顯示可理解的錯誤。啟動 log 只會列 endpoint、model id 與 timeout，不會列出 token。
 
-## 快速開始
+文件前處理設定：
+
+| 環境變數 | 預設值 | 說明 |
+|---|---|---|
+| `FILES_DIR` | `./data/files` | 原檔、頁圖、轉出 PDF 與 manifest 的根目錄 |
+| `PDF_RENDER_DPI` | `180` | Pdfium rasterize DPI；允許 72–600 |
+| `DOCUMENT_CONVERSION_TIMEOUT_SECS` | `120` | 每次 Pdfium 圖片處理或 LibreOffice 轉檔 timeout，必須為正整數 |
+| `PDFIUM_LIBRARY_PATH` | 空 | 完整 library 路徑或所在目錄；空值時依序搜尋執行檔旁與系統 library path |
+| `LIBREOFFICE_BIN` | `libreoffice` | LibreOffice executable 路徑或命令名 |
+
+支援 PDF、PNG/JPEG/WebP、DOCX/PPTX/XLSX、MD/Markdown/TXT，HTTP 上傳上限為 50 MiB。CSV/HTML 與舊版 Office 格式目前不在支援清單。
+
+## 使用 Docker Compose
+
+容器映像已包含 Pdfium、LibreOffice 與 Noto CJK 字型，不需要主機另外提供 PDF API 或 native library。先設定 `.env` 的 `NVIDIA_API_KEY` 與 `GEMMA_4_MODEL_ID`，再啟動完整服務：
 
 ```bash
-docker compose up -d
+cp .env.example .env
+# 編輯 .env，填入必要的雲端模型設定
+docker compose up -d --build
+docker compose ps
+curl http://localhost:8080/api/health
+```
+
+預設網址是 `http://localhost:8080`；可在 `.env` 以 `APP_PORT` 改變主機 port。`app_files` 與 `pgdata` named volumes 會保存上傳檔案與資料庫。查看或停止服務：
+
+```bash
+docker compose logs -f app
+docker compose down
+```
+
+若要在 build 階段實際驗證 Pdfium 與 LibreOffice 對 PDF、掃描 PDF、DOCX、PPTX、XLSX 的分頁與頁序：
+
+```bash
+docker build --target native-test -t ai-km-demo:native-test .
+```
+
+## 本機開發
+
+先依 `.prototools` 安裝工具，再只啟動資料庫：
+
+```bash
+proto install
+docker compose up -d postgres
 
 cd backend
-cargo run                         # http://localhost:8080
+proto exec rust -- cargo run      # http://localhost:8080
 ```
 
 前端開發模式（另開終端）：
 
 ```bash
 cd frontend
-npm install
-npm run dev                       # http://localhost:5173，proxy /api 到 :8080
+proto run npm -- ci
+proto run npm -- run dev          # http://localhost:5173，proxy /api 到 :8080
 ```
 
 或建立 production bundle，交由後端服務：
 
 ```bash
 cd frontend
-npm run build
+proto run npm -- run build
 ```
 
 ## API
@@ -88,20 +131,49 @@ npm run build
 | Method | Path | 說明 |
 |---|---|---|
 | GET | `/api/health` | 健康檢查 |
-| GET | `/api/documents` | 文件列表（含狀態、摘要、標籤、段落數） |
-| POST | `/api/documents` | multipart 上傳（欄位 `file`），立即回 id，背景處理 |
-| DELETE | `/api/documents/{id}` | 刪除文件與實體檔案 |
+| GET | `/api/documents` | 文件列表（含文件／artifact 狀態、頁數與檢索單元數） |
+| POST | `/api/documents` | multipart 上傳（單一 `file` 欄位），立即回 id，背景處理 |
+| DELETE | `/api/documents/{id}` | 刪除 DB row、原檔、轉出 PDF、頁圖、manifest 與暫存物 |
 | POST | `/api/chat` | SSE 串流問答（`text-delta` / `sources` / `done` / `error`） |
 
 `/api/chat` 的純文字串流契約維持不變；有檢索來源時，`sources` 一定在 `done` 前送出。模型端 HTTP 錯誤包含 status、最多 500 字的安全 response snippet 與可重試狀態；timeout 也會以統一錯誤回傳。
+
+## Artifact 契約
+
+分頁文件的典型布局如下；每次重試會先建立同檔案系統的暫存 run，全部成功後才以 rename 發布，DB 也在單一 transaction 內切換 current artifact set：
+
+```text
+FILES_DIR/{document_id}/
+├── original.ext
+└── artifacts-{run_id}/
+    ├── converted.pdf       # 僅 Office
+    ├── manifest.json
+    └── pages/
+        ├── 0001.png
+        └── 0002.png
+```
+
+`page_artifacts` 保存 1-based `page_number`、圖片路徑、尺寸與可空的 PDF 文字層；掃描頁沒有文字仍是有效頁面。極端 PDF MediaBox 仍依設定 DPI 縮放，但輸出單邊上限為 8192 px，避免 native bitmap 無界配置。MD/TXT 不製造假頁碼，改存 `text_artifacts`。此階段完全不呼叫模型，也不製造零向量：artifact 完成時 `artifact_status=ready`，但文件仍維持 `status=processing`，直到後續 embedding 階段產生真正的 2048 維向量。
 
 ## 驗證
 
 ```bash
 cd backend
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+proto exec rust -- cargo fmt --check
+proto exec rust -- cargo clippy --all-targets -- -D warnings
+proto exec rust -- cargo test
 ```
+
+一般測試會產生並驗證合成 fixture，但不要求開發機預裝外部轉檔工具。安裝 Pdfium 與 LibreOffice 後，可明確執行真實轉換 smoke test：
+
+```bash
+cd backend
+PDFIUM_LIBRARY_PATH=/path/to/libpdfium.so \
+LIBREOFFICE_BIN=libreoffice \
+proto exec rust -- cargo test page_artifacts::tests::generated_pdf_and_office_fixtures_preserve_page_order \
+  -- --ignored --exact --nocapture
+```
+
+fixture 的來源、預期頁數與涵蓋範圍見 [backend/tests/fixtures/README.md](backend/tests/fixtures/README.md)。
 
 詳細 MVP 規劃見 [docs/mvp-now.md](docs/mvp-now.md)。

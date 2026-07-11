@@ -1,81 +1,132 @@
 use crate::AppState;
+use crate::page_artifacts::{
+    ArtifactError, ArtifactManifest, PageArtifact, SourceKind, TextArtifact,
+};
 use axum::Json;
 use axum::extract::{Multipart, Path as AxumPath, State};
 use axum::http::StatusCode;
 use serde::Serialize;
-use std::sync::Arc;
+use sqlx::{Postgres, Transaction};
+use std::collections::HashMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
-const MAX_CHUNK_CHARS: usize = 2000;
-const HARD_MAX_CHUNK_CHARS: usize = 3000;
+const MAX_CHUNK_CHARS: usize = 2_000;
+const HARD_MAX_CHUNK_CHARS: usize = 3_000;
 const OVERLAP_CHARS: usize = 200;
-// Keep legacy image transcription payloads bounded until page-based ingestion replaces this path.
-const MAX_TRANSCRIBE_BYTES: usize = 4_000_000;
+const MAX_ERROR_CHARS: usize = 1_000;
+pub const MAX_UPLOAD_BYTES: usize = 50 * 1_048_576;
+pub const MULTIPART_BODY_LIMIT_BYTES: usize = MAX_UPLOAD_BYTES + 1_048_576;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DocumentLocks {
+    locks: Arc<Mutex<HashMap<Uuid, Weak<Mutex<()>>>>>,
+}
+
+impl DocumentLocks {
+    pub(crate) async fn lock(&self, document_id: Uuid) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&document_id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(document_id, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub struct UploadResponse {
     id: Uuid,
     status: String,
+    artifact_status: String,
 }
 
-/// POST /api/documents - multipart upload, saves file, kicks off background processing.
+#[derive(Debug)]
+struct PreparedArtifactSet {
+    source_kind: SourceKind,
+    artifact_dir: PathBuf,
+    manifest_path: PathBuf,
+    converted_pdf_path: Option<PathBuf>,
+    pages: Vec<PageArtifact>,
+    text_units: Vec<TextArtifact>,
+}
+
+/// POST /api/documents - save one supported file and start model-free artifact conversion.
 pub async fn upload_document(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<UploadResponse>), (StatusCode, String)> {
-    let mut file_bytes: Option<Vec<u8>> = None;
-    let mut original_filename: Option<String> = None;
+    let mut upload: Option<(String, Vec<u8>)> = None;
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
-    {
-        if field.name() == Some("file") {
-            original_filename = field.file_name().map(|s| s.to_string());
-            let bytes = field
-                .bytes()
-                .await
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-            file_bytes = Some(bytes.to_vec());
+    loop {
+        let field = multipart.next_field().await.map_err(multipart_error)?;
+        let Some(field) = field else { break };
+        if field.name() != Some("file") {
+            continue;
         }
+        if upload.is_some() {
+            return Err((StatusCode::BAD_REQUEST, "只允許一個 file 欄位".to_string()));
+        }
+        let filename = field
+            .file_name()
+            .map(str::to_owned)
+            .ok_or((StatusCode::BAD_REQUEST, "file 欄位缺少檔名".to_string()))?;
+        let bytes = field.bytes().await.map_err(multipart_error)?;
+        if bytes.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "不可上傳空檔案".to_string()));
+        }
+        if bytes.len() > MAX_UPLOAD_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("檔案超過 {} MiB 上限", MAX_UPLOAD_BYTES / 1_048_576),
+            ));
+        }
+        upload = Some((filename, bytes.to_vec()));
     }
 
-    let file_bytes =
-        file_bytes.ok_or((StatusCode::BAD_REQUEST, "missing file field".to_string()))?;
-    let original_filename = original_filename.unwrap_or_else(|| "upload".to_string());
-
+    let (original_filename, file_bytes) =
+        upload.ok_or((StatusCode::BAD_REQUEST, "缺少 file 欄位".to_string()))?;
+    let extension = extension_for(&original_filename)?;
+    let source_kind = SourceKind::from_extension(&extension).ok_or((
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "不支援此格式；請上傳 PDF、PNG/JPEG/WebP、DOCX/PPTX/XLSX 或 MD/TXT".to_string(),
+    ))?;
+    let mime_type = mime_type_for(&extension);
     let id = Uuid::new_v4();
-    let ext = std::path::Path::new(&original_filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("bin")
-        .to_lowercase();
-
-    let files_dir = state.files_dir.clone();
-    tokio::fs::create_dir_all(&files_dir)
+    let files_dir = PathBuf::from(&state.files_dir);
+    let storage_path = publish_original(&files_dir, id, &extension, &file_bytes)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
+    let storage_path_string = path_string(&storage_path);
 
-    let storage_path = format!("{files_dir}/{id}.{ext}");
-    tokio::fs::write(&storage_path, &file_bytes)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    sqlx::query(
-        "INSERT INTO documents (id, filename, storage_path, mime_type, status) VALUES ($1, $2, $3, $4, 'processing')",
+    let insert_result = sqlx::query(
+        "INSERT INTO documents \
+         (id, filename, storage_path, mime_type, status, artifact_status) \
+         VALUES ($1, $2, $3, $4, 'processing', 'processing')",
     )
     .bind(id)
     .bind(&original_filename)
-    .bind(&storage_path)
-    .bind(Option::<String>::None)
+    .bind(&storage_path_string)
+    .bind(mime_type)
     .execute(&state.pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .await;
+    if let Err(error) = insert_result {
+        let _ = remove_document_tree(&files_dir, id).await;
+        return Err(internal_error(error));
+    }
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        process_document(state_clone, id, storage_path, ext).await;
+        process_document(state_clone, id, storage_path, source_kind).await;
     });
 
     Ok((
@@ -83,185 +134,518 @@ pub async fn upload_document(
         Json(UploadResponse {
             id,
             status: "processing".to_string(),
+            artifact_status: "processing".to_string(),
         }),
     ))
 }
 
-async fn set_failed(state: &AppState, id: Uuid, error: &str) {
-    let snippet: String = error.chars().take(1000).collect();
-    let _ = sqlx::query("UPDATE documents SET status = 'failed', error = $2 WHERE id = $1")
-        .bind(id)
-        .bind(snippet)
-        .execute(&state.pool)
-        .await;
+fn multipart_error(error: axum::extract::multipart::MultipartError) -> (StatusCode, String) {
+    let status = error.status();
+    let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+        format!("檔案超過 {} MiB 上限", MAX_UPLOAD_BYTES / 1_048_576)
+    } else {
+        error.body_text()
+    };
+    (status, message)
 }
 
-async fn process_document(state: Arc<AppState>, id: Uuid, storage_path: String, ext: String) {
-    // Step 1: get markdown text.
-    let markdown = match ext.as_str() {
-        "md" | "markdown" | "txt" => match tokio::fs::read_to_string(&storage_path).await {
-            Ok(text) => text,
-            Err(e) => {
-                set_failed(&state, id, &format!("failed to read file: {e}")).await;
-                return;
-            }
-        },
-        // Everything else goes to the multimodal model as-is (VLM transcription).
-        _ => {
-            let bytes = match tokio::fs::read(&storage_path).await {
-                Ok(b) => b,
-                Err(e) => {
-                    set_failed(&state, id, &format!("failed to read file: {e}")).await;
-                    return;
-                }
-            };
-            if bytes.len() > MAX_TRANSCRIBE_BYTES {
-                set_failed(
-                    &state,
-                    id,
-                    "檔案超過 4MB 上限(模型直讀限制),請壓縮或拆分後再上傳",
-                )
-                .await;
-                return;
-            }
-            match state.models.transcribe_file(&ext, bytes).await {
-                Ok(md) => {
-                    // Models often wrap the transcript in a ```markdown fence despite the prompt.
-                    let md = strip_code_fences(&md);
-                    let md_path = derive_md_path(&storage_path);
-                    if let Err(e) = tokio::fs::write(&md_path, &md).await {
-                        tracing::warn!("failed to write converted markdown for {id}: {e}");
-                    }
-                    md
-                }
-                Err(e) => {
-                    set_failed(&state, id, &e.to_string()).await;
-                    return;
-                }
-            }
+fn extension_for(filename: &str) -> Result<String, (StatusCode, String)> {
+    Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty())
+        .map(str::to_ascii_lowercase)
+        .ok_or((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "檔名必須包含支援的副檔名".to_string(),
+        ))
+}
+
+fn mime_type_for(extension: &str) -> &'static str {
+    match extension {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "md" | "markdown" => "text/markdown",
+        "txt" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn publish_original(
+    files_dir: &Path,
+    document_id: Uuid,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, ArtifactError> {
+    tokio::fs::create_dir_all(files_dir)
+        .await
+        .map_err(|error| {
+            ArtifactError::new("original-storage", format!("無法建立檔案目錄: {error}"))
+        })?;
+    let document_dir = files_dir.join(document_id.to_string());
+    if tokio::fs::try_exists(&document_dir).await.unwrap_or(false) {
+        return Err(ArtifactError::new(
+            "original-storage",
+            "文件儲存目錄已存在，請重試",
+        ));
+    }
+
+    let staging_dir = files_dir.join(format!(".{document_id}.upload-{}.tmp", Uuid::new_v4()));
+    let original_path = staging_dir.join(format!("original.{extension}"));
+    let result = async {
+        tokio::fs::create_dir(&staging_dir).await?;
+        tokio::fs::write(&original_path, bytes).await?;
+        tokio::fs::rename(&staging_dir, &document_dir).await
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        return Err(ArtifactError::new(
+            "original-storage",
+            format!("原檔寫入失敗: {error}"),
+        ));
+    }
+    Ok(document_dir.join(format!("original.{extension}")))
+}
+
+async fn set_failed(state: &AppState, id: Uuid, error: &str) {
+    let snippet = bounded_error(error);
+    if let Err(db_error) = sqlx::query(
+        "UPDATE documents \
+         SET status = 'failed', artifact_status = 'failed', error = $2 \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(snippet)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(document_id = %id, "failed to persist ingest error: {db_error}");
+    }
+}
+
+fn bounded_error(error: &str) -> String {
+    error.chars().take(MAX_ERROR_CHARS).collect()
+}
+
+pub(crate) async fn process_document(
+    state: Arc<AppState>,
+    id: Uuid,
+    storage_path: PathBuf,
+    source_kind: SourceKind,
+) {
+    let _guard = state.document_locks.lock(id).await;
+    let document_dir = match storage_path.parent() {
+        Some(path) => path.to_owned(),
+        None => {
+            set_failed(&state, id, "original-storage: 原檔路徑缺少文件目錄").await;
+            return;
         }
     };
 
-    if markdown.trim().is_empty() {
-        set_failed(&state, id, "conversion produced empty output").await;
-        return;
-    }
-
-    // Step 2: chunk.
-    let chunks = chunk_markdown(&markdown);
-    if chunks.is_empty() {
-        set_failed(&state, id, "no chunks produced from document").await;
-        return;
-    }
-
-    // Step 3: embeddings + insert.
-    for (idx, chunk) in chunks.iter().enumerate() {
-        let embedding = match state.models.embed_passage(chunk).await {
-            Ok(v) => v,
-            Err(e) => {
-                set_failed(&state, id, &format!("embedding failed: {e}")).await;
-                return;
-            }
-        };
-        let vector = match crate::embedding::to_halfvec(embedding) {
-            Ok(vector) => vector,
-            Err(e) => {
-                set_failed(&state, id, &format!("embedding rejected: {e}")).await;
-                return;
-            }
-        };
-
-        if let Err(e) = sqlx::query(
-            "INSERT INTO document_units \
-             (document_id, kind, unit_index, content, embedding) \
-             VALUES ($1, 'text', $2, $3, $4)",
-        )
-        .bind(id)
-        .bind(idx as i32)
-        .bind(chunk)
-        .bind(vector)
-        .execute(&state.pool)
-        .await
-        {
-            set_failed(&state, id, &format!("db insert failed: {e}")).await;
+    let marked_processing = sqlx::query(
+        "UPDATE documents \
+         SET status = 'processing', artifact_status = 'processing', error = NULL \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&state.pool)
+    .await;
+    match marked_processing {
+        Ok(result) if result.rows_affected() == 0 => {
+            let _ = tokio::fs::remove_dir_all(&document_dir).await;
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            set_failed(
+                &state,
+                id,
+                &format!("artifact-db: 無法更新處理狀態: {error}"),
+            )
+            .await;
             return;
         }
     }
 
-    // Step 4: summary + tags (best-effort).
-    let (summary, tags) = generate_summary_and_tags(&state, &markdown).await;
+    let run_id = Uuid::new_v4();
+    let temporary_dir = document_dir.join(format!(".artifacts-{run_id}.tmp"));
+    let artifact_dir = document_dir.join(format!("artifacts-{run_id}"));
+    if let Err(error) = tokio::fs::create_dir(&temporary_dir).await {
+        set_failed(
+            &state,
+            id,
+            &format!("artifact-stage: 無法建立暫存目錄: {error}"),
+        )
+        .await;
+        return;
+    }
 
-    let update_result =
-        sqlx::query("UPDATE documents SET status = 'ready', summary = $2, tags = $3 WHERE id = $1")
-            .bind(id)
-            .bind(summary)
-            .bind(tags)
-            .execute(&state.pool)
-            .await;
+    let prepared = prepare_artifact_set(
+        &state,
+        id,
+        source_kind,
+        &storage_path,
+        &temporary_dir,
+        &artifact_dir,
+    )
+    .await;
+    let mut prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&temporary_dir).await;
+            set_failed(&state, id, &error.to_string()).await;
+            return;
+        }
+    };
 
-    if let Err(e) = update_result {
-        set_failed(&state, id, &format!("final update failed: {e}")).await;
+    if !document_exists(&state, id).await {
+        let _ = tokio::fs::remove_dir_all(&temporary_dir).await;
+        let _ = tokio::fs::remove_dir_all(&document_dir).await;
+        return;
+    }
+    if let Err(error) = tokio::fs::rename(&temporary_dir, &artifact_dir).await {
+        let _ = tokio::fs::remove_dir_all(&temporary_dir).await;
+        set_failed(
+            &state,
+            id,
+            &format!("artifact-publish: 無法發布完整 artifact set: {error}"),
+        )
+        .await;
+        return;
+    }
+    prepared.artifact_dir = artifact_dir.clone();
+
+    if let Err(error) = persist_artifact_set(&state, id, &prepared).await {
+        let _ = tokio::fs::remove_dir_all(&artifact_dir).await;
+        if document_exists(&state, id).await {
+            set_failed(&state, id, &error.to_string()).await;
+        } else {
+            let _ = tokio::fs::remove_dir_all(&document_dir).await;
+        }
+        return;
+    }
+
+    cleanup_obsolete_artifact_runs(&document_dir, &artifact_dir).await;
+}
+
+async fn prepare_artifact_set(
+    state: &AppState,
+    document_id: Uuid,
+    source_kind: SourceKind,
+    original_path: &Path,
+    temporary_dir: &Path,
+    final_dir: &Path,
+) -> Result<PreparedArtifactSet, ArtifactError> {
+    let mut converted_pdf_path = None;
+    let rendered_pages = match source_kind {
+        SourceKind::Pdf => {
+            crate::page_artifacts::render_pdf(&state.artifact_config, original_path, temporary_dir)
+                .await?
+        }
+        SourceKind::Image => {
+            crate::page_artifacts::normalize_image(
+                &state.artifact_config,
+                original_path,
+                temporary_dir,
+            )
+            .await?
+        }
+        SourceKind::Office => {
+            let temporary_pdf = crate::page_artifacts::convert_office_to_pdf(
+                &state.artifact_config,
+                original_path,
+                temporary_dir,
+            )
+            .await?;
+            let pages = crate::page_artifacts::render_pdf(
+                &state.artifact_config,
+                &temporary_pdf,
+                temporary_dir,
+            )
+            .await?;
+            converted_pdf_path = Some(final_dir.join("converted.pdf"));
+            pages
+        }
+        SourceKind::Text => Vec::new(),
+    };
+
+    let pages = rendered_pages
+        .into_iter()
+        .map(|page| PageArtifact {
+            document_id,
+            page_number: page.page_number,
+            image_path: path_string(&final_dir.join(page.relative_image_path)),
+            width: page.width,
+            height: page.height,
+            extracted_text: page.extracted_text,
+        })
+        .collect::<Vec<_>>();
+
+    let text_units = if source_kind == SourceKind::Text {
+        let text = tokio::fs::read_to_string(original_path)
+            .await
+            .map_err(|error| {
+                ArtifactError::new("text-read", format!("無法以 UTF-8 讀取文字檔: {error}"))
+            })?;
+        let chunks = chunk_markdown(&text);
+        if chunks.is_empty() {
+            return Err(ArtifactError::new("text-chunk", "文字檔沒有可建立的內容"));
+        }
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, content)| {
+                Ok(TextArtifact {
+                    document_id,
+                    unit_index: i32::try_from(index).map_err(|_| {
+                        ArtifactError::new("text-chunk", "文字段落數超過系統可追蹤範圍")
+                    })?,
+                    content,
+                })
+            })
+            .collect::<Result<Vec<_>, ArtifactError>>()?
+    } else {
+        Vec::new()
+    };
+
+    if source_kind != SourceKind::Text && pages.is_empty() {
+        return Err(ArtifactError::new(
+            "artifact-validate",
+            "轉換結果不含任何頁面",
+        ));
+    }
+    validate_page_sequence(&pages)?;
+
+    let manifest_path = final_dir.join("manifest.json");
+    let manifest = ArtifactManifest {
+        document_id,
+        source_kind,
+        original_path: path_string(original_path),
+        converted_pdf_path: converted_pdf_path.as_ref().map(|path| path_string(path)),
+        pages: pages.clone(),
+        text_units: text_units.clone(),
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+        ArtifactError::new(
+            "artifact-manifest",
+            format!("無法序列化 artifact manifest: {error}"),
+        )
+    })?;
+    tokio::fs::write(temporary_dir.join("manifest.json"), manifest_bytes)
+        .await
+        .map_err(|error| {
+            ArtifactError::new(
+                "artifact-manifest",
+                format!("無法寫入 artifact manifest: {error}"),
+            )
+        })?;
+
+    Ok(PreparedArtifactSet {
+        source_kind,
+        artifact_dir: final_dir.to_owned(),
+        manifest_path,
+        converted_pdf_path,
+        pages,
+        text_units,
+    })
+}
+
+fn validate_page_sequence(pages: &[PageArtifact]) -> Result<(), ArtifactError> {
+    for (index, page) in pages.iter().enumerate() {
+        let expected = i32::try_from(index + 1)
+            .map_err(|_| ArtifactError::new("artifact-validate", "頁數超過系統可追蹤範圍"))?;
+        if page.page_number != expected {
+            return Err(ArtifactError::new(
+                "artifact-validate",
+                format!(
+                    "轉換結果頁序不連續：預期第 {expected} 頁，收到第 {} 頁",
+                    page.page_number
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn persist_artifact_set(
+    state: &AppState,
+    document_id: Uuid,
+    prepared: &PreparedArtifactSet,
+) -> Result<(), ArtifactError> {
+    let mut transaction = state.pool.begin().await.map_err(artifact_db_error)?;
+    let document_state: Option<(String, String)> =
+        sqlx::query_as("SELECT status, artifact_status FROM documents WHERE id = $1 FOR UPDATE")
+            .bind(document_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(artifact_db_error)?;
+    let Some((status, artifact_status)) = document_state else {
+        return Err(ArtifactError::new(
+            "artifact-db",
+            "文件已刪除，取消 artifact 發布",
+        ));
+    };
+    if status != "processing" || artifact_status != "processing" {
+        return Err(ArtifactError::new(
+            "artifact-db",
+            "文件狀態已變更，取消過期的 artifact 發布",
+        ));
+    }
+
+    sqlx::query("DELETE FROM document_artifact_sets WHERE document_id = $1")
+        .bind(document_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(artifact_db_error)?;
+    sqlx::query(
+        "INSERT INTO document_artifact_sets \
+         (document_id, source_kind, artifact_dir, manifest_path, converted_pdf_path) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(document_id)
+    .bind(prepared.source_kind.as_str())
+    .bind(path_string(&prepared.artifact_dir))
+    .bind(path_string(&prepared.manifest_path))
+    .bind(
+        prepared
+            .converted_pdf_path
+            .as_ref()
+            .map(|path| path_string(path)),
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(artifact_db_error)?;
+
+    insert_pages(&mut transaction, &prepared.pages).await?;
+    insert_text_units(&mut transaction, &prepared.text_units).await?;
+    sqlx::query("UPDATE documents SET artifact_status = 'ready', error = NULL WHERE id = $1")
+        .bind(document_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(artifact_db_error)?;
+    transaction.commit().await.map_err(artifact_db_error)
+}
+
+async fn insert_pages(
+    transaction: &mut Transaction<'_, Postgres>,
+    pages: &[PageArtifact],
+) -> Result<(), ArtifactError> {
+    for page in pages {
+        sqlx::query(
+            "INSERT INTO page_artifacts \
+             (document_id, page_number, image_path, width, height, extracted_text) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(page.document_id)
+        .bind(page.page_number)
+        .bind(&page.image_path)
+        .bind(page.width)
+        .bind(page.height)
+        .bind(&page.extracted_text)
+        .execute(&mut **transaction)
+        .await
+        .map_err(artifact_db_error)?;
+    }
+    Ok(())
+}
+
+async fn insert_text_units(
+    transaction: &mut Transaction<'_, Postgres>,
+    units: &[TextArtifact],
+) -> Result<(), ArtifactError> {
+    for unit in units {
+        sqlx::query(
+            "INSERT INTO text_artifacts (document_id, unit_index, content) VALUES ($1, $2, $3)",
+        )
+        .bind(unit.document_id)
+        .bind(unit.unit_index)
+        .bind(&unit.content)
+        .execute(&mut **transaction)
+        .await
+        .map_err(artifact_db_error)?;
+    }
+    Ok(())
+}
+
+fn artifact_db_error(error: sqlx::Error) -> ArtifactError {
+    ArtifactError::new("artifact-db", format!("artifact 寫入失敗: {error}"))
+}
+
+async fn document_exists(state: &AppState, document_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM documents WHERE id = $1)")
+        .bind(document_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(false)
+}
+
+async fn cleanup_obsolete_artifact_runs(document_dir: &Path, active_dir: &Path) {
+    let active_name = active_dir.file_name();
+    let Ok(mut entries) = tokio::fs::read_dir(document_dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name_text) = name.to_str() else {
+            continue;
+        };
+        let is_artifact_run = name_text.starts_with("artifacts-")
+            || (name_text.starts_with(".artifacts-") && name_text.ends_with(".tmp"));
+        if is_artifact_run
+            && Some(name.as_os_str()) != active_name
+            && let Err(error) = tokio::fs::remove_dir_all(entry.path()).await
+        {
+            tracing::warn!(path = %entry.path().display(), "failed to remove stale artifact run: {error}");
+        }
     }
 }
 
-fn derive_md_path(storage_path: &str) -> String {
-    let path = std::path::Path::new(storage_path);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("doc");
-    let parent = path.parent().and_then(|p| p.to_str()).unwrap_or(".");
-    format!("{parent}/{stem}.md")
-}
-
-/// Split markdown by headings, merge adjacent sections up to ~2000 chars (hard max 3000),
-/// and split oversized sections on paragraph boundaries with overlap.
+/// Split markdown by headings, merge adjacent sections, then split oversized sections.
 fn chunk_markdown(markdown: &str) -> Vec<String> {
-    let heading_re = regex::Regex::new(r"(?m)^#{1,6} ").unwrap();
-
-    // Split into sections, each starting at a heading (first section may have no heading).
-    let mut sections: Vec<String> = Vec::new();
-    let mut last_start = 0;
-    let mut starts: Vec<usize> = heading_re.find_iter(markdown).map(|m| m.start()).collect();
+    let heading_re = regex::Regex::new(r"(?m)^#{1,6} ").expect("static heading regex");
+    let mut starts = heading_re
+        .find_iter(markdown)
+        .map(|match_| match_.start())
+        .collect::<Vec<_>>();
     if starts.first() != Some(&0) {
         starts.insert(0, 0);
     }
-    for i in 0..starts.len() {
-        let start = starts[i];
-        let end = if i + 1 < starts.len() {
-            starts[i + 1]
-        } else {
-            markdown.len()
-        };
-        if start >= last_start {
-            let section = markdown[start..end].to_string();
-            if !section.trim().is_empty() {
-                sections.push(section);
-            }
+
+    let mut sections = Vec::new();
+    for (index, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(markdown.len());
+        let section = &markdown[start..end];
+        if !section.trim().is_empty() {
+            sections.push(section.to_string());
         }
-        last_start = end;
     }
     if sections.is_empty() && !markdown.trim().is_empty() {
         sections.push(markdown.to_string());
     }
 
-    // Further split oversized sections on paragraph boundaries with overlap.
-    let mut expanded: Vec<String> = Vec::new();
-    for section in sections {
-        if section.chars().count() <= HARD_MAX_CHUNK_CHARS {
-            expanded.push(section);
-        } else {
-            expanded.extend(split_oversized(&section));
-        }
-    }
+    let expanded = sections
+        .into_iter()
+        .flat_map(|section| {
+            if section.chars().count() <= HARD_MAX_CHUNK_CHARS {
+                vec![section]
+            } else {
+                split_oversized(&section)
+            }
+        })
+        .collect::<Vec<_>>();
 
-    // Merge adjacent sections up to ~2000 chars (hard max 3000).
-    let mut merged: Vec<String> = Vec::new();
+    let mut merged = Vec::new();
     let mut current = String::new();
     for section in expanded {
         if current.is_empty() {
             current = section;
-            continue;
-        }
-        let combined_len = current.chars().count() + section.chars().count();
-        if combined_len <= HARD_MAX_CHUNK_CHARS {
+        } else if current.chars().count() + section.chars().count() < HARD_MAX_CHUNK_CHARS {
             current.push('\n');
             current.push_str(&section);
         } else {
@@ -272,48 +656,39 @@ fn chunk_markdown(markdown: &str) -> Vec<String> {
     if !current.trim().is_empty() {
         merged.push(current);
     }
-
     merged
-        .into_iter()
-        .filter(|c| !c.trim().is_empty())
-        .collect()
 }
 
 fn split_oversized(section: &str) -> Vec<String> {
-    let paragraphs: Vec<&str> = section.split("\n\n").collect();
-    let mut result: Vec<String> = Vec::new();
+    let mut result = Vec::new();
     let mut current = String::new();
-
-    for para in paragraphs {
-        let combined_len = current.chars().count() + para.chars().count();
+    for paragraph in section.split("\n\n") {
+        let separator = usize::from(!current.is_empty()) * 2;
         if current.is_empty() {
-            current = para.to_string();
-        } else if combined_len <= MAX_CHUNK_CHARS {
+            current = paragraph.to_string();
+        } else if current.chars().count() + paragraph.chars().count() + separator <= MAX_CHUNK_CHARS
+        {
             current.push_str("\n\n");
-            current.push_str(para);
+            current.push_str(paragraph);
         } else {
-            let overlap: String = current
+            let overlap = current
                 .chars()
                 .rev()
                 .take(OVERLAP_CHARS)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
-                .collect();
+                .collect::<String>();
             result.push(std::mem::take(&mut current));
-            current = format!("{overlap}\n\n{para}");
+            current = format!("{overlap}\n\n{paragraph}");
         }
 
-        // If a single paragraph itself exceeds the hard max, hard-split it.
         while current.chars().count() > HARD_MAX_CHUNK_CHARS {
-            let take_count = MAX_CHUNK_CHARS;
-            let piece: String = current.chars().take(take_count).collect();
-            let remainder: String = current
+            result.push(current.chars().take(MAX_CHUNK_CHARS).collect());
+            current = current
                 .chars()
-                .skip(take_count.saturating_sub(OVERLAP_CHARS))
+                .skip(MAX_CHUNK_CHARS - OVERLAP_CHARS)
                 .collect();
-            result.push(piece);
-            current = remainder;
         }
     }
     if !current.trim().is_empty() {
@@ -322,108 +697,111 @@ fn split_oversized(section: &str) -> Vec<String> {
     result
 }
 
-async fn generate_summary_and_tags(
-    state: &AppState,
-    markdown: &str,
-) -> (Option<String>, Option<Vec<String>>) {
-    let excerpt: String = markdown.chars().take(6000).collect();
-    let prompt = format!(
-        "請閱讀以下文件內容,並以嚴格 JSON 格式回覆(不要加任何說明文字或 markdown 標記),格式為 {{\"summary\":\"繁體中文,100字以內\",\"tags\":[\"3到6個繁體中文短標籤\"]}}。\n\n文件內容:\n{excerpt}"
-    );
-
-    let result = state
-        .models
-        .chat_once(crate::cloud_models::SYSTEM_PROMPT, &prompt)
-        .await;
-
-    let raw = match result {
-        Ok(text) => text,
-        Err(e) => {
-            tracing::warn!("summary/tags generation failed: {e}");
-            return (None, None);
-        }
-    };
-
-    let cleaned = strip_code_fences(&raw);
-
-    // Models sometimes preface/suffix the JSON with chatter; salvage the outermost {...} span.
-    let parsed = serde_json::from_str::<serde_json::Value>(&cleaned).or_else(|e| {
-        match (cleaned.find('{'), cleaned.rfind('}')) {
-            (Some(start), Some(end)) if start < end => {
-                serde_json::from_str::<serde_json::Value>(&cleaned[start..=end])
-            }
-            _ => Err(e),
-        }
-    });
-
-    match parsed {
-        Ok(value) => {
-            let summary = value
-                .get("summary")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let tags = value.get("tags").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<String>>()
-            });
-            (summary, tags)
-        }
-        Err(e) => {
-            tracing::warn!("failed to parse summary/tags JSON: {e}; raw: {raw}");
-            (None, None)
-        }
-    }
-}
-
-fn strip_code_fences(text: &str) -> String {
-    let trimmed = text.trim();
-    if let Some(rest) = trimmed.strip_prefix("```") {
-        // Drop the language tag (json, markdown, …) that may sit right after the fence,
-        // with or without a following newline.
-        let rest = rest
-            .trim_start_matches(|c: char| c.is_ascii_alphanumeric())
-            .trim_start();
-        if let Some(end) = rest.rfind("```") {
-            return rest[..end].trim().to_string();
-        }
-        return rest.trim().to_string();
-    }
-    trimmed.to_string()
-}
-
-/// DELETE /api/documents/:id
+/// DELETE /api/documents/:id. The same per-document lock serializes this with conversion.
 pub async fn delete_document(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let row: Option<(String,)> = sqlx::query_as("SELECT storage_path FROM documents WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if row.is_none() {
+    let _guard = state.document_locks.lock(id).await;
+    let storage_path: Option<String> =
+        sqlx::query_scalar("SELECT storage_path FROM documents WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal_error)?;
+    let Some(storage_path) = storage_path else {
         return Err((StatusCode::NOT_FOUND, "document not found".to_string()));
+    };
+
+    // Keep the DB row as the retry handle until every known filesystem path is
+    // gone. If cleanup fails, the client can safely repeat DELETE instead of
+    // receiving a permanent 404 while orphaned artifacts remain on disk.
+    remove_document_tree(Path::new(&state.files_dir), id)
+        .await
+        .map_err(internal_error)?;
+
+    // Compatibility cleanup for documents uploaded before the per-document layout.
+    let legacy_path = PathBuf::from(storage_path);
+    if legacy_path.parent() == Some(Path::new(&state.files_dir)) {
+        remove_legacy_files(Path::new(&state.files_dir), id).await?;
     }
 
     sqlx::query("DELETE FROM documents WHERE id = $1")
         .bind(id)
         .execute(&state.pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
-    // Remove FILES_DIR/{id}.* files (original + any converted markdown).
-    if let Ok(mut entries) = tokio::fs::read_dir(&state.files_dir).await {
-        let prefix = format!("{id}.");
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Some(name) = entry.file_name().to_str()
-                && name.starts_with(&prefix)
-            {
-                let _ = tokio::fs::remove_file(entry.path()).await;
-            }
+async fn remove_document_tree(files_dir: &Path, id: Uuid) -> std::io::Result<()> {
+    let document_dir = files_dir.join(id.to_string());
+    match tokio::fs::remove_dir_all(document_dir).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn remove_legacy_files(files_dir: &Path, id: Uuid) -> Result<(), (StatusCode, String)> {
+    let mut entries = match tokio::fs::read_dir(files_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(internal_error(error)),
+    };
+    let file_prefix = format!("{id}.");
+    let upload_prefix = format!(".{id}.upload-");
+    while let Some(entry) = entries.next_entry().await.map_err(internal_error)? {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(&file_prefix) {
+            tokio::fs::remove_file(entry.path())
+                .await
+                .map_err(internal_error)?;
+        } else if name.starts_with(&upload_prefix) && name.ends_with(".tmp") {
+            tokio::fs::remove_dir_all(entry.path())
+                .await
+                .map_err(internal_error)?;
         }
     }
+    Ok(())
+}
 
-    Ok(StatusCode::NO_CONTENT)
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn internal_error(error: impl fmt::Display) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heading_aware_chunking_remains_model_free_and_bounded() {
+        let document = format!("# 第一章\n\n{}\n\n# 第二章\n內容", "字".repeat(7_000));
+        let chunks = chunk_markdown(&document);
+        assert!(chunks.len() >= 3);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= HARD_MAX_CHUNK_CHARS)
+        );
+    }
+
+    #[test]
+    fn page_sequence_must_be_one_based_and_contiguous() {
+        let id = Uuid::new_v4();
+        let pages = vec![PageArtifact {
+            document_id: id,
+            page_number: 2,
+            image_path: "page.png".to_string(),
+            width: 1,
+            height: 1,
+            extracted_text: None,
+        }];
+        assert!(validate_page_sequence(&pages).is_err());
+    }
 }

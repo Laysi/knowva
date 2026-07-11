@@ -1,8 +1,38 @@
 services:
+  app:
+    build:
+      context: .
+      target: runtime
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://km:km@postgres:5432/km
+      FILES_DIR: /app/backend/data/files
+      PORT: "8080"
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      GEMMA_4_MODEL_ID: ${GEMMA_4_MODEL_ID:-}
+      NEMOTRON_EMBED_MODEL_ID: ${NEMOTRON_EMBED_MODEL_ID:-nvidia/llama-nemotron-embed-vl-1b-v2}
+      NEMOTRON_RERANK_MODEL_ID: ${NEMOTRON_RERANK_MODEL_ID:-nvidia/llama-nemotron-rerank-vl-1b-v2}
+      CLOUD_MODEL_BASE_URL: ${CLOUD_MODEL_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      CLOUD_CHAT_URL: ${CLOUD_CHAT_URL:-}
+      CLOUD_EMBED_URL: ${CLOUD_EMBED_URL:-}
+      CLOUD_RERANK_URL: ${CLOUD_RERANK_URL:-https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking}
+      CLOUD_MODEL_REQUEST_TIMEOUT_SECS: ${CLOUD_MODEL_REQUEST_TIMEOUT_SECS:-120}
+      PDF_RENDER_DPI: ${PDF_RENDER_DPI:-180}
+      DOCUMENT_CONVERSION_TIMEOUT_SECS: ${DOCUMENT_CONVERSION_TIMEOUT_SECS:-120}
+      PDFIUM_LIBRARY_PATH: /usr/local/lib/libpdfium.so
+      LIBREOFFICE_BIN: /usr/bin/libreoffice
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      - app_files:/app/backend/data/files
+
   postgres:
     image: pgvector/pgvector:pg17
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: km
       POSTGRES_PASSWORD: km
@@ -16,4 +46,5 @@ services:
       retries: 5
 
 volumes:
+  app_files:
   pgdata:

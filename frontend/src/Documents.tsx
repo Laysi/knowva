@@ -5,10 +5,13 @@ type DocumentRow = {
   id: string;
   filename: string;
   status: "processing" | "ready" | "failed";
+  artifact_status: "pending" | "processing" | "ready" | "failed";
   summary: string | null;
   tags: string[] | null;
   error: string | null;
   created_at: string;
+  page_count: number;
+  unit_count: number;
   chunk_count: number;
 };
 
@@ -42,10 +45,14 @@ function relativeTime(iso: string): string {
   });
 }
 
-const StatusBadge = ({ status }: { status: DocumentRow["status"] }) => (
-  <span className={`status status-${status}`}>
+const StatusBadge = ({ doc }: { doc: DocumentRow }) => (
+  // artifact_status=ready means page conversion is complete, but #5 has not
+  // embedded the staged artifacts yet, so the document is not searchable.
+  <span className={`status status-${doc.status}`}>
     <span className="status-dot" />
-    {statusLabel[status]}
+    {doc.status === "processing" && doc.artifact_status === "ready"
+      ? "前處理完成"
+      : statusLabel[doc.status]}
   </span>
 );
 
@@ -70,7 +77,9 @@ export const Documents = () => {
   }, [fetchDocs]);
 
   useEffect(() => {
-    const hasProcessing = docs.some((d) => d.status === "processing");
+    const hasProcessing = docs.some(
+      (d) => d.status === "processing" && d.artifact_status !== "ready",
+    );
     if (hasProcessing && pollRef.current === null) {
       pollRef.current = window.setInterval(() => {
         fetchDocs();
@@ -97,7 +106,14 @@ export const Documents = () => {
         body: formData,
       });
       if (!res.ok) {
-        alert(`上傳失敗:${res.status}`);
+        const detail = res.status >= 400 && res.status < 500
+          ? (await res.text()).trim()
+          : "";
+        alert(
+          detail
+            ? `上傳失敗：${detail}`
+            : `上傳失敗：伺服器暫時無法處理（${res.status}）`,
+        );
         return;
       }
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -154,6 +170,7 @@ export const Documents = () => {
           <input
             ref={fileInputRef}
             type="file"
+            accept=".pdf,.png,.jpg,.jpeg,.webp,.docx,.pptx,.xlsx,.md,.markdown,.txt"
             hidden
             onChange={(e) => {
               const file = e.target.files?.[0];
@@ -165,7 +182,9 @@ export const Documents = () => {
           </span>
           <div className="dropzone-text">
             <strong>{uploading ? "上傳與解析中…" : "拖曳檔案到這裡,或點擊選擇檔案"}</strong>
-            <span>支援 PDF、Word、Excel、CSV、HTML、圖片、TXT/MD(單檔 ≤ 4MB;PPT 請先匯出 PDF)</span>
+            <span>
+              支援 PDF、DOCX、PPTX、XLSX、PNG/JPEG/WebP、TXT/MD（單檔 ≤ 50 MiB）
+            </span>
           </div>
         </div>
 
@@ -207,7 +226,7 @@ export const Documents = () => {
                     <span className="doc-name" title={doc.filename}>
                       {doc.filename}
                     </span>
-                    <StatusBadge status={doc.status} />
+                    <StatusBadge doc={doc} />
                   </div>
                   <p
                     className={
@@ -216,7 +235,9 @@ export const Documents = () => {
                   >
                     {doc.summary ??
                       (doc.status === "processing"
-                        ? "解析中,摘要即將產生…"
+                        ? doc.artifact_status === "ready"
+                          ? "前處理完成，等待建立檢索索引…"
+                          : "正在建立可追蹤的頁面 artifact…"
                         : doc.status === "failed"
                           ? "處理失敗,無法產生摘要。"
                           : "尚無摘要")}
@@ -232,7 +253,10 @@ export const Documents = () => {
                       </span>
                     )}
                     <span className="doc-metrics">
-                      段落 {doc.chunk_count} · {relativeTime(doc.created_at)}
+                      {doc.page_count > 0
+                        ? `頁面 ${doc.page_count}`
+                        : `段落 ${doc.unit_count}`}
+                      {" · "}{relativeTime(doc.created_at)}
                     </span>
                   </div>
                   {doc.status === "failed" && doc.error && (

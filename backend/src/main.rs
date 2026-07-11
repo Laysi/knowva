@@ -1,10 +1,13 @@
 pub mod cloud_models;
 mod embedding;
 mod ingest;
+mod page_artifacts;
 mod search;
 
 #[cfg(test)]
 mod database_tests;
+#[cfg(test)]
+mod test_fixtures;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -28,6 +31,8 @@ pub struct AppState {
     pool: PgPool,
     models: CloudModelClient,
     files_dir: String,
+    artifact_config: page_artifacts::ArtifactConfig,
+    document_locks: ingest::DocumentLocks,
 }
 
 #[tokio::main]
@@ -45,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(8080);
 
     let model_config = CloudModelConfig::from_env()?;
+    let artifact_config = page_artifacts::ArtifactConfig::from_env()?;
     tracing::info!(
         chat_model = model_config.chat_model(),
         embed_model = model_config.embed_model(),
@@ -54,6 +60,12 @@ async fn main() -> anyhow::Result<()> {
         rerank_endpoint = %model_config.rerank_endpoint(),
         request_timeout_secs = model_config.request_timeout().as_secs(),
         "cloud model client configured"
+    );
+    tracing::info!(
+        render_dpi = artifact_config.render_dpi,
+        conversion_timeout_secs = artifact_config.conversion_timeout.as_secs(),
+        libreoffice_binary = %artifact_config.libreoffice_binary.display(),
+        "document artifact converter configured"
     );
     let models = CloudModelClient::new(model_config)?;
 
@@ -68,6 +80,8 @@ async fn main() -> anyhow::Result<()> {
         pool,
         models,
         files_dir,
+        artifact_config,
+        document_locks: ingest::DocumentLocks::default(),
     });
 
     let api_routes = api_router(state);
@@ -100,7 +114,7 @@ fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/documents/{id}", delete(ingest::delete_document))
         .route("/api/chat", post(chat))
-        .layer(DefaultBodyLimit::max(50 * 1_048_576))
+        .layer(DefaultBodyLimit::max(ingest::MULTIPART_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 
@@ -113,6 +127,7 @@ struct DocumentRow {
     id: uuid::Uuid,
     filename: String,
     status: String,
+    artifact_status: String,
     summary: Option<String>,
     tags: Option<Vec<String>>,
     error: Option<String>,
@@ -127,11 +142,27 @@ async fn list_documents(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<DocumentRow>>, (axum::http::StatusCode, String)> {
     let rows = sqlx::query_as::<_, DocumentRow>(
-        "SELECT d.id, d.filename, d.status, d.summary, d.tags, d.error, d.created_at, \
-         COUNT(u.id) FILTER (WHERE u.kind = 'page') AS page_count, \
-         COUNT(u.id) AS unit_count, COUNT(u.id) AS chunk_count \
-         FROM documents d LEFT JOIN document_units u ON u.document_id = d.id \
-         GROUP BY d.id ORDER BY d.created_at DESC",
+        "WITH unit_counts AS ( \
+           SELECT document_id, COUNT(*) AS unit_count, \
+                  COUNT(*) FILTER (WHERE kind = 'page') AS page_count \
+           FROM document_units GROUP BY document_id \
+         ), artifact_counts AS ( \
+           SELECT d.id AS document_id, COUNT(DISTINCT p.id) AS page_count, \
+                  COUNT(DISTINCT p.id) + COUNT(DISTINCT t.id) AS unit_count \
+           FROM documents d \
+           LEFT JOIN page_artifacts p ON p.document_id = d.id \
+           LEFT JOIN text_artifacts t ON t.document_id = d.id \
+           GROUP BY d.id \
+         ) \
+         SELECT d.id, d.filename, d.status, d.artifact_status, d.summary, d.tags, \
+                d.error, d.created_at, \
+                GREATEST(COALESCE(u.page_count, 0), COALESCE(a.page_count, 0)) AS page_count, \
+                GREATEST(COALESCE(u.unit_count, 0), COALESCE(a.unit_count, 0)) AS unit_count, \
+                GREATEST(COALESCE(u.unit_count, 0), COALESCE(a.unit_count, 0)) AS chunk_count \
+         FROM documents d \
+         LEFT JOIN unit_counts u ON u.document_id = d.id \
+         LEFT JOIN artifact_counts a ON a.document_id = d.id \
+         ORDER BY d.created_at DESC",
     )
     .fetch_all(&state.pool)
     .await
