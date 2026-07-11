@@ -11,6 +11,7 @@ pub struct FixtureSet {
     pub xlsx: PathBuf,
     pub markdown: PathBuf,
     pub text: PathBuf,
+    pub hybrid_retrieval: PathBuf,
 }
 
 pub fn write_all(root: &Path) -> anyhow::Result<FixtureSet> {
@@ -22,6 +23,7 @@ pub fn write_all(root: &Path) -> anyhow::Result<FixtureSet> {
     let xlsx = root.join("single-sheet.xlsx");
     let markdown = root.join("headings.md");
     let text = root.join("plain.txt");
+    let hybrid_retrieval = root.join("hybrid-retrieval.md");
 
     std::fs::write(&native_pdf, native_pdf_bytes())?;
     std::fs::write(&scanned_pdf, scanned_pdf_bytes())?;
@@ -33,6 +35,13 @@ pub fn write_all(root: &Path) -> anyhow::Result<FixtureSet> {
         "# 第一章\nMarkdown fixture 第一段。\n\n## 第二章\nMarkdown fixture 第二段。\n",
     )?;
     std::fs::write(&text, "TXT fixture 第一段。\n\nTXT fixture 第二段。\n")?;
+    std::fs::write(
+        &hybrid_retrieval,
+        "# 繁中語意詞\n人工智慧助理可以協助企業整理知識；查詢可使用同義縮寫 AI。\n\n\
+         ## 精確產品代號\n設備型號 NX-2048-V2 支援 2048 維向量。\n\n\
+         ## 重複頁面 A\n此段是刻意重複的檢索內容。\n\n\
+         ## 重複頁面 B\n此段是刻意重複的檢索內容。\n",
+    )?;
 
     Ok(FixtureSet {
         native_pdf,
@@ -42,6 +51,7 @@ pub fn write_all(root: &Path) -> anyhow::Result<FixtureSet> {
         xlsx,
         markdown,
         text,
+        hybrid_retrieval,
     })
 }
 
@@ -265,6 +275,11 @@ mod tests {
         }
         assert!(fixtures.markdown.is_file());
         assert!(fixtures.text.is_file());
+        let hybrid = std::fs::read_to_string(&fixtures.hybrid_retrieval)?;
+        assert!(hybrid.contains("人工智慧"));
+        assert!(hybrid.contains("AI"));
+        assert!(hybrid.contains("NX-2048-V2"));
+        assert_eq!(hybrid.matches("此段是刻意重複的檢索內容").count(), 2);
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

@@ -201,7 +201,10 @@ async fn chat(
         };
 
         match retrieval {
-            Some(chunks) if !chunks.is_empty() => {
+            Some(mut chunks) if !chunks.is_empty() => {
+                // Hybrid retrieval keeps a top-50 pool for the next reranking
+                // stage while preserving the current chat prompt's top-8 size.
+                chunks.truncate(search::CHAT_CONTEXT_TOP_N);
                 let system_prompt = search::build_rag_system_prompt(&chunks);
                 let sources = search::dedupe_sources(&chunks);
 
