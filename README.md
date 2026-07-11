@@ -58,9 +58,12 @@ GEMMA_4_MODEL_ID=the-confirmed-cloud-gemma-4-id
 | `CLOUD_RERANK_URL` | 選填 | 完整 reranking URL；範例已填 NVIDIA 託管端點 |
 | `NEMOTRON_EMBED_MODEL_ID` | 有鎖定預設 | 只接受 `llama-nemotron-embed-vl-1b-v2` family |
 | `NEMOTRON_RERANK_MODEL_ID` | 有鎖定預設 | 只接受 `llama-nemotron-rerank-vl-1b-v2` family |
+| `RERANK_CANDIDATE_TOP_K` | `50` | RRF 候選池送入 VL rerank 的數量，必須不小於 `RERANK_TOP_N` |
+| `RERANK_TOP_N` | `6` | 精排後回答 context 數量，只允許 3–8 |
+| `RERANK_BATCH_SIZE` | `8` | 每次 hosted rerank request 的 passage 數量，範圍為 1–512 |
 | `CLOUD_MODEL_REQUEST_TIMEOUT_SECS` | 有預設 | 所有模型 HTTP/SSE request timeout，必須是正整數 |
 
-API key 或 Gemma 4 model id 缺失時，後端會在連接資料庫與接受流量前停止並顯示可理解的錯誤。啟動 log 只會列 endpoint、model id 與 timeout，不會列出 token。
+API key、Gemma 4 model id 缺失或 rerank 設定無效時，後端會在連接資料庫與接受流量前停止並顯示可理解的錯誤。啟動 log 只會列 endpoint、model id、timeout 與非敏感 rerank limits，不會列出 token。
 
 文件前處理設定：
 
@@ -162,8 +165,10 @@ FILES_DIR/{document_id}/
 - Dense 使用 query 的固定 2048 維 embedding 與 ready-only partial HNSW `halfvec_cosine_ops` index，cosine top-k 預設 50。HNSW nearest-neighbor query 先 materialize，再以 distance、`unit_id` 做穩定排序。
 - Lexical 是標準 Okapi BM25，不使用 `ILIKE`、`ts_rank` 或 `ts_rank_cd`。公式參數固定 `k1=1.2`、`b=0.75`；migration `0004_hybrid_retrieval.sql` 以 trigger 維護 ready-only corpus 的文件數、總 token 數與每詞 DF，query 在 PostgreSQL 內計算 TF/IDF/長度正規化，不會把 corpus 載入 Rust。
 - Lexical candidate index 是 non-empty `content` 上的 ready-only partial GIN token-array index。tokenizer 先做 Unicode NFKC、lowercase 與 dash normalization；繁中採 character unigram + adjacent bigram，原因是不用可變字典也能重現、可涵蓋未知企業詞；英文、數字與產品代號保留完整 token，hyphenated code 另產 compact 與 component variants，讓全形／半形或常見標點差異不會讓基本詞失效。
-- RRF 固定 `k=60`，`rrf_score(d) = Σ 1 / (60 + rank_i(d))`。以 `unit_id` 去重；同分依最佳 route rank、`unit_id` 排序。兩路預設各 50，融合保留 50；既有 chat prompt 仍只使用前 8 筆，避免改變 SSE/API 行為，完整候選池則保留給後續 VL reranker。
-- 每筆 `RetrievalCandidate` 直接帶 `unit_id`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、兩路 rank/score 與 `rrf_score`，後續階段不需重新查來源 metadata。
+- RRF 固定 `k=60`，`rrf_score(d) = Σ 1 / (60 + rank_i(d))`。以 `unit_id` 去重；同分依最佳 route rank、`unit_id` 排序。兩路預設各 50，融合預設保留 50，再以固定 `llama-nemotron-rerank-vl-1b-v2` 精排成 top 6（可設 3–8）。
+- Page passage 只讀已發布 artifact：有文字層時送 image+text，掃描頁送 image-only（完全省略 `text`），MD/TXT chunk 送 text-only。本機路徑不進 payload，圖片只以記憶體 data URL 傳送；預設每批 8 筆，API 回應即使重排順序也依每批 local index 映回原 unit。
+- 每筆 `RetrievalCandidate` 直接帶 `unit_id`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、兩路 rank/score、`rrf_score` 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
+- Rerank 每批都嚴格驗證回應筆數、index 唯一且不越界、score finite，再驗證跨批映射。408、429、5xx、transport error 與 timeout 最多嘗試三次；耗盡後以原 RRF top_n 原序回退，且 rerank 欄位保持 null。設定、artifact 或 hosted response contract 錯誤不回退，會回傳可診斷錯誤。Structured log 僅記錄各階段筆數、延遲、fallback 與 model id，不含 query、文件內容、secret 或 base64。
 
 ## 驗證
 
@@ -174,7 +179,7 @@ proto exec rust -- cargo clippy --all-targets -- -D warnings
 proto exec rust -- cargo test
 ```
 
-一般測試以本機 mock cloud endpoint 驗證四種 embedding payload、有限重試與 transaction/DB 契約，不會呼叫真實雲端。安裝 Pdfium 與 LibreOffice 後，可明確執行 native fixture smoke；它也會確認原生 PDF 使用 image+text embedding、掃描 PDF 使用 image-only embedding：
+一般測試以本機 mock cloud endpoint 驗證四種 embedding payload、三種 rerank modality、跨批映射、嚴格 response contract、有限重試／fallback 與 transaction/DB 契約，不會呼叫真實雲端。安裝 Pdfium 與 LibreOffice 後，可明確執行 native fixture smoke；它也會確認原生 PDF 使用 image+text embedding、掃描 PDF 使用 image-only embedding：
 
 ```bash
 cd backend
