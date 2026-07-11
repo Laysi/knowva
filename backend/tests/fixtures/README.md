@@ -12,6 +12,9 @@
 | `single-sheet.xlsx` | 1 頁 | 單一 worksheet 轉為一頁 PDF |
 | `headings.md` | 至少 1 個文字單元 | 使用既有標題感知 chunk，不轉頁圖 |
 | `plain.txt` | 至少 1 個文字單元 | 使用文字 chunk，不虛構頁碼 |
+| `hybrid-retrieval.md` | 至少 1 個文字單元 | 含繁中同義詞 `人工智慧`/`AI`、精確產品代號 `NX-2048-V2` 與兩段刻意重複內容 |
+
+其中 `scanned-one-page.pdf` 同時是 hybrid retrieval 的 dense-only fixture：它沒有 `content`，不得出現在 BM25 route，但仍須由 2048 維頁圖 embedding 召回。database fixtures 另以相同文字的不同 1-based page 驗證它們保留不同 `unit_id`，只有同一頁在 dense/BM25 重疊時才會去重。
 
 一般 `cargo test` 會用 mock cloud endpoint 驗證 embedding payload、圖片正規化、MD/TXT 入庫、DB constraint、重試與刪除清理。真實 Pdfium／LibreOffice 轉換測試標記為 ignored，避免缺少 native dependency 的 CI 假失敗；安裝依賴後執行：
 

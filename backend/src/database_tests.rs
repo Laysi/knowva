@@ -112,6 +112,29 @@ async fn insert_text_unit(
     .await
 }
 
+async fn insert_page_unit(
+    pool: &PgPool,
+    document_id: Uuid,
+    unit_index: i32,
+    page_number: i32,
+    content: Option<&str>,
+    embedding: &HalfVector,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "INSERT INTO document_units \
+         (document_id, kind, unit_index, page_number, content, image_path, embedding) \
+         VALUES ($1, 'page', $2, $3, $4, $5, $6) RETURNING id",
+    )
+    .bind(document_id)
+    .bind(unit_index)
+    .bind(page_number)
+    .bind(content)
+    .bind(format!("/pages/{document_id}/{page_number:04}.png"))
+    .bind(embedding)
+    .fetch_one(pool)
+    .await
+}
+
 #[sqlx::test]
 async fn fresh_database_migrates_to_halfvec(pool: PgPool) -> anyhow::Result<()> {
     let embedding_type: String = sqlx::query_scalar(
@@ -140,6 +163,18 @@ async fn fresh_database_migrates_to_halfvec(pool: PgPool) -> anyhow::Result<()> 
     .await?;
     assert!(index_definition.contains("USING hnsw"));
     assert!(index_definition.contains("halfvec_cosine_ops"));
+    assert!(index_definition.contains("WHERE retrieval_ready"));
+
+    let bm25_index_definition: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes \
+         WHERE schemaname = current_schema() \
+           AND indexname = 'document_units_bm25_tokens_gin'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(bm25_index_definition.contains("USING gin"));
+    assert!(bm25_index_definition.contains("bm25_tokens"));
+    assert!(bm25_index_definition.contains("retrieval_ready"));
 
     let chunks_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('public.chunks')::text")
@@ -397,7 +432,8 @@ async fn halfvec_cosine_query_orders_results_and_uses_hnsw(pool: PgPool) -> anyh
     let query = vector_with(&[(0, 1.0)]);
     let rows: Vec<(i64, HalfVector)> = sqlx::query_as(
         "SELECT id, embedding FROM document_units \
-         ORDER BY embedding <=> $1 LIMIT 3",
+         WHERE retrieval_ready \
+         ORDER BY embedding <=> $1, id LIMIT 3",
     )
     .bind(&query)
     .fetch_all(&pool)
@@ -417,7 +453,9 @@ async fn halfvec_cosine_query_orders_results_and_uses_hnsw(pool: PgPool) -> anyh
         .await?;
     let plan: Vec<String> = sqlx::query_scalar(
         "EXPLAIN (COSTS OFF) \
-         SELECT id FROM document_units ORDER BY embedding <=> $1 LIMIT 2",
+         SELECT id FROM document_units \
+         WHERE retrieval_ready \
+         ORDER BY embedding <=> $1, id LIMIT 2",
     )
     .bind(&query)
     .fetch_all(&mut *connection)
@@ -426,6 +464,475 @@ async fn halfvec_cosine_query_orders_results_and_uses_hnsw(pool: PgPool) -> anyh
         plan.iter()
             .any(|line| line.contains("document_units_embedding_hnsw")),
         "expected HNSW index in query plan: {plan:?}"
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn bm25_tokenizer_normalizes_traditional_chinese_english_numbers_and_product_codes(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let tokens: Vec<String> = sqlx::query_scalar(
+        "SELECT km_bm25_tokenize('知識，管理！PostgreSQL／ＢＭ２５ 版本１２３ ＮＸ－２０４８－Ｖ２')",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    for expected in [
+        "知識",
+        "管理",
+        "postgresql",
+        "bm25",
+        "版本",
+        "123",
+        "nx-2048-v2",
+        "nx2048v2",
+        "nx",
+        "2048",
+        "v2",
+    ] {
+        assert!(
+            tokens.iter().any(|token| token == expected),
+            "missing {expected:?} from {tokens:?}"
+        );
+    }
+
+    let full_width: Vec<String> =
+        sqlx::query_scalar("SELECT km_bm25_tokenize('ＮＸ－２０４８－Ｖ２')")
+            .fetch_one(&pool)
+            .await?;
+    let half_width: Vec<String> = sqlx::query_scalar("SELECT km_bm25_tokenize('nx-2048-v2')")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(full_width, half_width);
+
+    let punctuation_variant: Vec<String> =
+        sqlx::query_scalar("SELECT km_bm25_tokenize('知識。管理 PostgreSQL, BM25; 123')")
+            .fetch_one(&pool)
+            .await?;
+    for basic_term in ["知識", "管理", "postgresql", "bm25", "123"] {
+        assert!(
+            punctuation_variant.iter().any(|token| token == basic_term),
+            "punctuation removed basic term {basic_term:?}: {punctuation_variant:?}"
+        );
+    }
+    Ok(())
+}
+
+#[sqlx::test]
+async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delete(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let first_document = insert_document(&pool, "processing").await?;
+    let embedding = vector_with(&[(0, 1.0)]);
+    let first_unit = insert_text_unit(
+        &pool,
+        first_document,
+        0,
+        "alpha alpha product-100",
+        &embedding,
+    )
+    .await?;
+
+    let initial_stats: (i64, i64) = sqlx::query_as(
+        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(initial_stats, (0, 0));
+
+    sqlx::query("UPDATE documents SET status = 'ready' WHERE id = $1")
+        .bind(first_document)
+        .execute(&pool)
+        .await?;
+    let first_length: i32 =
+        sqlx::query_scalar("SELECT bm25_length FROM document_units WHERE id = $1")
+            .bind(first_unit)
+            .fetch_one(&pool)
+            .await?;
+    let ready_stats: (i64, i64) = sqlx::query_as(
+        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(ready_stats, (1, i64::from(first_length)));
+    let alpha_df: i64 = sqlx::query_scalar(
+        "SELECT document_frequency FROM km_bm25_term_stats WHERE term = 'alpha'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(alpha_df, 1, "repeated terms count once toward DF");
+
+    sqlx::query("UPDATE document_units SET content = 'beta beta' WHERE id = $1")
+        .bind(first_unit)
+        .execute(&pool)
+        .await?;
+    let changed_length: i32 =
+        sqlx::query_scalar("SELECT bm25_length FROM document_units WHERE id = $1")
+            .bind(first_unit)
+            .fetch_one(&pool)
+            .await?;
+    let changed_stats: (i64, i64) = sqlx::query_as(
+        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(changed_stats, (1, i64::from(changed_length)));
+    let alpha_df: Option<i64> = sqlx::query_scalar(
+        "SELECT document_frequency FROM km_bm25_term_stats WHERE term = 'alpha'",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    assert!(alpha_df.is_none());
+    let beta_df: i64 =
+        sqlx::query_scalar("SELECT document_frequency FROM km_bm25_term_stats WHERE term = 'beta'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(beta_df, 1);
+
+    let second_document = insert_document(&pool, "ready").await?;
+    insert_text_unit(&pool, second_document, 0, "beta gamma", &embedding).await?;
+    let two_document_stats: (i64, i64) = sqlx::query_as(
+        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(two_document_stats.0, 2);
+    let beta_df: i64 =
+        sqlx::query_scalar("SELECT document_frequency FROM km_bm25_term_stats WHERE term = 'beta'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(beta_df, 2);
+
+    sqlx::query("UPDATE documents SET status = 'failed' WHERE id = $1")
+        .bind(first_document)
+        .execute(&pool)
+        .await?;
+    let failed_stats: (i64, i64) = sqlx::query_as(
+        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(failed_stats.0, 1);
+    let beta_df: i64 =
+        sqlx::query_scalar("SELECT document_frequency FROM km_bm25_term_stats WHERE term = 'beta'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(beta_df, 1);
+
+    sqlx::query("UPDATE documents SET status = 'ready' WHERE id = $1")
+        .bind(first_document)
+        .execute(&pool)
+        .await?;
+    let restored_count: i64 =
+        sqlx::query_scalar("SELECT document_count FROM km_bm25_corpus_stats WHERE singleton")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(restored_count, 2);
+
+    let processing_document = insert_document(&pool, "processing").await?;
+    sqlx::query("UPDATE document_units SET document_id = $1 WHERE id = $2")
+        .bind(processing_document)
+        .bind(first_unit)
+        .execute(&pool)
+        .await?;
+    let moved_ready: bool =
+        sqlx::query_scalar("SELECT retrieval_ready FROM document_units WHERE id = $1")
+            .bind(first_unit)
+            .fetch_one(&pool)
+            .await?;
+    assert!(!moved_ready);
+    let moved_count: i64 =
+        sqlx::query_scalar("SELECT document_count FROM km_bm25_corpus_stats WHERE singleton")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(moved_count, 1);
+
+    sqlx::query("UPDATE document_units SET retrieval_ready = true WHERE id = $1")
+        .bind(first_unit)
+        .execute(&pool)
+        .await?;
+    let canonical_ready: bool =
+        sqlx::query_scalar("SELECT retrieval_ready FROM document_units WHERE id = $1")
+            .bind(first_unit)
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        !canonical_ready,
+        "direct flag updates must follow canonical document status"
+    );
+    let canonical_count: i64 =
+        sqlx::query_scalar("SELECT document_count FROM km_bm25_corpus_stats WHERE singleton")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(canonical_count, 1);
+
+    sqlx::query("UPDATE document_units SET document_id = $1 WHERE id = $2")
+        .bind(first_document)
+        .bind(first_unit)
+        .execute(&pool)
+        .await?;
+    let moved_back_count: i64 =
+        sqlx::query_scalar("SELECT document_count FROM km_bm25_corpus_stats WHERE singleton")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(moved_back_count, 2);
+
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(second_document)
+        .execute(&pool)
+        .await?;
+    let after_first_delete: (i64, i64) = sqlx::query_as(
+        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(after_first_delete, (1, i64::from(changed_length)));
+
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(first_document)
+        .execute(&pool)
+        .await?;
+    let final_stats: (i64, i64) = sqlx::query_as(
+        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(final_stats, (0, 0));
+    let term_count: i64 = sqlx::query_scalar("SELECT count(*) FROM km_bm25_term_stats")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(term_count, 0);
+    Ok(())
+}
+
+#[sqlx::test]
+async fn dense_and_bm25_return_complete_ready_only_metadata_and_keep_scan_pages(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let query_vector = vector_with(&[(0, 1.0)]);
+    let orthogonal_vector = vector_with(&[(1, 1.0)]);
+
+    let scan_document = insert_document(&pool, "ready").await?;
+    sqlx::query("UPDATE documents SET filename = 'scan.pdf' WHERE id = $1")
+        .bind(scan_document)
+        .execute(&pool)
+        .await?;
+    let scan_unit = insert_page_unit(&pool, scan_document, 0, 1, None, &query_vector).await?;
+
+    let product_document = insert_document(&pool, "ready").await?;
+    sqlx::query("UPDATE documents SET filename = 'products.md' WHERE id = $1")
+        .bind(product_document)
+        .execute(&pool)
+        .await?;
+    let product_unit = insert_text_unit(
+        &pool,
+        product_document,
+        0,
+        "精確產品代號 NX-2048-V2，支援 PostgreSQL 17。",
+        &orthogonal_vector,
+    )
+    .await?;
+
+    let duplicate_document = insert_document(&pool, "ready").await?;
+    sqlx::query("UPDATE documents SET filename = 'duplicate.pdf' WHERE id = $1")
+        .bind(duplicate_document)
+        .execute(&pool)
+        .await?;
+    let duplicate_one = insert_page_unit(
+        &pool,
+        duplicate_document,
+        0,
+        1,
+        Some("重複內容：人工智慧知識中樞"),
+        &orthogonal_vector,
+    )
+    .await?;
+    let duplicate_two = insert_page_unit(
+        &pool,
+        duplicate_document,
+        1,
+        2,
+        Some("重複內容：人工智慧知識中樞"),
+        &orthogonal_vector,
+    )
+    .await?;
+
+    for status in ["processing", "failed"] {
+        let inactive_document = insert_document(&pool, status).await?;
+        insert_text_unit(
+            &pool,
+            inactive_document,
+            0,
+            "NX-2048-V2 NX-2048-V2 NX-2048-V2",
+            &query_vector,
+        )
+        .await?;
+    }
+
+    let dense = crate::search::dense_candidates_from_pool(&pool, &query_vector, 50).await?;
+    assert_eq!(dense[0].metadata.unit_id, scan_unit);
+    assert_eq!(dense[0].rank, 1);
+    assert_eq!(dense[0].metadata.document_id, scan_document);
+    assert_eq!(dense[0].metadata.filename, "scan.pdf");
+    assert_eq!(dense[0].metadata.kind, "page");
+    assert_eq!(dense[0].metadata.page_number, Some(1));
+    assert!(dense[0].metadata.image_path.is_some());
+    assert!(dense[0].metadata.content.is_none());
+    assert_eq!(dense.len(), 4, "only four ready units are dense candidates");
+
+    let product =
+        crate::search::bm25_candidates_from_pool(&pool, "ｎｘ－２０４８－ｖ２", 50).await?;
+    assert_eq!(product.len(), 1);
+    assert_eq!(product[0].metadata.unit_id, product_unit);
+    assert_eq!(product[0].rank, 1);
+    assert!(product[0].score > 0.0);
+    assert_eq!(product[0].metadata.filename, "products.md");
+    assert_eq!(product[0].metadata.kind, "text");
+    assert_eq!(product[0].metadata.page_number, None);
+    assert_eq!(product[0].metadata.image_path, None);
+    assert!(
+        product[0]
+            .metadata
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("NX-2048-V2"))
+    );
+
+    let duplicate = crate::search::bm25_candidates_from_pool(&pool, "重複，內容", 50).await?;
+    assert_eq!(
+        duplicate
+            .iter()
+            .map(|candidate| candidate.metadata.unit_id)
+            .collect::<Vec<_>>(),
+        vec![
+            duplicate_one.min(duplicate_two),
+            duplicate_one.max(duplicate_two)
+        ]
+    );
+    assert!(
+        duplicate
+            .iter()
+            .all(|candidate| candidate.metadata.image_path.is_some())
+    );
+    assert!(
+        duplicate
+            .iter()
+            .all(|candidate| candidate.metadata.page_number.is_some())
+    );
+    assert!(
+        product
+            .iter()
+            .chain(&duplicate)
+            .all(|candidate| candidate.metadata.unit_id != scan_unit),
+        "image-only scan page must not be fabricated into lexical results"
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn lexical_scores_match_okapi_bm25_formula_and_do_not_pad_top_k(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let embedding = vector_with(&[(0, 1.0)]);
+    let first_document = insert_document(&pool, "ready").await?;
+    let first_id = insert_text_unit(&pool, first_document, 0, "alpha alpha", &embedding).await?;
+    let second_document = insert_document(&pool, "ready").await?;
+    let second_id =
+        insert_text_unit(&pool, second_document, 0, "alpha beta beta", &embedding).await?;
+    let third_document = insert_document(&pool, "ready").await?;
+    insert_text_unit(&pool, third_document, 0, "gamma", &embedding).await?;
+
+    let results = crate::search::bm25_candidates_from_pool(&pool, "alpha", 50).await?;
+    assert_eq!(results.len(), 2, "top_k is not padded with placeholders");
+    assert_eq!(results[0].metadata.unit_id, first_id);
+    assert_eq!(results[1].metadata.unit_id, second_id);
+
+    let idf = (1.0_f64 + ((3.0_f64 - 2.0 + 0.5) / (2.0 + 0.5))).ln();
+    let expected_first = idf * ((2.0 * (1.2 + 1.0)) / (2.0 + 1.2 * (1.0 - 0.75 + 0.75)));
+    let expected_second =
+        idf * ((1.0 * (1.2 + 1.0)) / (1.0 + 1.2 * (1.0 - 0.75 + 0.75 * (3.0 / 2.0))));
+    assert!((results[0].score - expected_first).abs() < 1e-12);
+    assert!((results[1].score - expected_second).abs() < 1e-12);
+    Ok(())
+}
+
+#[sqlx::test]
+async fn production_candidate_predicates_use_hnsw_and_gin_indexes(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let document_id = insert_document(&pool, "ready").await?;
+    let query_vector = vector_with(&[(0, 1.0)]);
+    insert_text_unit(
+        &pool,
+        document_id,
+        0,
+        "NX-2048-V2 deterministic fixture",
+        &query_vector,
+    )
+    .await?;
+
+    let mut connection = pool.acquire().await?;
+    sqlx::query("SET enable_seqscan = off")
+        .execute(&mut *connection)
+        .await?;
+    let dense_plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (COSTS OFF) \
+         WITH nearest AS MATERIALIZED ( \
+           SELECT u.id, u.document_id, (u.embedding <=> $1) AS distance \
+           FROM document_units AS u \
+           WHERE u.retrieval_ready \
+           ORDER BY u.embedding <=> $1 \
+           LIMIT 50 \
+         ) \
+         SELECT nearest.id \
+         FROM nearest \
+         JOIN documents AS d ON d.id = nearest.document_id \
+         WHERE d.status = 'ready' \
+         ORDER BY nearest.distance, nearest.id \
+         LIMIT 50",
+    )
+    .bind(&query_vector)
+    .fetch_all(&mut *connection)
+    .await?;
+    assert!(
+        dense_plan
+            .iter()
+            .any(|line| line.contains("document_units_embedding_hnsw")),
+        "production dense query must use HNSW: {dense_plan:?}"
+    );
+
+    let lexical_plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (COSTS OFF) \
+         WITH query_terms AS MATERIALIZED ( \
+           SELECT DISTINCT token AS term \
+           FROM unnest(km_bm25_tokenize($1)) AS token \
+           WHERE token <> '' \
+         ), query_token_array AS ( \
+           SELECT COALESCE(array_agg(term ORDER BY term), ARRAY[]::text[]) AS terms \
+           FROM query_terms \
+         ), lexical AS MATERIALIZED ( \
+           SELECT u.id, u.document_id \
+           FROM document_units AS u \
+           CROSS JOIN query_token_array AS query \
+           WHERE u.retrieval_ready \
+             AND u.content IS NOT NULL \
+             AND btrim(u.content) <> '' \
+             AND u.bm25_tokens && query.terms \
+         ) \
+         SELECT lexical.id \
+         FROM lexical \
+         JOIN documents AS d ON d.id = lexical.document_id \
+         WHERE d.status = 'ready'",
+    )
+    .bind("ＮＸ－２０４８－Ｖ２")
+    .fetch_all(&mut *connection)
+    .await?;
+    assert!(
+        lexical_plan
+            .iter()
+            .any(|line| line.contains("document_units_bm25_tokens_gin")),
+        "production lexical candidate predicate must use GIN: {lexical_plan:?}"
     );
     Ok(())
 }
@@ -1044,6 +1551,7 @@ async fn markdown_and_text_fixtures_keep_heading_aware_staging(pool: PgPool) -> 
     for (filename, fixture) in [
         ("headings.md", fixtures.markdown),
         ("plain.txt", fixtures.text),
+        ("hybrid-retrieval.md", fixtures.hybrid_retrieval),
     ] {
         let document_id = Uuid::new_v4();
         let document_dir = root.join(document_id.to_string());
