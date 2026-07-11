@@ -15,6 +15,9 @@ services:
       GEMMA_4_MODEL_ID: ${GEMMA_4_MODEL_ID:-}
       NEMOTRON_EMBED_MODEL_ID: ${NEMOTRON_EMBED_MODEL_ID:-nvidia/llama-nemotron-embed-vl-1b-v2}
       NEMOTRON_RERANK_MODEL_ID: ${NEMOTRON_RERANK_MODEL_ID:-nvidia/llama-nemotron-rerank-vl-1b-v2}
+      RERANK_CANDIDATE_TOP_K: ${RERANK_CANDIDATE_TOP_K:-50}
+      RERANK_TOP_N: ${RERANK_TOP_N:-6}
+      RERANK_BATCH_SIZE: ${RERANK_BATCH_SIZE:-8}
       CLOUD_MODEL_BASE_URL: ${CLOUD_MODEL_BASE_URL:-https://integrate.api.nvidia.com/v1}
       CLOUD_CHAT_URL: ${CLOUD_CHAT_URL:-}
       CLOUD_EMBED_URL: ${CLOUD_EMBED_URL:-}

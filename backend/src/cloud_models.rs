@@ -15,6 +15,12 @@ pub const DEFAULT_EMBED_MODEL_ID: &str = "nvidia/llama-nemotron-embed-vl-1b-v2";
 pub const DEFAULT_RERANK_MODEL_ID: &str = "nvidia/llama-nemotron-rerank-vl-1b-v2";
 pub const EMBEDDING_DIMENSIONS: usize = 2048;
 pub const MAX_EMBED_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+pub const DEFAULT_RERANK_CANDIDATE_TOP_K: usize = 50;
+pub const DEFAULT_RERANK_TOP_N: usize = 6;
+pub const DEFAULT_RERANK_BATCH_SIZE: usize = 8;
+pub const MIN_RERANK_TOP_N: usize = 3;
+pub const MAX_RERANK_TOP_N: usize = 8;
+pub const MAX_RERANK_BATCH_SIZE: usize = 512;
 
 const DEFAULT_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -22,6 +28,9 @@ const MAX_EMBED_REQUEST_BYTES: usize = 36 * 1024 * 1024;
 const DEFAULT_EMBED_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_EMBED_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_EMBED_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+const DEFAULT_RERANK_MAX_ATTEMPTS: usize = 3;
+const DEFAULT_RERANK_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const DEFAULT_RERANK_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
@@ -54,6 +63,9 @@ pub struct CloudModelConfig {
     embed_model: String,
     rerank_model: String,
     request_timeout: Duration,
+    rerank_candidate_top_k: usize,
+    rerank_top_n: usize,
+    rerank_batch_size: usize,
 }
 
 impl fmt::Debug for CloudModelConfig {
@@ -67,6 +79,9 @@ impl fmt::Debug for CloudModelConfig {
             .field("embed_model", &self.embed_model)
             .field("rerank_model", &self.rerank_model)
             .field("request_timeout", &self.request_timeout)
+            .field("rerank_candidate_top_k", &self.rerank_candidate_top_k)
+            .field("rerank_top_n", &self.rerank_top_n)
+            .field("rerank_batch_size", &self.rerank_batch_size)
             .finish()
     }
 }
@@ -133,6 +148,29 @@ impl CloudModelConfig {
                 })?,
             None => DEFAULT_TIMEOUT_SECS,
         };
+        let rerank_candidate_top_k = positive_usize_setting(
+            &mut get,
+            "RERANK_CANDIDATE_TOP_K",
+            DEFAULT_RERANK_CANDIDATE_TOP_K,
+        )?;
+        let rerank_top_n = positive_usize_setting(&mut get, "RERANK_TOP_N", DEFAULT_RERANK_TOP_N)?;
+        if !(MIN_RERANK_TOP_N..=MAX_RERANK_TOP_N).contains(&rerank_top_n) {
+            return Err(CloudModelConfigError(format!(
+                "RERANK_TOP_N must be between {MIN_RERANK_TOP_N} and {MAX_RERANK_TOP_N}"
+            )));
+        }
+        if rerank_candidate_top_k < rerank_top_n {
+            return Err(CloudModelConfigError(format!(
+                "RERANK_CANDIDATE_TOP_K ({rerank_candidate_top_k}) must be at least RERANK_TOP_N ({rerank_top_n})"
+            )));
+        }
+        let rerank_batch_size =
+            positive_usize_setting(&mut get, "RERANK_BATCH_SIZE", DEFAULT_RERANK_BATCH_SIZE)?;
+        if rerank_batch_size > MAX_RERANK_BATCH_SIZE {
+            return Err(CloudModelConfigError(format!(
+                "RERANK_BATCH_SIZE must not exceed {MAX_RERANK_BATCH_SIZE}"
+            )));
+        }
 
         Ok(Self {
             api_key,
@@ -143,6 +181,9 @@ impl CloudModelConfig {
             embed_model,
             rerank_model,
             request_timeout: Duration::from_secs(timeout_secs),
+            rerank_candidate_top_k,
+            rerank_top_n,
+            rerank_batch_size,
         })
     }
 
@@ -173,6 +214,18 @@ impl CloudModelConfig {
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
+
+    pub fn rerank_candidate_top_k(&self) -> usize {
+        self.rerank_candidate_top_k
+    }
+
+    pub fn rerank_top_n(&self) -> usize {
+        self.rerank_top_n
+    }
+
+    pub fn rerank_batch_size(&self) -> usize {
+        self.rerank_batch_size
+    }
 }
 
 fn required_value(
@@ -193,6 +246,21 @@ fn optional_value(
     get(name)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn positive_usize_setting(
+    get: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+    default: usize,
+) -> Result<usize, CloudModelConfigError> {
+    match optional_value(get, name) {
+        Some(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| CloudModelConfigError(format!("{name} must be a positive integer"))),
+        None => Ok(default),
+    }
 }
 
 fn validate_locked_model(
@@ -459,7 +527,7 @@ pub struct EmbeddingData {
     pub embedding: Vec<f32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct RerankRequest {
     pub model: String,
     pub query: RerankQuery,
@@ -467,12 +535,24 @@ pub struct RerankRequest {
     pub truncate: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl fmt::Debug for RerankRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RerankRequest")
+            .field("model", &self.model)
+            .field("query", &"[REDACTED]")
+            .field("passage_count", &self.passages.len())
+            .field("truncate", &self.truncate)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize)]
 pub struct RerankQuery {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct RerankPassage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -487,6 +567,20 @@ impl RerankPassage {
             image: None,
         }
     }
+
+    pub fn image(image: &[u8]) -> CloudModelResult<Self> {
+        Ok(Self {
+            text: None,
+            image: Some(image_data_url_for(ModelOperation::Rerank, image)?),
+        })
+    }
+
+    pub fn image_text(text: impl Into<String>, image: &[u8]) -> CloudModelResult<Self> {
+        Ok(Self {
+            text: Some(text.into()),
+            image: Some(image_data_url_for(ModelOperation::Rerank, image)?),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -497,7 +591,7 @@ pub struct RerankResponse {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct RerankResult {
     pub index: usize,
-    pub logit: f32,
+    pub logit: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -519,6 +613,25 @@ impl Default for EmbeddingRetryConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RerankRetryConfig {
+    max_attempts: usize,
+    base_delay: Duration,
+    max_delay: Duration,
+    jitter: bool,
+}
+
+impl Default for RerankRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_RERANK_MAX_ATTEMPTS,
+            base_delay: DEFAULT_RERANK_RETRY_BASE_DELAY,
+            max_delay: DEFAULT_RERANK_RETRY_MAX_DELAY,
+            jitter: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CloudModelClient {
     http: reqwest::Client,
@@ -530,9 +643,15 @@ pub struct CloudModelClient {
     embed_model: String,
     rerank_model: String,
     request_timeout: Duration,
+    rerank_candidate_top_k: usize,
+    rerank_top_n: usize,
+    rerank_batch_size: usize,
     embedding_retry: EmbeddingRetryConfig,
+    rerank_retry: RerankRetryConfig,
     #[cfg(test)]
     embedding_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    rerank_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CloudModelClient {
@@ -555,9 +674,15 @@ impl CloudModelClient {
             embed_model: config.embed_model,
             rerank_model: config.rerank_model,
             request_timeout: config.request_timeout,
+            rerank_candidate_top_k: config.rerank_candidate_top_k,
+            rerank_top_n: config.rerank_top_n,
+            rerank_batch_size: config.rerank_batch_size,
             embedding_retry: EmbeddingRetryConfig::default(),
+            rerank_retry: RerankRetryConfig::default(),
             #[cfg(test)]
             embedding_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            rerank_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -576,10 +701,19 @@ impl CloudModelClient {
             embed_model: DEFAULT_EMBED_MODEL_ID.to_string(),
             rerank_model: DEFAULT_RERANK_MODEL_ID.to_string(),
             request_timeout: Duration::from_secs(1),
+            rerank_candidate_top_k: DEFAULT_RERANK_CANDIDATE_TOP_K,
+            rerank_top_n: DEFAULT_RERANK_TOP_N,
+            rerank_batch_size: DEFAULT_RERANK_BATCH_SIZE,
         };
         let mut client = Self::new(config).expect("static cloud model test config must be valid");
         client.embedding_retry = EmbeddingRetryConfig {
             max_attempts: DEFAULT_EMBED_MAX_ATTEMPTS,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            jitter: false,
+        };
+        client.rerank_retry = RerankRetryConfig {
+            max_attempts: DEFAULT_RERANK_MAX_ATTEMPTS,
             base_delay: Duration::ZERO,
             max_delay: Duration::ZERO,
             jitter: false,
@@ -604,6 +738,28 @@ impl CloudModelClient {
     fn embedding_attempt_count(&self) -> usize {
         self.embedding_attempts
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn rerank_attempt_count(&self) -> usize {
+        self.rerank_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn rerank_model(&self) -> &str {
+        &self.rerank_model
+    }
+
+    pub fn rerank_candidate_top_k(&self) -> usize {
+        self.rerank_candidate_top_k
+    }
+
+    pub fn rerank_top_n(&self) -> usize {
+        self.rerank_top_n
+    }
+
+    pub fn rerank_batch_size(&self) -> usize {
+        self.rerank_batch_size
     }
 
     pub async fn stream_chat(&self, messages: Vec<ChatMessage>, tx: Sender<SseEvent>) {
@@ -727,7 +883,7 @@ impl CloudModelClient {
     }
 
     pub async fn embed_image_passage(&self, image: &[u8]) -> CloudModelResult<Vec<f32>> {
-        let data_url = image_data_url(image)?;
+        let data_url = image_data_url_for(ModelOperation::Embed, image)?;
         self.embed_input(data_url, "passage", "image").await
     }
 
@@ -742,7 +898,7 @@ impl CloudModelClient {
                 message: "text_image input requires non-empty text".to_string(),
             });
         }
-        let data_url = image_data_url(image)?;
+        let data_url = image_data_url_for(ModelOperation::Embed, image)?;
         let input = format!("{}\n<img src=\"{data_url}\"/>", text.trim());
         self.embed_input(input, "passage", "text_image").await
     }
@@ -818,14 +974,34 @@ impl CloudModelClient {
                 message: "query and at least one passage are required".to_string(),
             });
         }
-        if passages
-            .iter()
-            .any(|passage| passage.text.is_none() && passage.image.is_none())
-        {
-            return Err(CloudModelError::InvalidRequest {
-                operation: ModelOperation::Rerank,
-                message: "each passage requires text, image, or both".to_string(),
-            });
+        for (index, passage) in passages.iter().enumerate() {
+            if passage.text.is_none() && passage.image.is_none() {
+                return Err(CloudModelError::InvalidRequest {
+                    operation: ModelOperation::Rerank,
+                    message: format!("passage {index} requires text, image, or both"),
+                });
+            }
+            if passage
+                .text
+                .as_deref()
+                .is_some_and(|text| text.trim().is_empty())
+            {
+                return Err(CloudModelError::InvalidRequest {
+                    operation: ModelOperation::Rerank,
+                    message: format!("passage {index} text must not be empty"),
+                });
+            }
+            if passage.image.as_deref().is_some_and(|image| {
+                !image.starts_with("data:image/png;base64,")
+                    && !image.starts_with("data:image/jpeg;base64,")
+            }) {
+                return Err(CloudModelError::InvalidRequest {
+                    operation: ModelOperation::Rerank,
+                    message: format!(
+                        "passage {index} image must be an in-memory PNG or JPEG data URL"
+                    ),
+                });
+            }
         }
 
         let request = RerankRequest {
@@ -836,21 +1012,7 @@ impl CloudModelClient {
             passages: passages.to_vec(),
             truncate: "END".to_string(),
         };
-        let response = self
-            .send_json(ModelOperation::Rerank, &self.rerank_endpoint, &request)
-            .await?;
-        let response: RerankResponse = self.decode_json(ModelOperation::Rerank, response).await?;
-        if response
-            .rankings
-            .iter()
-            .any(|ranking| ranking.index >= passages.len())
-        {
-            return Err(CloudModelError::InvalidResponse {
-                operation: ModelOperation::Rerank,
-                message: "ranking index is outside the submitted passage list".to_string(),
-            });
-        }
-        Ok(response)
+        self.send_rerank_request(&request, passages.len()).await
     }
 
     fn chat_request(
@@ -927,28 +1089,63 @@ impl CloudModelClient {
         unreachable!("embedding retry configuration always has at least one attempt")
     }
 
-    fn embedding_retry_delay(&self, failed_attempt: usize) -> Duration {
-        let exponent = u32::try_from(failed_attempt.saturating_sub(1))
-            .unwrap_or(u32::MAX)
-            .min(31);
-        let multiplier = 1_u32 << exponent;
-        let exponential = self
-            .embedding_retry
-            .base_delay
-            .checked_mul(multiplier)
-            .unwrap_or(self.embedding_retry.max_delay)
-            .min(self.embedding_retry.max_delay);
-        if !self.embedding_retry.jitter || exponential.is_zero() {
-            return exponential;
+    async fn send_rerank_request(
+        &self,
+        request: &RerankRequest,
+        expected_count: usize,
+    ) -> CloudModelResult<RerankResponse> {
+        for attempt in 1..=self.rerank_retry.max_attempts {
+            #[cfg(test)]
+            self.rerank_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let result = async {
+                let response = self
+                    .send_json(ModelOperation::Rerank, &self.rerank_endpoint, request)
+                    .await?;
+                let response = self.decode_json(ModelOperation::Rerank, response).await?;
+                validate_rerank_response(response, expected_count)
+            }
+            .await;
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) if error.is_retryable() && attempt < self.rerank_retry.max_attempts => {
+                    let error_kind = match &error {
+                        CloudModelError::Http { .. } => "http",
+                        CloudModelError::Timeout { .. } => "timeout",
+                        CloudModelError::Transport { .. } => "transport",
+                        CloudModelError::InvalidRequest { .. } => "invalid_request",
+                        CloudModelError::InvalidResponse { .. } => "invalid_response",
+                    };
+                    tracing::warn!(
+                        stage = "rerank_request",
+                        attempt,
+                        max_attempts = self.rerank_retry.max_attempts,
+                        model_id = self.rerank_model(),
+                        error_kind,
+                        http_status = ?error.status().map(|status| status.as_u16()),
+                        "rerank request failed transiently; retrying"
+                    );
+                    tokio::time::sleep(bounded_retry_delay(
+                        self.rerank_retry.base_delay,
+                        self.rerank_retry.max_delay,
+                        self.rerank_retry.jitter,
+                        attempt,
+                    ))
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
         }
+        unreachable!("rerank retry configuration always has at least one attempt")
+    }
 
-        // Equal jitter keeps a minimum delay while spreading retries over the
-        // upper half of the exponentially growing window.
-        let half = exponential / 2;
-        let jitter_window_ms = exponential.saturating_sub(half).as_millis();
-        let upper_bound = jitter_window_ms.saturating_add(1);
-        let random = (uuid::Uuid::new_v4().as_u128() % upper_bound) as u64;
-        half.saturating_add(Duration::from_millis(random))
+    fn embedding_retry_delay(&self, failed_attempt: usize) -> Duration {
+        bounded_retry_delay(
+            self.embedding_retry.base_delay,
+            self.embedding_retry.max_delay,
+            self.embedding_retry.jitter,
+            failed_attempt,
+        )
     }
 
     async fn send_json<T: Serialize + ?Sized>(
@@ -1047,16 +1244,48 @@ impl CloudModelClient {
     }
 }
 
+fn bounded_retry_delay(
+    base_delay: Duration,
+    max_delay: Duration,
+    jitter: bool,
+    failed_attempt: usize,
+) -> Duration {
+    let exponent = u32::try_from(failed_attempt.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(31);
+    let multiplier = 1_u32 << exponent;
+    let exponential = base_delay
+        .checked_mul(multiplier)
+        .unwrap_or(max_delay)
+        .min(max_delay);
+    if !jitter || exponential.is_zero() {
+        return exponential;
+    }
+
+    // Equal jitter keeps a minimum delay while spreading retries over the
+    // upper half of the exponentially growing window.
+    let half = exponential / 2;
+    let jitter_window_ms = exponential.saturating_sub(half).as_millis();
+    let upper_bound = jitter_window_ms.saturating_add(1);
+    let random = (uuid::Uuid::new_v4().as_u128() % upper_bound) as u64;
+    half.saturating_add(Duration::from_millis(random))
+}
+
+#[cfg(test)]
 fn image_data_url(image: &[u8]) -> CloudModelResult<String> {
+    image_data_url_for(ModelOperation::Embed, image)
+}
+
+fn image_data_url_for(operation: ModelOperation, image: &[u8]) -> CloudModelResult<String> {
     if image.is_empty() {
         return Err(CloudModelError::InvalidRequest {
-            operation: ModelOperation::Embed,
+            operation,
             message: "image input must not be empty".to_string(),
         });
     }
     if image.len() > MAX_EMBED_IMAGE_BYTES {
         return Err(CloudModelError::InvalidRequest {
-            operation: ModelOperation::Embed,
+            operation,
             message: format!(
                 "decoded image payload is {} bytes; maximum is {MAX_EMBED_IMAGE_BYTES} bytes",
                 image.len()
@@ -1070,12 +1299,55 @@ fn image_data_url(image: &[u8]) -> CloudModelResult<String> {
         "image/jpeg"
     } else {
         return Err(CloudModelError::InvalidRequest {
-            operation: ModelOperation::Embed,
+            operation,
             message: "image input must be a PNG or JPEG payload".to_string(),
         });
     };
     let encoded = base64::engine::general_purpose::STANDARD.encode(image);
     Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+fn validate_rerank_response(
+    response: RerankResponse,
+    expected_count: usize,
+) -> CloudModelResult<RerankResponse> {
+    if response.rankings.len() != expected_count {
+        return Err(CloudModelError::InvalidResponse {
+            operation: ModelOperation::Rerank,
+            message: format!(
+                "expected {expected_count} ranking entries, received {}",
+                response.rankings.len()
+            ),
+        });
+    }
+
+    let mut seen = vec![false; expected_count];
+    for (position, ranking) in response.rankings.iter().enumerate() {
+        if ranking.index >= expected_count {
+            return Err(CloudModelError::InvalidResponse {
+                operation: ModelOperation::Rerank,
+                message: format!(
+                    "ranking entry {position} has out-of-range index {} for {expected_count} passages",
+                    ranking.index
+                ),
+            });
+        }
+        if seen[ranking.index] {
+            return Err(CloudModelError::InvalidResponse {
+                operation: ModelOperation::Rerank,
+                message: format!("ranking index {} is duplicated", ranking.index),
+            });
+        }
+        if !ranking.logit.is_finite() {
+            return Err(CloudModelError::InvalidResponse {
+                operation: ModelOperation::Rerank,
+                message: format!("ranking index {} has a non-finite logit", ranking.index),
+            });
+        }
+        seen[ranking.index] = true;
+    }
+
+    Ok(response)
 }
 
 fn validate_embedding(embedding: Vec<f32>) -> CloudModelResult<Vec<f32>> {
@@ -1208,6 +1480,10 @@ mod tests {
         RetryOnce(StatusCode),
         PermanentBadRequest,
         WrongDimensions,
+        MalformedRerank,
+        MissingRerank,
+        DuplicateRerank,
+        OutOfRangeRerank,
     }
 
     #[derive(Debug)]
@@ -1268,7 +1544,13 @@ mod tests {
             MockMode::PermanentBadRequest => {
                 return (StatusCode::BAD_REQUEST, "invalid request").into_response();
             }
-            MockMode::Success | MockMode::RetryOnce(_) | MockMode::WrongDimensions => {}
+            MockMode::Success
+            | MockMode::RetryOnce(_)
+            | MockMode::WrongDimensions
+            | MockMode::MalformedRerank
+            | MockMode::MissingRerank
+            | MockMode::DuplicateRerank
+            | MockMode::OutOfRangeRerank => {}
         }
 
         match path.as_str() {
@@ -1306,12 +1588,50 @@ mod tests {
                 )
                     .into_response()
             }
-            "/ranking" | "/capabilities/rerank" => (
-                StatusCode::OK,
-                [(CONTENT_TYPE, "application/json")],
-                r#"{"rankings":[{"index":1,"logit":0.9},{"index":0,"logit":0.1}]}"#,
-            )
-                .into_response(),
+            "/ranking" | "/capabilities/rerank" => {
+                let passage_count = body["passages"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or_default();
+                let response_body = match state.mode {
+                    MockMode::MalformedRerank => "not-json".to_string(),
+                    MockMode::MissingRerank => serde_json::json!({ "rankings": [] }).to_string(),
+                    MockMode::DuplicateRerank => serde_json::json!({
+                        "rankings": (0..passage_count)
+                            .map(|index| serde_json::json!({
+                                "index": if index == 0 { 0 } else { index - 1 },
+                                "logit": index as f64,
+                            }))
+                            .collect::<Vec<_>>()
+                    })
+                    .to_string(),
+                    MockMode::OutOfRangeRerank => serde_json::json!({
+                        "rankings": (0..passage_count)
+                            .map(|index| serde_json::json!({
+                                "index": if index == 0 { passage_count } else { index },
+                                "logit": index as f64,
+                            }))
+                            .collect::<Vec<_>>()
+                    })
+                    .to_string(),
+                    _ => serde_json::json!({
+                        "rankings": (0..passage_count)
+                            .rev()
+                            .map(|index| serde_json::json!({
+                                "index": index,
+                                "logit": index as f64 + 0.1,
+                            }))
+                            .collect::<Vec<_>>()
+                    })
+                    .to_string(),
+                };
+                (
+                    StatusCode::OK,
+                    [(CONTENT_TYPE, "application/json")],
+                    response_body,
+                )
+                    .into_response()
+            }
             _ => StatusCode::NOT_FOUND.into_response(),
         }
     }
@@ -1362,6 +1682,12 @@ mod tests {
         let mut client = CloudModelClient::new(config).expect("cloud client");
         client.embedding_retry = EmbeddingRetryConfig {
             max_attempts: DEFAULT_EMBED_MAX_ATTEMPTS,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            jitter: false,
+        };
+        client.rerank_retry = RerankRetryConfig {
+            max_attempts: DEFAULT_RERANK_MAX_ATTEMPTS,
             base_delay: Duration::ZERO,
             max_delay: Duration::ZERO,
             jitter: false,
@@ -1425,6 +1751,56 @@ mod tests {
         ])
         .expect_err("alternative rerank family must be rejected");
         assert!(replacement.to_string().contains(RERANK_MODEL_FAMILY));
+    }
+
+    #[test]
+    fn config_validates_rerank_pool_batch_and_top_n() {
+        let config = config_from(&[
+            ("NVIDIA_API_KEY", "secret"),
+            ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+        ])
+        .expect("default rerank config");
+        assert_eq!(
+            config.rerank_candidate_top_k(),
+            DEFAULT_RERANK_CANDIDATE_TOP_K
+        );
+        assert_eq!(config.rerank_top_n(), DEFAULT_RERANK_TOP_N);
+        assert_eq!(config.rerank_batch_size(), DEFAULT_RERANK_BATCH_SIZE);
+
+        for top_n in [MIN_RERANK_TOP_N, DEFAULT_RERANK_TOP_N, MAX_RERANK_TOP_N] {
+            let raw = top_n.to_string();
+            let config = config_from(&[
+                ("NVIDIA_API_KEY", "secret"),
+                ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+                ("RERANK_TOP_N", &raw),
+            ])
+            .expect("supported top_n");
+            assert_eq!(config.rerank_top_n(), top_n);
+        }
+
+        for (name, value) in [
+            ("RERANK_TOP_N", "2"),
+            ("RERANK_TOP_N", "9"),
+            ("RERANK_BATCH_SIZE", "0"),
+            ("RERANK_CANDIDATE_TOP_K", "0"),
+        ] {
+            let error = config_from(&[
+                ("NVIDIA_API_KEY", "secret"),
+                ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+                (name, value),
+            ])
+            .expect_err("invalid rerank config must fail before startup");
+            assert!(error.to_string().contains(name));
+        }
+
+        let oversized_batch = (MAX_RERANK_BATCH_SIZE + 1).to_string();
+        let error = config_from(&[
+            ("NVIDIA_API_KEY", "secret"),
+            ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+            ("RERANK_BATCH_SIZE", &oversized_batch),
+        ])
+        .expect_err("hosted batch limit must fail before startup");
+        assert!(error.to_string().contains("RERANK_BATCH_SIZE"));
     }
 
     #[tokio::test]
@@ -1496,11 +1872,16 @@ mod tests {
         let ranking = client
             .rerank(
                 "query",
-                &[RerankPassage::text("first"), RerankPassage::text("second")],
+                &[
+                    RerankPassage::image_text("same-page text", &image)
+                        .expect("image+text rerank passage"),
+                    RerankPassage::image(&image).expect("image-only rerank passage"),
+                    RerankPassage::text("text-only passage"),
+                ],
             )
             .await
             .expect("ranking");
-        assert_eq!(ranking.rankings[0].index, 1);
+        assert_eq!(ranking.rankings[0].index, 2);
 
         let requests = state.requests.lock().expect("request lock");
         assert_eq!(requests.len(), 6);
@@ -1556,6 +1937,41 @@ mod tests {
             .find(|request| request.path == "/capabilities/rerank")
             .expect("rerank request");
         assert_eq!(rerank.body["model"], DEFAULT_RERANK_MODEL_ID);
+        assert_eq!(rerank.body["query"], serde_json::json!({ "text": "query" }));
+        assert_eq!(rerank.body["truncate"], "END");
+        let passages = rerank.body["passages"]
+            .as_array()
+            .expect("rerank passages array");
+        assert_eq!(passages.len(), 3);
+        assert_eq!(passages[0]["text"], "same-page text");
+        assert!(
+            passages[0]["image"]
+                .as_str()
+                .is_some_and(|image| image.starts_with("data:image/png;base64,"))
+        );
+        assert!(passages[1].get("text").is_none());
+        assert!(
+            passages[1]["image"]
+                .as_str()
+                .is_some_and(|image| image.starts_with("data:image/png;base64,"))
+        );
+        assert_eq!(
+            passages[2],
+            serde_json::json!({ "text": "text-only passage" })
+        );
+        let rerank_debug = format!(
+            "{:?}",
+            RerankRequest {
+                model: DEFAULT_RERANK_MODEL_ID.to_string(),
+                query: RerankQuery {
+                    text: "private query".to_string(),
+                },
+                passages: vec![RerankPassage::image(&image).expect("debug passage")],
+                truncate: "END".to_string(),
+            }
+        );
+        assert!(!rerank_debug.contains("private query"));
+        assert!(!rerank_debug.contains("base64"));
         server.abort();
     }
 
@@ -1609,6 +2025,83 @@ mod tests {
             assert_eq!(client.embedding_attempt_count(), 2);
             assert_eq!(state.requests.lock().expect("request lock").len(), 2);
             server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn rerank_retries_429_and_5xx_then_succeeds() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let (base_url, state, server) = spawn_mock(MockMode::RetryOnce(status)).await;
+            let client = test_client(&base_url, "test-api-key", Duration::from_secs(1));
+            let response = client
+                .rerank(
+                    "query",
+                    &[RerankPassage::text("first"), RerankPassage::text("second")],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("rerank retry after {status} failed: {error}"));
+            assert_eq!(response.rankings.len(), 2);
+            assert_eq!(client.rerank_attempt_count(), 2);
+            assert_eq!(state.requests.lock().expect("request lock").len(), 2);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn rerank_timeout_is_typed_retried_and_safe_for_stage_fallback() {
+        let (base_url, state, server) = spawn_mock(MockMode::Slow).await;
+        let client = test_client(&base_url, "test-api-key", Duration::from_millis(10));
+        let error = client
+            .rerank("query", &[RerankPassage::text("passage")])
+            .await
+            .expect_err("mock rerank should time out");
+        assert!(error.is_timeout());
+        assert!(error.is_retryable());
+        assert_eq!(client.rerank_attempt_count(), 3);
+        assert!(state.requests.lock().expect("request lock").len() <= 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rerank_rejects_malformed_count_duplicate_and_out_of_range_without_retry() {
+        for mode in [
+            MockMode::MalformedRerank,
+            MockMode::MissingRerank,
+            MockMode::DuplicateRerank,
+            MockMode::OutOfRangeRerank,
+        ] {
+            let (base_url, state, server) = spawn_mock(mode).await;
+            let client = test_client(&base_url, "test-api-key", Duration::from_secs(1));
+            let error = client
+                .rerank(
+                    "query",
+                    &[RerankPassage::text("first"), RerankPassage::text("second")],
+                )
+                .await
+                .expect_err("invalid rerank response must fail");
+            assert!(matches!(&error, CloudModelError::InvalidResponse { .. }));
+            assert!(!error.is_retryable());
+            assert_eq!(client.rerank_attempt_count(), 1);
+            assert_eq!(state.requests.lock().expect("request lock").len(), 1);
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn rerank_validation_rejects_non_finite_scores() {
+        for logit in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = validate_rerank_response(
+                RerankResponse {
+                    rankings: vec![RerankResult { index: 0, logit }],
+                },
+                1,
+            )
+            .expect_err("non-finite rerank logit must fail");
+            assert!(matches!(&error, CloudModelError::InvalidResponse { .. }));
+            assert!(!error.is_retryable());
         }
     }
 

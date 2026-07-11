@@ -30,7 +30,7 @@ The backend requires `NVIDIA_API_KEY` and a confirmed `GEMMA_4_MODEL_ID`. Shared
   - SSE events remain `text-delta`, optional `sources`, then `done`; failures emit `error`. When sources exist they must precede `done`.
   - `ingest.rs` owns upload, atomic artifact publishing, bounded-concurrency Embed VL promotion, transactional/idempotent `document_units` replacement, and delete/retry cleanup. A document becomes `ready` only after every staged artifact has one validated embedding and the counts match.
   - `page_artifacts.rs` uses Pdfium for PDF rasterization/text-layer extraction, normalizes images, and runs isolated headless LibreOffice conversion for DOCX/PPTX/XLSX. Artifact conversion itself never calls a model or fabricates embeddings; ingestion embeds the published artifacts afterward.
-  - `search.rs` owns injectable dense/BM25 candidate stages and deterministic RRF. Dense and lexical paths default to top-50 over ready-only partial HNSW/GIN indexes; BM25 corpus statistics are transactionally maintained by migration `0004_hybrid_retrieval.sql`. Chat keeps the first eight fused candidates until VL reranking is connected.
+  - `search.rs` owns injectable dense/BM25 candidate stages, deterministic RRF, safe artifact-to-passage preparation, batched VL reranking, strict index/score mapping, and transient-only RRF fallback. Dense and lexical paths default to top-50 over ready-only partial HNSW/GIN indexes; BM25 corpus statistics are transactionally maintained by migration `0004_hybrid_retrieval.sql`. Rerank output defaults to six candidates and is configurable from three to eight.
 - `frontend/` is Vite + React TypeScript + assistant-ui with plain CSS.
 - SQLx migrations run automatically at backend startup.
 

@@ -59,6 +59,9 @@ async fn main() -> anyhow::Result<()> {
         embed_endpoint = %model_config.embed_endpoint(),
         rerank_endpoint = %model_config.rerank_endpoint(),
         request_timeout_secs = model_config.request_timeout().as_secs(),
+        rerank_candidate_top_k = model_config.rerank_candidate_top_k(),
+        rerank_top_n = model_config.rerank_top_n(),
+        rerank_batch_size = model_config.rerank_batch_size(),
         "cloud model client configured"
     );
     tracing::info!(
@@ -193,18 +196,31 @@ async fn chat(
 
     tokio::spawn(async move {
         let retrieval = match &last_user_text {
-            Some(text) if !text.trim().is_empty() => search::retrieve(&state, text)
-                .await
-                .map_err(|e| tracing::warn!("retrieval failed, falling back to plain chat: {e}"))
-                .ok(),
+            Some(text) if !text.trim().is_empty() => match search::retrieve(&state, text).await {
+                Ok(chunks) => Some(chunks),
+                Err(error) if error.is_permanent_rerank_failure() => {
+                    let _ = tx
+                        .send(SseEvent::Error {
+                            message: error.client_message(),
+                        })
+                        .await;
+                    return;
+                }
+                Err(_error) => {
+                    tracing::warn!(
+                        stage = "retrieval",
+                        fallback = true,
+                        error_kind = "candidate_retrieval",
+                        "candidate retrieval failed; falling back to plain chat"
+                    );
+                    None
+                }
+            },
             _ => None,
         };
 
         match retrieval {
-            Some(mut chunks) if !chunks.is_empty() => {
-                // Hybrid retrieval keeps a top-50 pool for the next reranking
-                // stage while preserving the current chat prompt's top-8 size.
-                chunks.truncate(search::CHAT_CONTEXT_TOP_N);
+            Some(chunks) if !chunks.is_empty() => {
                 let system_prompt = search::build_rag_system_prompt(&chunks);
                 let sources = search::dedupe_sources(&chunks);
 
