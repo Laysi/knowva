@@ -1,53 +1,227 @@
-import type { ChatModelAdapter } from "@assistant-ui/react";
+import type {
+  ChatModelAdapter,
+  ThreadAssistantMessagePart,
+} from "@assistant-ui/react";
 
-export const BackendAdapter: ChatModelAdapter = {
-  async *run({ messages, abortSignal }) {
-    const res = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        messages: messages.map((m) => ({
-          role: m.role,
-          content: m.content
-            .filter((c) => c.type === "text")
-            .map((c: any) => c.text)
-            .join("\n"),
-        })),
-      }),
-      signal: abortSignal,
-    });
-    if (!res.ok || !res.body) throw new Error(`API error: ${res.status}`);
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    let text = "";
-    let sources: { documentId: string; filename: string }[] = [];
+export type ChatSource = {
+  sourceId: string;
+  documentId: string;
+  unitId: number;
+  unitIndex?: number | null;
+  filename: string;
+  pageNumber: number | null;
+  kind: "page" | "text";
+};
+
+class SafeChatError extends Error {}
+
+export function chatRequestErrorMessage(status?: number): string {
+  if (status === undefined) {
+    return "無法連線至問答服務，請確認網路後再試。";
+  }
+  if (status === 401 || status === 403) {
+    return "目前沒有使用知識問答的權限。";
+  }
+  if (status === 429) return "目前詢問人數較多，請稍後再試。";
+  return "問答服務暫時無法使用，請稍後再試。";
+}
+
+const isAbortError = (error: unknown, signal: AbortSignal): boolean =>
+  signal.aborted ||
+  (error instanceof Error && error.name === "AbortError");
+
+const parseSseEvent = (event: string): unknown | null => {
+  const data = event
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).replace(/^ /, ""))
+    .join("\n");
+  if (!data) return null;
+  return JSON.parse(data) as unknown;
+};
+
+async function* readSsePayloads(
+  stream: ReadableStream<Uint8Array>,
+): AsyncGenerator<unknown> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const events = buf.split("\n\n");
-      buf = events.pop() ?? "";
-      for (const ev of events) {
-        const line = ev.split("\n").find((l) => l.startsWith("data: "));
-        if (!line) continue;
-        const payload = JSON.parse(line.slice(6));
-        if (payload.type === "text-delta") {
-          text += payload.text;
-          yield { content: [{ type: "text", text }] };
-        } else if (payload.type === "sources") {
-          sources = payload.sources ?? [];
-        } else if (payload.type === "error") {
-          throw new Error(payload.message);
-        }
+      buffer = (buffer + decoder.decode(value, { stream: true })).replace(
+        /\r\n/g,
+        "\n",
+      );
+      const events = buffer.split("\n\n");
+      buffer = events.pop() ?? "";
+      for (const event of events) {
+        const payload = parseSseEvent(event);
+        if (payload !== null) yield payload;
       }
     }
-    if (sources.length > 0) {
-      const list = sources
-        .map((s, i) => `${i + 1}. ${s.filename}`)
-        .join("\n");
-      text += `\n\n---\n**資料來源**\n${list}`;
-      yield { content: [{ type: "text", text }] };
+
+    buffer = (buffer + decoder.decode()).replace(/\r\n/g, "\n");
+    if (buffer.trim()) {
+      const payload = parseSseEvent(buffer);
+      if (payload !== null) yield payload;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+const isChatSource = (value: unknown): value is ChatSource => {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.sourceId === "string" &&
+    value.sourceId.length > 0 &&
+    typeof value.documentId === "string" &&
+    value.documentId.length > 0 &&
+    typeof value.unitId === "number" &&
+    Number.isSafeInteger(value.unitId) &&
+    value.unitId > 0 &&
+    (value.unitIndex === undefined ||
+      value.unitIndex === null ||
+      (typeof value.unitIndex === "number" &&
+        Number.isSafeInteger(value.unitIndex) &&
+        value.unitIndex >= 0)) &&
+    typeof value.filename === "string" &&
+    value.filename.length > 0 &&
+    ((value.kind === "page" &&
+      typeof value.pageNumber === "number" &&
+      Number.isSafeInteger(value.pageNumber) &&
+      value.pageNumber > 0) ||
+      (value.kind === "text" && value.pageNumber === null))
+  );
+};
+
+const sourceData = (value: unknown): ChatSource[] | null => {
+  if (!Array.isArray(value) || !value.every(isChatSource)) return null;
+  const sourceIds = new Set(value.map((source) => source.sourceId));
+  return sourceIds.size === value.length ? value : null;
+};
+
+const appendTextDelta = (
+  content: readonly ThreadAssistantMessagePart[],
+  activeTextIndex: number | null,
+  delta: string,
+): { content: ThreadAssistantMessagePart[]; activeTextIndex: number } => {
+  if (activeTextIndex === null) {
+    return {
+      content: [...content, { type: "text", text: delta }],
+      activeTextIndex: content.length,
+    };
+  }
+
+  const current = content[activeTextIndex];
+  if (current?.type !== "text") {
+    throw new SafeChatError("回覆格式異常，請重新送出問題。");
+  }
+  const updated = { ...current, text: current.text + delta };
+  return {
+    content: [
+      ...content.slice(0, activeTextIndex),
+      updated,
+      ...content.slice(activeTextIndex + 1),
+    ],
+    activeTextIndex,
+  };
+};
+
+export const BackendAdapter: ChatModelAdapter = {
+  async *run({ messages, abortSignal }) {
+    let response: Response;
+    try {
+      response = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: messages.map((message) => ({
+            role: message.role,
+            content: message.content
+              .flatMap((part) => (part.type === "text" ? [part.text] : []))
+              .join("\n"),
+          })),
+        }),
+        signal: abortSignal,
+      });
+    } catch (error) {
+      if (isAbortError(error, abortSignal)) throw error;
+      throw new SafeChatError(chatRequestErrorMessage());
+    }
+
+    if (!response.ok) {
+      throw new SafeChatError(chatRequestErrorMessage(response.status));
+    }
+    if (!response.body) {
+      throw new SafeChatError("問答服務未傳回內容，請稍後再試。");
+    }
+
+    let content: ThreadAssistantMessagePart[] = [];
+    let activeTextIndex: number | null = null;
+    let sources: ChatSource[] | null = null;
+    let completed = false;
+
+    try {
+      for await (const value of readSsePayloads(response.body)) {
+        if (!isRecord(value) || typeof value.type !== "string") continue;
+        if (completed) {
+          throw new SafeChatError("回覆格式異常，請重新送出問題。");
+        }
+
+        if (value.type === "text-delta") {
+          if (sources !== null || typeof value.text !== "string") {
+            throw new SafeChatError("回覆格式異常，請重新送出問題。");
+          }
+          const next = appendTextDelta(content, activeTextIndex, value.text);
+          content = next.content;
+          activeTextIndex = next.activeTextIndex;
+          yield { content };
+          continue;
+        }
+
+        if (value.type === "sources") {
+          if (sources !== null) {
+            throw new SafeChatError("回覆格式異常，請重新送出問題。");
+          }
+          sources = sourceData(value.sources);
+          if (sources === null) {
+            throw new SafeChatError("回覆格式異常，請重新送出問題。");
+          }
+          continue;
+        }
+
+        if (value.type === "done") {
+          if (sources === null) {
+            throw new SafeChatError("回覆格式異常，請重新送出問題。");
+          }
+          content = [
+            ...content,
+            { type: "data", name: "sources", data: sources },
+          ];
+          activeTextIndex = null;
+          completed = true;
+          yield { content };
+          continue;
+        }
+
+        if (value.type === "error") {
+          throw new SafeChatError("系統暫時無法產生回覆，請稍後再試。");
+        }
+      }
+      if (!completed) {
+        throw new SafeChatError("回覆傳輸中斷，請重新送出問題。");
+      }
+    } catch (error) {
+      if (isAbortError(error, abortSignal)) throw error;
+      if (error instanceof SafeChatError) throw error;
+      throw new SafeChatError("回覆傳輸中斷，請重新送出問題。");
     }
   },
 };

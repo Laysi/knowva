@@ -831,8 +831,19 @@ impl CloudModelClient {
 
     #[cfg(test)]
     pub(crate) fn for_test_embed_endpoint(endpoint: &str, timeout: Duration) -> Self {
+        Self::for_test_endpoints("http://127.0.0.1/chat/completions", endpoint, timeout)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_endpoints(
+        chat_endpoint: &str,
+        embed_endpoint: &str,
+        timeout: Duration,
+    ) -> Self {
         let mut client = Self::for_test();
-        client.embed_endpoint = Url::parse(endpoint).expect("test embed endpoint must be valid");
+        client.chat_endpoint = Url::parse(chat_endpoint).expect("test chat endpoint must be valid");
+        client.embed_endpoint =
+            Url::parse(embed_endpoint).expect("test embed endpoint must be valid");
         client.request_timeout = timeout;
         client.http = reqwest::Client::builder()
             .connect_timeout(timeout.min(Duration::from_millis(100)))
@@ -856,6 +867,10 @@ impl CloudModelClient {
 
     pub fn rerank_model(&self) -> &str {
         &self.rerank_model
+    }
+
+    pub fn chat_model(&self) -> &str {
+        &self.chat_model
     }
 
     pub fn rerank_candidate_top_k(&self) -> usize {
@@ -1005,6 +1020,27 @@ impl CloudModelClient {
             false,
             2048,
             Some(0.2),
+        );
+        let response = self.send_chat_request(&request).await?;
+        self.chat_content(response).await
+    }
+
+    /// Runs one bounded non-streaming Gemma 4 request over prepared multimodal content.
+    ///
+    /// This is used for best-effort document metadata generation. The caller remains
+    /// responsible for treating the content as untrusted and validating the returned schema.
+    pub(crate) async fn chat_once_with_context(
+        &self,
+        system_prompt: &str,
+        context: ApiChatContent,
+    ) -> CloudModelResult<String> {
+        let request = self.chat_request_with_context(
+            system_prompt.to_string(),
+            context,
+            Vec::new(),
+            false,
+            512,
+            Some(0.0),
         );
         let response = self.send_chat_request(&request).await?;
         self.chat_content(response).await
@@ -2421,6 +2457,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_shot_multimodal_chat_uses_locked_bounded_generation_contract() {
+        let (base_url, state, server) = spawn_mock(MockMode::Success).await;
+        let client = test_client(&base_url, "test-api-key", Duration::from_secs(1));
+        let content = ApiChatContent::Parts(vec![
+            ApiChatContentPart::Text {
+                text: "untrusted document source".to_string(),
+            },
+            ApiChatContentPart::ImageUrl {
+                image_url: ApiImageUrl {
+                    url: "data:image/png;base64,fixture".to_string(),
+                },
+            },
+        ]);
+
+        assert_eq!(
+            client
+                .chat_once_with_context("strict summary system prompt", content)
+                .await
+                .expect("one-shot response"),
+            "ok"
+        );
+
+        let requests = state.requests.lock().expect("request lock");
+        let request = requests.last().expect("summary request");
+        assert_eq!(request.body["model"], "hosted/google-gemma-4-test");
+        assert_eq!(request.body["stream"], false);
+        assert_eq!(request.body["max_tokens"], 512);
+        assert_eq!(request.body["temperature"], 0.0);
+        let messages = request.body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(
+            messages[1]["content"]
+                .as_array()
+                .expect("multimodal parts")
+                .len(),
+            2
+        );
+        drop(requests);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn gemma_multimodal_request_places_three_to_six_page_context_before_history() {
         for source_count in [3_usize, 6] {
             let (base_url, state, server) = spawn_mock(MockMode::Success).await;
@@ -2505,6 +2585,7 @@ mod tests {
         let candidates = vec![
             crate::search::RetrievalCandidate {
                 unit_id: 41,
+                unit_index: 4,
                 document_id: page_document_id,
                 filename: "shared-name.pdf".to_string(),
                 kind: "page".to_string(),
@@ -2521,6 +2602,7 @@ mod tests {
             },
             crate::search::RetrievalCandidate {
                 unit_id: 42,
+                unit_index: 1,
                 document_id: text_document_id,
                 filename: "shared-name.pdf".to_string(),
                 kind: "text".to_string(),
@@ -2734,6 +2816,7 @@ mod tests {
             source_id: format!("S{index}"),
             document_id: uuid::Uuid::from_u128(index),
             unit_id: index as i64,
+            unit_index: index as i32 - 1,
             filename: format!("source-{index}.md"),
             page_number: None,
             kind: "text".to_string(),

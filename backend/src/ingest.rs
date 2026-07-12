@@ -54,6 +54,8 @@ pub struct UploadResponse {
     id: Uuid,
     status: String,
     artifact_status: String,
+    #[serde(rename = "processingStage")]
+    processing_stage: String,
 }
 
 #[derive(Debug)]
@@ -185,7 +187,7 @@ pub async fn upload_document(
     let insert_result = sqlx::query(
         "INSERT INTO documents \
          (id, filename, storage_path, mime_type, status, artifact_status) \
-         VALUES ($1, $2, $3, $4, 'processing', 'processing')",
+         VALUES ($1, $2, $3, $4, 'processing', 'pending')",
     )
     .bind(id)
     .bind(&original_filename)
@@ -208,7 +210,8 @@ pub async fn upload_document(
         Json(UploadResponse {
             id,
             status: "processing".to_string(),
-            artifact_status: "processing".to_string(),
+            artifact_status: "pending".to_string(),
+            processing_stage: "queued".to_string(),
         }),
     ))
 }
@@ -354,7 +357,8 @@ pub(crate) async fn process_document(
 
     let marked_processing = sqlx::query(
         "UPDATE documents \
-         SET status = 'processing', artifact_status = 'processing', error = NULL \
+         SET status = 'processing', artifact_status = 'processing', \
+             summary = NULL, tags = NULL, error = NULL \
          WHERE id = $1",
     )
     .bind(id)
@@ -445,7 +449,16 @@ pub(crate) async fn process_document(
                 return;
             }
         };
-    if let Err(error) = persist_embedded_units(&state, id, &embedded_units).await {
+    let metadata = crate::document_summary::generate_best_effort(
+        &state.models,
+        id,
+        &prepared.pages,
+        &prepared.text_units,
+        Path::new(&state.files_dir),
+    )
+    .await;
+    if let Err(error) = persist_embedded_units(&state, id, &embedded_units, metadata.as_ref()).await
+    {
         set_embedding_failed(&state, id, &error).await;
     }
 }
@@ -830,6 +843,7 @@ async fn persist_embedded_units(
     state: &AppState,
     document_id: Uuid,
     units: &[EmbeddedUnit],
+    metadata: Option<&crate::document_summary::DocumentSummary>,
 ) -> Result<(), EmbeddingStageError> {
     let expected_count = i64::try_from(units.len()).map_err(|_| {
         EmbeddingStageError::document(
@@ -920,11 +934,15 @@ async fn persist_embedded_units(
         ));
     }
 
+    let summary = metadata.map(|metadata| metadata.summary.clone());
+    let tags = metadata.map(|metadata| metadata.tags.clone());
     let update = sqlx::query(
-        "UPDATE documents SET status = 'ready', error = NULL \
+        "UPDATE documents SET status = 'ready', summary = $2, tags = $3, error = NULL \
          WHERE id = $1 AND status = 'processing' AND artifact_status = 'ready'",
     )
     .bind(document_id)
+    .bind(summary)
+    .bind(tags)
     .execute(&mut *transaction)
     .await
     .map_err(embedding_db_error)?;
@@ -947,7 +965,7 @@ pub(crate) async fn embed_published_artifacts_for_test(
     let units = embed_artifact_units(&state.models, pages, text_units)
         .await
         .map_err(|error| error.to_string())?;
-    persist_embedded_units(state, document_id, &units)
+    persist_embedded_units(state, document_id, &units, None)
         .await
         .map_err(|error| error.to_string())
 }
