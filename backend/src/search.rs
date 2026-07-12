@@ -6,7 +6,7 @@ use crate::cloud_models::{
 use futures::future::BoxFuture;
 use pgvector::HalfVector;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -58,9 +58,6 @@ pub struct RetrievalCandidate {
     pub rerank_score: Option<f64>,
     pub rerank_rank: Option<usize>,
 }
-
-// Compatibility name retained for the existing chat/prompt call sites.
-pub type RetrievedChunk = RetrievalCandidate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RerankConfig {
@@ -230,10 +227,6 @@ pub enum RetrieveError {
 }
 
 impl RetrieveError {
-    pub fn is_permanent_rerank_failure(&self) -> bool {
-        matches!(self, Self::Rerank(_))
-    }
-
     pub fn client_message(&self) -> String {
         match self {
             Self::Candidates(_) => {
@@ -556,7 +549,10 @@ pub async fn retrieve_with_backend<B: CandidateRetrievalBackend + ?Sized>(
 /// returns the configured top 3-8 candidates. Exhausted transient model
 /// failures fall back to the unchanged RRF prefix; contract/artifact failures
 /// remain diagnostic errors.
-pub async fn retrieve(state: &AppState, query: &str) -> Result<Vec<RetrievedChunk>, RetrieveError> {
+pub async fn retrieve(
+    state: &AppState,
+    query: &str,
+) -> Result<Vec<RetrievalCandidate>, RetrieveError> {
     let rerank_config = RerankConfig::from_client(&state.models);
     let route_top_k = DEFAULT_DENSE_TOP_K.max(rerank_config.candidate_top_k);
     let retrieval_config = RetrievalConfig::new(
@@ -1015,58 +1011,6 @@ fn best_rank(candidate: &RetrievalCandidate) -> usize {
         .chain(candidate.bm25_rank)
         .min()
         .unwrap_or(usize::MAX)
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SourceRef {
-    #[serde(rename = "documentId")]
-    pub document_id: Uuid,
-    pub filename: String,
-    #[serde(rename = "pageNumber", skip_serializing_if = "Option::is_none")]
-    pub page_number: Option<i32>,
-}
-
-/// Builds the RAG-augmented system prompt from retrieved candidates.
-pub fn build_rag_system_prompt(chunks: &[RetrievedChunk]) -> String {
-    let mut prompt = String::new();
-    prompt.push_str(crate::cloud_models::SYSTEM_PROMPT);
-    prompt.push_str(
-        "\n\n以下是知識庫檢索到的段落,回答時優先依據這些內容,並在回答中標註出處檔名;若段落與問題無關或不足,請直接說明知識庫沒有相關資料。\n\n",
-    );
-    for (i, chunk) in chunks.iter().enumerate() {
-        let page = chunk
-            .page_number
-            .map(|number| format!(" 第 {number} 頁"))
-            .unwrap_or_default();
-        let content = chunk
-            .content
-            .as_deref()
-            .unwrap_or("[此頁只有頁面影像，尚無文字層]");
-        prompt.push_str(&format!(
-            "[{}] {}{}\n{}\n\n",
-            i + 1,
-            chunk.filename,
-            page,
-            content
-        ));
-    }
-    prompt
-}
-
-/// Dedupe retrieved units by document/page, preserving retrieval rank order.
-pub fn dedupe_sources(chunks: &[RetrievedChunk]) -> Vec<SourceRef> {
-    let mut seen = HashSet::new();
-    let mut sources = Vec::new();
-    for chunk in chunks {
-        if seen.insert((chunk.document_id, chunk.page_number)) {
-            sources.push(SourceRef {
-                document_id: chunk.document_id,
-                filename: chunk.filename.clone(),
-                page_number: chunk.page_number,
-            });
-        }
-    }
-    sources
 }
 
 #[cfg(test)]
