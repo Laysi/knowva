@@ -30,7 +30,8 @@
 - 本機開發另需 [proto](https://moonrepo.dev/proto)；repository 的 `.prototools` 會安裝固定版本的 Rust、Node.js 與 npm
 - 不使用容器轉檔時，主機需另裝 Pdfium 動態函式庫；可安裝在系統 library path，或以 `PDFIUM_LIBRARY_PATH` 指定檔案／目錄
 - 不使用容器處理 DOCX/PPTX/XLSX 時，主機需另裝 LibreOffice headless 與所需 CJK 字型
-- 可呼叫上述三個固定模型的雲端 API key
+- 一個 Cloudflare AI Gateway(所有模型流量一律經 gateway 轉送,不再直連供應商端點),並啟用 Authenticated Gateway 與一個 Run token
+- 可呼叫上述三個固定模型的 NVIDIA Build API key(chat 改走 OpenRouter 則另備 OpenRouter key),以 BYOK 存放在 gateway;後端不保存任何 provider key
 - 由實際雲端端點確認過的 Gemma 4 model id
 
 ## 設定
@@ -41,10 +42,11 @@
 cp .env.example .env
 ```
 
-最少必須填入：
+先在 Cloudflare dashboard 依序完成：建立 AI Gateway → 啟用 Authenticated Gateway 並建立 Run token → 註冊兩個 custom providers（slug `nvidia-build` → `https://integrate.api.nvidia.com`、slug `nvidia-ai` → `https://ai.api.nvidia.com`）→ 以 BYOK 為兩個 custom providers 存入 NVIDIA Build API key（chat 走 OpenRouter 時另存 OpenRouter key）。provider key 一律存於 gateway，後端不會送出上游 `Authorization` header。最少必須填入：
 
 ```dotenv
-NVIDIA_API_KEY=your-cloud-api-key
+CF_AI_GATEWAY_BASE_URL=https://gateway.ai.cloudflare.com/v1/<account_id>/<gateway_id>
+CF_AI_GATEWAY_TOKEN=your-ai-gateway-run-token
 GEMMA_4_MODEL_ID=the-confirmed-cloud-gemma-4-id
 ```
 
@@ -52,10 +54,9 @@ GEMMA_4_MODEL_ID=the-confirmed-cloud-gemma-4-id
 
 | 環境變數 | 必要性 | 說明 |
 |---|---|---|
-| `CLOUD_MODEL_BASE_URL` | 有預設 | 共用雲端 API base URL |
-| `CLOUD_CHAT_URL` | 選填 | 完整 chat URL；空值時使用 common base 的 `/chat/completions` |
-| `CLOUD_EMBED_URL` | 選填 | 完整 embedding URL；空值時使用 common base 的 `/embeddings` |
-| `CLOUD_RERANK_URL` | 選填 | 完整 reranking URL；範例已填 NVIDIA 託管端點 |
+| `CLOUD_CHAT_URL` | 選填 | 完整 chat gateway route；空值時使用 `${CF_AI_GATEWAY_BASE_URL}/custom-nvidia-build/v1/chat/completions`，改走 OpenRouter 則填 `${CF_AI_GATEWAY_BASE_URL}/openrouter/v1/chat/completions` |
+| `CLOUD_EMBED_URL` | 選填 | 完整 embedding gateway route；空值時使用 `${CF_AI_GATEWAY_BASE_URL}/custom-nvidia-build/v1/embeddings` |
+| `CLOUD_RERANK_URL` | 選填 | 完整 reranking gateway route；空值時使用 `${CF_AI_GATEWAY_BASE_URL}/custom-nvidia-ai/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking` |
 | `NEMOTRON_EMBED_MODEL_ID` | 有鎖定預設 | 只接受 `llama-nemotron-embed-vl-1b-v2` family |
 | `NEMOTRON_RERANK_MODEL_ID` | 有鎖定預設 | 只接受 `llama-nemotron-rerank-vl-1b-v2` family |
 | `RERANK_CANDIDATE_TOP_K` | `50` | RRF 候選池送入 VL rerank 的數量，必須不小於 `RERANK_TOP_N` |
@@ -63,7 +64,7 @@ GEMMA_4_MODEL_ID=the-confirmed-cloud-gemma-4-id
 | `RERANK_BATCH_SIZE` | `8` | 每次 hosted rerank request 的 passage 數量，範圍為 1–512 |
 | `CLOUD_MODEL_REQUEST_TIMEOUT_SECS` | 有預設 | 所有模型 HTTP/SSE request timeout，必須是正整數 |
 
-API key、Gemma 4 model id 缺失或 rerank 設定無效時，後端會在連接資料庫與接受流量前停止並顯示可理解的錯誤。啟動 log 只會列 endpoint、model id、timeout 與非敏感 rerank limits，不會列出 token。
+Gateway base URL、gateway token、Gemma 4 model id 缺失或 rerank 設定無效時，後端會在連接資料庫與接受流量前停止並顯示可理解的錯誤。啟動 log 只會列 endpoint、model id、timeout 與非敏感 rerank limits，不會列出 token。
 
 文件前處理設定：
 
@@ -79,7 +80,7 @@ API key、Gemma 4 model id 缺失或 rerank 設定無效時，後端會在連接
 
 ## 使用 Docker Compose
 
-容器映像已包含 Pdfium、LibreOffice 與 Noto CJK 字型，不需要主機另外提供 PDF API 或 native library。先設定 `.env` 的 `NVIDIA_API_KEY` 與 `GEMMA_4_MODEL_ID`，再啟動完整服務：
+容器映像已包含 Pdfium、LibreOffice 與 Noto CJK 字型，不需要主機另外提供 PDF API 或 native library。先設定 `.env` 的 `CF_AI_GATEWAY_BASE_URL`、`CF_AI_GATEWAY_TOKEN` 與 `GEMMA_4_MODEL_ID`，再啟動完整服務：
 
 ```bash
 cp .env.example .env
@@ -191,7 +192,7 @@ proto exec rust -- cargo test page_artifacts::tests::generated_pdf_and_office_fi
 
 fixture 的來源、預期頁數與涵蓋範圍見 [backend/tests/fixtures/README.md](backend/tests/fixtures/README.md)。
 
-若要選擇性驗證真實 NVIDIA endpoint，先在 `.env` 填妥 `NVIDIA_API_KEY`、`GEMMA_4_MODEL_ID` 與需要覆寫的 `CLOUD_EMBED_URL`，再明確執行下列 ignored test。它會各送一次 text query、text passage、image passage 與 image+text passage（共四次雲端呼叫）；一般 `cargo test` 與 CI 不會執行：
+若要選擇性驗證經 Cloudflare AI Gateway 的真實 NVIDIA Build endpoint，先在 `.env` 填妥 `CF_AI_GATEWAY_BASE_URL`（或完整的 `CLOUD_EMBED_URL` gateway route）、`CF_AI_GATEWAY_TOKEN` 與 `GEMMA_4_MODEL_ID`，並確認 NVIDIA key 已以 BYOK 存於 gateway，再明確執行下列 ignored test。它會各送一次 text query、text passage、image passage 與 image+text passage（共四次雲端呼叫）；一般 `cargo test` 與 CI 不會執行：
 
 ```bash
 cd backend
