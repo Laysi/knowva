@@ -24,6 +24,7 @@ const BM25_B: f64 = 0.75;
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidateMetadata {
     pub unit_id: i64,
+    pub unit_index: i32,
     pub document_id: Uuid,
     pub filename: String,
     pub kind: String,
@@ -44,6 +45,7 @@ pub struct RankedCandidate {
 #[serde(rename_all = "camelCase")]
 pub struct RetrievalCandidate {
     pub unit_id: i64,
+    pub unit_index: i32,
     pub document_id: Uuid,
     pub filename: String,
     pub kind: String,
@@ -359,6 +361,7 @@ impl CandidateRetrievalBackend for PostgresRetrievalBackend<'_> {
 #[derive(Debug, sqlx::FromRow)]
 struct CandidateRow {
     unit_id: i64,
+    unit_index: i32,
     document_id: Uuid,
     filename: String,
     kind: String,
@@ -373,6 +376,7 @@ impl CandidateRow {
         RankedCandidate {
             metadata: CandidateMetadata {
                 unit_id: self.unit_id,
+                unit_index: self.unit_index,
                 document_id: self.document_id,
                 filename: self.filename,
                 kind: self.kind,
@@ -394,7 +398,7 @@ pub(crate) async fn dense_candidates_from_pool(
     let limit = i64::try_from(top_k)?;
     let rows = sqlx::query_as::<_, CandidateRow>(
         "WITH nearest AS MATERIALIZED ( \
-           SELECT u.id AS unit_id, u.document_id, u.kind, u.page_number, \
+           SELECT u.id AS unit_id, u.unit_index, u.document_id, u.kind, u.page_number, \
                   u.image_path, u.content, \
                   (u.embedding <=> $1)::double precision AS distance \
            FROM document_units AS u \
@@ -402,7 +406,7 @@ pub(crate) async fn dense_candidates_from_pool(
            ORDER BY u.embedding <=> $1 \
            LIMIT $2 \
          ) \
-         SELECT nearest.unit_id, nearest.document_id, d.filename, nearest.kind, \
+         SELECT nearest.unit_id, nearest.unit_index, nearest.document_id, d.filename, nearest.kind, \
                 nearest.page_number, nearest.image_path, nearest.content, \
                 (1.0 - nearest.distance)::double precision AS score \
          FROM nearest \
@@ -438,7 +442,7 @@ pub(crate) async fn bm25_candidates_from_pool(
            SELECT COALESCE(array_agg(term ORDER BY term), ARRAY[]::text[]) AS terms \
            FROM query_terms \
          ), candidate_units AS MATERIALIZED ( \
-           SELECT u.id AS unit_id, u.document_id, u.kind, \
+           SELECT u.id AS unit_id, u.unit_index, u.document_id, u.kind, \
                   u.page_number, u.image_path, u.content, u.bm25_tokens, u.bm25_length \
            FROM document_units AS u \
            CROSS JOIN query_token_array AS query \
@@ -447,7 +451,7 @@ pub(crate) async fn bm25_candidates_from_pool(
              AND btrim(u.content) <> '' \
              AND u.bm25_tokens && query.terms \
          ), scored AS ( \
-           SELECT candidate.unit_id, candidate.document_id, document.filename, \
+           SELECT candidate.unit_id, candidate.unit_index, candidate.document_id, document.filename, \
                   candidate.kind, candidate.page_number, candidate.image_path, \
                   candidate.content, \
                   sum( \
@@ -478,11 +482,11 @@ pub(crate) async fn bm25_candidates_from_pool(
              AND document.status = 'ready' \
              AND corpus.document_count > 0 \
              AND frequency.tf > 0 \
-           GROUP BY candidate.unit_id, candidate.document_id, document.filename, \
+           GROUP BY candidate.unit_id, candidate.unit_index, candidate.document_id, document.filename, \
                     candidate.kind, candidate.page_number, candidate.image_path, \
                     candidate.content \
          ) \
-         SELECT unit_id, document_id, filename, kind, page_number, image_path, content, score \
+         SELECT unit_id, unit_index, document_id, filename, kind, page_number, image_path, content, score \
          FROM scored \
          ORDER BY score DESC, unit_id \
          LIMIT $2",
@@ -958,6 +962,7 @@ pub fn reciprocal_rank_fusion(
                 .or_insert_with(|| Accumulator {
                     candidate: RetrievalCandidate {
                         unit_id: ranked.metadata.unit_id,
+                        unit_index: ranked.metadata.unit_index,
                         document_id: ranked.metadata.document_id,
                         filename: ranked.metadata.filename.clone(),
                         kind: ranked.metadata.kind.clone(),
@@ -1023,6 +1028,7 @@ mod tests {
     fn metadata(unit_id: i64) -> CandidateMetadata {
         CandidateMetadata {
             unit_id,
+            unit_index: unit_id as i32 - 1,
             document_id: Uuid::from_u128(unit_id as u128 + 100),
             filename: format!("document-{unit_id}.pdf"),
             kind: "page".to_string(),
@@ -1048,6 +1054,7 @@ mod tests {
     ) -> RetrievalCandidate {
         RetrievalCandidate {
             unit_id,
+            unit_index: unit_id as i32 - 1,
             document_id: Uuid::from_u128(unit_id as u128 + 100),
             filename: format!("document-{unit_id}.pdf"),
             kind: kind.to_string(),
@@ -1185,6 +1192,7 @@ mod tests {
         let value = serde_json::to_value(&fused[0]).expect("serialize candidate");
         for field in [
             "unitId",
+            "unitIndex",
             "documentId",
             "filename",
             "kind",

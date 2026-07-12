@@ -139,7 +139,38 @@ proto run npm -- run build
 | DELETE | `/api/documents/{id}` | 刪除 DB row、原檔、轉出 PDF、頁圖、manifest 與暫存物 |
 | POST | `/api/chat` | SSE 串流問答（`text-delta` / `sources` / `done` / `error`） |
 
+`GET /api/documents` 的 canonical response 使用 camelCase；下列範例同時省略了過渡期保留的 `artifact_status`、`page_count`、`unit_count`、`chunk_count`、`created_at` 與安全字串 `error` aliases：
+
+```json
+[
+  {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "filename": "操作手冊.pdf",
+    "status": "processing",
+    "processingStage": "indexing",
+    "processingError": null,
+    "summary": null,
+    "tags": null,
+    "createdAt": "2026-07-12T08:00:00Z",
+    "pageCount": 12,
+    "unitCount": 12
+  }
+]
+```
+
+`status` 維持 `processing` / `ready` / `failed`；`processingStage` 進一步區分 `queued` / `extracting` / `indexing` / `ready` / `failed`。失敗時 `processingError` 只提供固定的繁中 code/message，不會回傳資料庫診斷、provider response、路徑或 secret。Deprecated aliases 只供現有 MVP client 過渡，`chunk_count` 固定等於 `unitCount`。
+
 `/api/chat` 的純文字串流契約維持不變；有檢索來源時，`sources` 一定在 `done` 前送出。模型端 HTTP 錯誤包含 status、最多 500 字的安全 response snippet 與可重試狀態；timeout 也會以統一錯誤回傳。
+
+分頁 source 的 `pageNumber` 是 1-based；文字 source 的 `pageNumber` 固定為 JSON `null`，並以 0-based `unitIndex` 標識文字單元（UI 顯示時加一）。同文件的不同頁不會去重，完整 SSE 範例如下：
+
+```text
+data: {"type":"text-delta","text":"答案 [S1]"}
+
+data: {"type":"sources","sources":[{"sourceId":"S1","documentId":"00000000-0000-0000-0000-000000000001","unitId":101,"unitIndex":1,"filename":"操作手冊.pdf","pageNumber":2,"kind":"page"},{"sourceId":"S2","documentId":"00000000-0000-0000-0000-000000000002","unitId":202,"unitIndex":0,"filename":"備註.md","pageNumber":null,"kind":"text"}]}
+
+data: {"type":"done"}
+```
 
 ## Artifact 契約
 
@@ -160,6 +191,8 @@ FILES_DIR/{document_id}/
 
 頁圖只以記憶體中的 PNG/JPEG data URL 送出，不會傳送本機 artifact path；decoded image 上限 25 MiB、整體 embedding request 上限 36 MiB。Embedding 對 408、429、5xx、transport error 與 timeout 最多嘗試三次並使用 exponential backoff + jitter，其他 4xx 立即失敗。HTTP error snippet、API key、Authorization 與 base64 圖片資料都會在記錄前限長或遮蔽。
 
+所有 embedding 完成後，系統會以同一個雲端 Gemma 4 best-effort 產生繁中摘要與 3–6 個標籤：分頁文件固定只取前 3 頁，MD/TXT 固定只取前 3 個文字單元；每個文字單元最多 3000 字，每頁 extracted text 最多 2000 字，頁圖沿用最長邊 1600 px、JPEG quality 80、單一 serialized image part 5 MiB 與完整 chat request 24 MiB 的界線。輸出必須是 typed JSON，摘要非空且最多 500 字，每個唯一標籤非空且最多 30 字；只容許單一 code fence 或單一 JSON object 前後 chatter 的 JSON-aware salvage。暫時性錯誤最多兩次 summary request，malformed JSON 不重試；任一 summary 失敗都只記安全 warning，仍會把完整 embeddings 與 `ready` 在同一 transaction 發布，不會重跑 embedding。
+
 ## Hybrid retrieval 契約
 
 - Dense 使用 query 的固定 2048 維 embedding 與 ready-only partial HNSW `halfvec_cosine_ops` index，cosine top-k 預設 50。HNSW nearest-neighbor query 先 materialize，再以 distance、`unit_id` 做穩定排序。
@@ -167,7 +200,7 @@ FILES_DIR/{document_id}/
 - Lexical candidate index 是 non-empty `content` 上的 ready-only partial GIN token-array index。tokenizer 先做 Unicode NFKC、lowercase 與 dash normalization；繁中採 character unigram + adjacent bigram，原因是不用可變字典也能重現、可涵蓋未知企業詞；英文、數字與產品代號保留完整 token，hyphenated code 另產 compact 與 component variants，讓全形／半形或常見標點差異不會讓基本詞失效。
 - RRF 固定 `k=60`，`rrf_score(d) = Σ 1 / (60 + rank_i(d))`。以 `unit_id` 去重；同分依最佳 route rank、`unit_id` 排序。兩路預設各 50，融合預設保留 50，再以固定 `llama-nemotron-rerank-vl-1b-v2` 精排成 top 6（可設 3–8）。
 - Page passage 只讀已發布 artifact：有文字層時送 image+text，掃描頁送 image-only（完全省略 `text`），MD/TXT chunk 送 text-only。本機路徑不進 payload，圖片只以記憶體 data URL 傳送；預設每批 8 筆，API 回應即使重排順序也依每批 local index 映回原 unit。
-- 每筆 `RetrievalCandidate` 直接帶 `unit_id`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、兩路 rank/score、`rrf_score` 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
+- 每筆 `RetrievalCandidate` 直接帶 `unit_id`、0-based `unit_index`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、兩路 rank/score、`rrf_score` 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
 - Rerank 每批都嚴格驗證回應筆數、index 唯一且不越界、score finite，再驗證跨批映射。408、429、5xx、transport error 與 timeout 最多嘗試三次；耗盡後以原 RRF top_n 原序回退，且 rerank 欄位保持 null。設定、artifact 或 hosted response contract 錯誤不回退，會回傳可診斷錯誤。Structured log 僅記錄各階段筆數、延遲、fallback 與 model id，不含 query、文件內容、secret 或 base64。
 
 ## 驗證
@@ -177,6 +210,12 @@ cd backend
 proto exec rust -- cargo fmt --check
 proto exec rust -- cargo clippy --all-targets -- -D warnings
 proto exec rust -- cargo test
+
+cd ../frontend
+proto run npm -- ci
+proto run npm -- run lint
+proto run npm -- run test
+proto run npm -- run build
 ```
 
 一般測試以本機 mock cloud endpoint 驗證四種 embedding payload、三種 rerank modality、跨批映射、嚴格 response contract、有限重試／fallback 與 transaction/DB 契約，不會呼叫真實雲端。安裝 Pdfium 與 LibreOffice 後，可明確執行 native fixture smoke；它也會確認原生 PDF 使用 image+text embedding、掃描 PDF 使用 image-only embedding：

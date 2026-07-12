@@ -708,6 +708,59 @@
   border-radius: var(--radius-sm);
 }
 
+/* Structured assistant-ui `sources` data part. */
+.source-list {
+  margin-top: 18px;
+  padding-top: 13px;
+  border-top: 1px solid var(--color-border);
+}
+
+.source-list h3 {
+  margin: 0 0 8px;
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--color-text-secondary);
+}
+
+.source-list ol {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: source-list;
+}
+
+.source-list li {
+  position: relative;
+  min-height: 22px;
+  padding-left: 29px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.source-list li::before {
+  counter-increment: source-list;
+  content: counter(source-list);
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 21px;
+  height: 21px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-accent);
+  background: var(--color-accent-weak);
+  border-radius: var(--radius-sm);
+}
+
 /* Streaming caret */
 .aui-md[data-status="running"] > :last-child::after {
   content: "";
@@ -935,6 +988,10 @@
   white-space: nowrap;
 }
 
+.doc-metric {
+  display: inline-block;
+}
+
 .doc-error {
   display: none;
   margin-top: 9px;
@@ -975,6 +1032,31 @@
   border-color: var(--color-danger-border);
 }
 
+.docs-request-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+  padding: 13px 15px;
+  font-size: 14px;
+  color: var(--color-danger-text);
+  background: var(--color-danger-bg);
+  border: 1px solid var(--color-danger-border);
+  border-radius: var(--radius-md);
+}
+
+.docs-request-error button {
+  flex: none;
+  padding: 5px 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-danger-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-danger-border);
+  border-radius: var(--radius-sm);
+}
+
 /* ---- Status badge ---- */
 .status {
   flex: none;
@@ -991,6 +1073,15 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
+}
+
+.status-queued {
+  color: var(--color-text-secondary);
+  background: var(--color-surface-sunken);
+}
+
+.status-queued .status-dot {
+  background: var(--color-text-muted);
 }
 
 .status-processing {

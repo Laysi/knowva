@@ -56,3 +56,18 @@ The backend requires `NVIDIA_API_KEY` and a confirmed `GEMMA_4_MODEL_ID`. Shared
 ## Working tree safety
 
 Preserve unrelated user changes. Use focused patches, run the backend checks above, and do not push or create a PR unless explicitly requested.
+
+## Agent routing
+
+Use `deep-reasoner` for architecture, unclear bugs, security, database/API/deployment decisions, design review, and high-risk tradeoffs. It is read-only and should return a decision memo plus implementation plan.
+Use `senior-engineer` for difficult implementation that requires strong engineering judgment and direct code edits, especially Rust, backend logic, APIs, async/concurrency, database integration, state management, complex refactors, or bugs that are too hard for mechanical patching.
+Use `fast-worker` for clear, scoped implementation: small code edits, refactors, file creation, tests, formatting, migrations, and applying an existing plan. Do not use it for architecture or hard engineering judgment.
+Use `ui-rewriter` when the frontend looks ugly, cheap, inconsistent, template-like, or not credible as a B2B SaaS product. It may directly edit frontend files, but should not touch backend architecture.
+For risky architecture: `deep-reasoner` first, then `senior-engineer`, `fast-worker`, or `ui-rewriter`.
+For hard implementation: `senior-engineer`.
+For obvious scoped bugs or mechanical edits: `fast-worker`.
+For frontend visual polish/redesign: `ui-rewriter`.
+Do not let multiple agents independently redesign the same area.
+Do not ask `fast-worker` to invent architecture.
+Do not ask `deep-reasoner` to edit files.
+Do not use Opus agents for routine mechanical edits.

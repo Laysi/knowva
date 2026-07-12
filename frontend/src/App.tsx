@@ -65,7 +65,7 @@ function App() {
           <div className="sidebar-footer">
             <span className="footer-note">
               <ShieldIcon className="footer-note-icon" />
-              地端部署
+              雲端模型
             </span>
             <span className="badge-demo">v0.1 Demo</span>
           </div>
