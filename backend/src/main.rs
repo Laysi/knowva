@@ -2,6 +2,7 @@ pub mod cloud_models;
 mod embedding;
 mod ingest;
 mod page_artifacts;
+mod rag_context;
 mod search;
 
 #[cfg(test)]
@@ -184,66 +185,7 @@ async fn chat(
     Json(req): Json<ChatRequest>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
-
-    let models = state.models.clone();
-
-    let last_user_text = req
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone());
-
-    tokio::spawn(async move {
-        let retrieval = match &last_user_text {
-            Some(text) if !text.trim().is_empty() => match search::retrieve(&state, text).await {
-                Ok(chunks) => Some(chunks),
-                Err(error) if error.is_permanent_rerank_failure() => {
-                    let _ = tx
-                        .send(SseEvent::Error {
-                            message: error.client_message(),
-                        })
-                        .await;
-                    return;
-                }
-                Err(_error) => {
-                    tracing::warn!(
-                        stage = "retrieval",
-                        fallback = true,
-                        error_kind = "candidate_retrieval",
-                        "candidate retrieval failed; falling back to plain chat"
-                    );
-                    None
-                }
-            },
-            _ => None,
-        };
-
-        match retrieval {
-            Some(chunks) if !chunks.is_empty() => {
-                let system_prompt = search::build_rag_system_prompt(&chunks);
-                let sources = search::dedupe_sources(&chunks);
-
-                let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
-                let models2 = models.clone();
-                let stream_task = tokio::spawn(async move {
-                    models2
-                        .stream_chat_with_system(system_prompt, req.messages, inner_tx)
-                        .await
-                });
-
-                forward_rag_events(&mut inner_rx, &tx, &sources).await;
-                // Dropping the receiver first is load-bearing: if we broke out early
-                // (client disconnected), the pump blocks on a full channel forever and
-                // stream_task.await would never resolve.
-                drop(inner_rx);
-                let _ = stream_task.await;
-            }
-            _ => {
-                models.stream_chat(req.messages, tx).await;
-            }
-        }
-    });
+    tokio::spawn(run_chat(state, req, tx));
 
     let stream = ReceiverStream::new(rx).map(|event| {
         let data = serde_json::to_string(&event).unwrap_or_else(|_| {
@@ -255,14 +197,129 @@ async fn chat(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc::Sender<SseEvent>) {
+    let last_user_text = req
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.clone());
+
+    let candidates = match last_user_text {
+        Some(text) if !text.trim().is_empty() => {
+            let retrieval = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = search::retrieve(&state, &text) => result,
+            };
+            match retrieval {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    let error_kind = match &error {
+                        search::RetrieveError::Candidates(_) => "candidate_retrieval",
+                        search::RetrieveError::Rerank(_) => "rerank",
+                    };
+                    tracing::error!(
+                        stage = "retrieval",
+                        error_kind,
+                        "knowledge-base retrieval failed"
+                    );
+                    let _ = tx
+                        .send(SseEvent::Error {
+                            message: error.client_message(),
+                        })
+                        .await;
+                    return;
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+
+    // Complete artifact validation, image conversion, and payload trimming before the
+    // provider request is opened. Structured metadata remains separate from model content.
+    let context = tokio::select! {
+        biased;
+        _ = tx.closed() => return,
+        result = rag_context::build_rag_context(&candidates, Path::new(&state.files_dir)) => result,
+    };
+    let context = match context {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::error!(
+                stage = "rag_context",
+                error_kind = error.safe_kind(),
+                "RAG context preflight failed"
+            );
+            let _ = tx
+                .send(SseEvent::Error {
+                    message: error.client_message(),
+                })
+                .await;
+            return;
+        }
+    };
+    let system_prompt = if context.sources.is_empty() {
+        rag_context::RAG_NO_SOURCES_SYSTEM_PROMPT
+    } else {
+        rag_context::RAG_SYSTEM_PROMPT
+    };
+    let models = state.models.clone();
+    let context = match models.fit_rag_context_to_request(system_prompt, context, &req.messages) {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::error!(
+                stage = "rag_request_preflight",
+                error_kind = error.safe_kind(),
+                "Gemma 4 request payload preflight failed"
+            );
+            let _ = tx
+                .send(SseEvent::Error {
+                    message: error.chat_client_message(),
+                })
+                .await;
+            return;
+        }
+    };
+    let rag_context::RagContext { content, sources } = context;
+
+    let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
+    let stream_task = tokio::spawn(async move {
+        models
+            .stream_chat_with_context(system_prompt.to_string(), content, req.messages, inner_tx)
+            .await;
+    });
+    let abort_handle = stream_task.abort_handle();
+    let client_connected = forward_rag_events(&mut inner_rx, &tx, &sources, &abort_handle).await;
+    drop(inner_rx);
+    if client_connected {
+        let _ = stream_task.await;
+    }
+}
+
 async fn forward_rag_events(
     inner_rx: &mut tokio::sync::mpsc::Receiver<SseEvent>,
     tx: &tokio::sync::mpsc::Sender<SseEvent>,
-    sources: &[search::SourceRef],
-) {
-    while let Some(event) = inner_rx.recv().await {
+    sources: &[rag_context::SourceRef],
+    upstream_abort: &tokio::task::AbortHandle,
+) -> bool {
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = tx.closed() => {
+                upstream_abort.abort();
+                return false;
+            }
+            event = inner_rx.recv() => event,
+        };
         match event {
-            SseEvent::Done => {
+            Some(SseEvent::TextDelta { text }) => {
+                if tx.send(SseEvent::TextDelta { text }).await.is_err() {
+                    upstream_abort.abort();
+                    return false;
+                }
+            }
+            Some(SseEvent::Done) => {
                 if tx
                     .send(SseEvent::Sources {
                         sources: sources.to_vec(),
@@ -270,15 +327,40 @@ async fn forward_rag_events(
                     .await
                     .is_err()
                 {
-                    break;
+                    upstream_abort.abort();
+                    return false;
                 }
-                let _ = tx.send(SseEvent::Done).await;
-                break;
+                if tx.send(SseEvent::Done).await.is_err() {
+                    upstream_abort.abort();
+                    return false;
+                }
+                return true;
             }
-            other => {
-                if tx.send(other).await.is_err() {
-                    break;
+            Some(error @ SseEvent::Error { .. }) => {
+                if tx.send(error).await.is_err() {
+                    upstream_abort.abort();
+                    return false;
                 }
+                return true;
+            }
+            Some(SseEvent::Sources { .. }) => {
+                upstream_abort.abort();
+                let _ = tx
+                    .send(SseEvent::Error {
+                        message: "雲端回答串流狀態無效（錯誤代碼：chat_stream_protocol）"
+                            .to_string(),
+                    })
+                    .await;
+                return true;
+            }
+            None => {
+                upstream_abort.abort();
+                let _ = tx
+                    .send(SseEvent::Error {
+                        message: "雲端回答串流意外中斷（錯誤代碼：chat_stream_closed）".to_string(),
+                    })
+                    .await;
+                return true;
             }
         }
     }
@@ -288,16 +370,25 @@ async fn forward_rag_events(
 mod tests {
     use super::*;
 
+    fn pending_upstream() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(std::future::pending())
+    }
+
     #[tokio::test]
     async fn rag_sse_keeps_text_sources_done_order() {
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel(4);
         let (outer_tx, mut outer_rx) = tokio::sync::mpsc::channel(4);
         let document_id = uuid::Uuid::new_v4();
-        let sources = vec![search::SourceRef {
+        let sources = vec![rag_context::SourceRef {
+            source_id: "S1".to_string(),
             document_id,
+            unit_id: 17,
             filename: "source.pdf".to_string(),
             page_number: Some(1),
+            kind: "page".to_string(),
         }];
+        let upstream = pending_upstream();
+        let abort_handle = upstream.abort_handle();
 
         inner_tx
             .send(SseEvent::TextDelta {
@@ -308,7 +399,8 @@ mod tests {
         inner_tx.send(SseEvent::Done).await.expect("send done");
         drop(inner_tx);
 
-        forward_rag_events(&mut inner_rx, &outer_tx, &sources).await;
+        assert!(forward_rag_events(&mut inner_rx, &outer_tx, &sources, &abort_handle).await);
+        upstream.abort();
         drop(outer_tx);
 
         assert!(matches!(
@@ -324,6 +416,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rag_sse_zero_text_still_emits_one_sources_then_done() {
+        let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel(2);
+        let (outer_tx, mut outer_rx) = tokio::sync::mpsc::channel(2);
+        let upstream = pending_upstream();
+        let abort_handle = upstream.abort_handle();
+        inner_tx.send(SseEvent::Done).await.expect("send done");
+        drop(inner_tx);
+
+        assert!(forward_rag_events(&mut inner_rx, &outer_tx, &[], &abort_handle).await);
+        upstream.abort();
+        drop(outer_tx);
+        assert!(matches!(
+            outer_rx.recv().await,
+            Some(SseEvent::Sources { sources }) if sources.is_empty()
+        ));
+        assert!(matches!(outer_rx.recv().await, Some(SseEvent::Done)));
+        assert!(outer_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn rag_sse_stops_when_client_disconnects() {
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel(1);
         let (outer_tx, outer_rx) = tokio::sync::mpsc::channel(1);
@@ -334,14 +446,83 @@ mod tests {
             })
             .await
             .expect("send text");
+        let upstream = pending_upstream();
+        let abort_handle = upstream.abort_handle();
 
-        tokio::time::timeout(
+        let connected = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            forward_rag_events(&mut inner_rx, &outer_tx, &[]),
+            forward_rag_events(&mut inner_rx, &outer_tx, &[], &abort_handle),
         )
         .await
         .expect("disconnect must not block the event pump");
+        assert!(!connected);
+        assert!(
+            upstream
+                .await
+                .expect_err("upstream must be aborted")
+                .is_cancelled()
+        );
         drop(inner_rx);
         assert!(inner_tx.send(SseEvent::Done).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rag_sse_error_after_text_has_no_fake_sources_or_done() {
+        let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel(4);
+        let (outer_tx, mut outer_rx) = tokio::sync::mpsc::channel(4);
+        let upstream = pending_upstream();
+        let abort_handle = upstream.abort_handle();
+        inner_tx
+            .send(SseEvent::TextDelta {
+                text: "partial".to_string(),
+            })
+            .await
+            .expect("send text");
+        inner_tx
+            .send(SseEvent::Error {
+                message: "安全錯誤".to_string(),
+            })
+            .await
+            .expect("send error");
+        inner_tx
+            .send(SseEvent::Done)
+            .await
+            .expect("queue fake done");
+
+        assert!(forward_rag_events(&mut inner_rx, &outer_tx, &[], &abort_handle).await);
+        upstream.abort();
+        drop(outer_tx);
+        assert!(matches!(
+            outer_rx.recv().await,
+            Some(SseEvent::TextDelta { text }) if text == "partial"
+        ));
+        assert!(matches!(
+            outer_rx.recv().await,
+            Some(SseEvent::Error { message }) if message == "安全錯誤"
+        ));
+        assert!(outer_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unexpected_inner_close_emits_one_safe_error_only() {
+        let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel(1);
+        let (outer_tx, mut outer_rx) = tokio::sync::mpsc::channel(2);
+        let upstream = pending_upstream();
+        let abort_handle = upstream.abort_handle();
+        drop(inner_tx);
+
+        assert!(forward_rag_events(&mut inner_rx, &outer_tx, &[], &abort_handle).await);
+        assert!(
+            upstream
+                .await
+                .expect_err("upstream must be aborted")
+                .is_cancelled()
+        );
+        drop(outer_tx);
+        assert!(matches!(
+            outer_rx.recv().await,
+            Some(SseEvent::Error { message }) if message.contains("chat_stream_closed")
+        ));
+        assert!(outer_rx.recv().await.is_none());
     }
 }

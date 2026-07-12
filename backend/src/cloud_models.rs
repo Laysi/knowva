@@ -1,5 +1,6 @@
 use base64::Engine;
 use futures::StreamExt;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::{Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -24,6 +25,7 @@ pub const MAX_RERANK_BATCH_SIZE: usize = 512;
 
 const DEFAULT_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const MAX_CHAT_REQUEST_BYTES: usize = 24 * 1024 * 1024;
 const MAX_EMBED_REQUEST_BYTES: usize = 36 * 1024 * 1024;
 const DEFAULT_EMBED_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_EMBED_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -45,7 +47,7 @@ pub enum SseEvent {
     TextDelta { text: String },
     #[serde(rename = "sources")]
     Sources {
-        sources: Vec<crate::search::SourceRef>,
+        sources: Vec<crate::rag_context::SourceRef>,
     },
     #[serde(rename = "done")]
     Done,
@@ -279,14 +281,26 @@ fn validate_locked_model(
 
 fn is_gemma_4_model_id(model: &str) -> bool {
     let normalized = model.to_ascii_lowercase();
+    let bytes = normalized.as_bytes();
     normalized.match_indices("gemma").any(|(index, _)| {
-        let suffix = normalized[index + "gemma".len()..]
-            .trim_start_matches(|character: char| !character.is_ascii_alphanumeric());
-        suffix.strip_prefix('4').is_some_and(|rest| {
-            rest.chars()
-                .next()
-                .is_none_or(|character| !character.is_ascii_digit())
-        })
+        let has_left_boundary = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
+        if !has_left_boundary {
+            return false;
+        }
+
+        let mut cursor = index + "gemma".len();
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| matches!(byte, b'-' | b'_' | b'.'))
+        {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'4') {
+            return false;
+        }
+        bytes
+            .get(cursor + 1)
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric())
     })
 }
 
@@ -379,6 +393,36 @@ impl CloudModelError {
             Self::InvalidRequest { .. } | Self::InvalidResponse { .. } => false,
         }
     }
+
+    pub fn safe_kind(&self) -> &'static str {
+        match self {
+            Self::Http { .. } => "http",
+            Self::Timeout { .. } => "timeout",
+            Self::Transport { .. } => "transport",
+            Self::InvalidRequest { .. } => "invalid_request",
+            Self::InvalidResponse { .. } => "invalid_response",
+        }
+    }
+
+    /// Stable text that can be exposed to chat clients without provider or request content.
+    pub fn chat_client_message(&self) -> String {
+        match self {
+            Self::Http { status, .. } => format!(
+                "雲端回答服務拒絕請求（錯誤代碼：chat_model_http；HTTP {}）",
+                status.as_u16()
+            ),
+            Self::Timeout { .. } => "雲端回答服務逾時（錯誤代碼：chat_model_timeout）".to_string(),
+            Self::Transport { .. } => {
+                "雲端回答服務連線失敗（錯誤代碼：chat_model_transport）".to_string()
+            }
+            Self::InvalidRequest { .. } => {
+                "雲端回答請求設定無效（錯誤代碼：chat_model_invalid_request）".to_string()
+            }
+            Self::InvalidResponse { .. } => {
+                "雲端回答服務回應格式無效（錯誤代碼：chat_model_invalid_response）".to_string()
+            }
+        }
+    }
 }
 
 impl fmt::Display for CloudModelError {
@@ -420,7 +464,7 @@ impl std::error::Error for CloudModelError {}
 
 pub type CloudModelResult<T> = Result<T, CloudModelError>;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ApiChatMessage>,
@@ -428,6 +472,19 @@ pub struct ChatCompletionRequest {
     pub max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+}
+
+impl fmt::Debug for ChatCompletionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChatCompletionRequest")
+            .field("model", &self.model)
+            .field("message_count", &self.messages.len())
+            .field("stream", &self.stream)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -762,39 +819,97 @@ impl CloudModelClient {
         self.rerank_batch_size
     }
 
-    pub async fn stream_chat(&self, messages: Vec<ChatMessage>, tx: Sender<SseEvent>) {
-        self.stream_chat_with_system(SYSTEM_PROMPT.to_string(), messages, tx)
-            .await;
+    /// Fits a prepared RAG context to the complete serialized Gemma request.
+    ///
+    /// The context builder bounds its own multipart payload first. This second pass includes the
+    /// system prompt, model id, generation settings, and conversation history; if necessary it
+    /// removes only lowest-ranked sources while keeping model parts and structured metadata in
+    /// lockstep.
+    pub fn fit_rag_context_to_request(
+        &self,
+        system_prompt: &str,
+        context: crate::rag_context::RagContext,
+        messages: &[ChatMessage],
+    ) -> CloudModelResult<crate::rag_context::RagContext> {
+        self.fit_rag_context_to_request_with_limit(
+            system_prompt,
+            context,
+            messages,
+            MAX_CHAT_REQUEST_BYTES,
+        )
     }
 
-    pub async fn stream_chat_with_system(
+    fn fit_rag_context_to_request_with_limit(
+        &self,
+        system_prompt: &str,
+        mut context: crate::rag_context::RagContext,
+        messages: &[ChatMessage],
+        maximum_bytes: usize,
+    ) -> CloudModelResult<crate::rag_context::RagContext> {
+        loop {
+            let request = self.chat_request_with_context(
+                system_prompt.to_string(),
+                context.content.clone(),
+                messages.to_vec(),
+                true,
+                4096,
+                None,
+            );
+            let payload = serialize_chat_request(&request)?;
+            if payload.len() <= maximum_bytes {
+                return Ok(context);
+            }
+            if !context.drop_lowest_source() {
+                return Err(chat_request_too_large(payload.len(), maximum_bytes));
+            }
+        }
+    }
+
+    pub async fn stream_chat(&self, messages: Vec<ChatMessage>, tx: Sender<SseEvent>) {
+        self.stream_chat_with_context(
+            SYSTEM_PROMPT.to_string(),
+            ApiChatContent::Parts(Vec::new()),
+            messages,
+            tx,
+        )
+        .await;
+    }
+
+    pub async fn stream_chat_with_context(
         &self,
         system_prompt: String,
+        context: ApiChatContent,
         messages: Vec<ChatMessage>,
         tx: Sender<SseEvent>,
     ) {
         if let Err(error) = self
-            .try_stream_chat_with_system(system_prompt, messages, tx.clone())
+            .try_stream_chat_with_context(system_prompt, context, messages, tx.clone())
             .await
         {
+            tracing::error!(
+                stage = "chat_stream",
+                error_kind = error.safe_kind(),
+                http_status = ?error.status().map(|status| status.as_u16()),
+                "Gemma 4 chat stream failed"
+            );
             let _ = tx
                 .send(SseEvent::Error {
-                    message: error.to_string(),
+                    message: error.chat_client_message(),
                 })
                 .await;
         }
     }
 
-    pub async fn try_stream_chat_with_system(
+    pub async fn try_stream_chat_with_context(
         &self,
         system_prompt: String,
+        context: ApiChatContent,
         messages: Vec<ChatMessage>,
         tx: Sender<SseEvent>,
     ) -> CloudModelResult<()> {
-        let request = self.chat_request(system_prompt, messages, true, 4096, None);
-        let response = self
-            .send_json(ModelOperation::Chat, &self.chat_endpoint, &request)
-            .await?;
+        let request =
+            self.chat_request_with_context(system_prompt, context, messages, true, 4096, None);
+        let response = self.send_chat_request(&request).await?;
 
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
@@ -806,51 +921,23 @@ impl CloudModelClient {
 
             while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
                 let line = buffer.drain(..=newline).collect::<Vec<_>>();
-                let line = String::from_utf8_lossy(&line);
-                let line = line.trim_end_matches(['\r', '\n']);
-                let Some(payload) = line
-                    .strip_prefix("data:")
-                    .map(str::trim_start)
-                    .filter(|payload| !payload.is_empty())
-                else {
-                    continue;
-                };
-
-                if payload == "[DONE]" {
-                    if !send_filter_remainder(&tx, &mut filter).await {
-                        return Ok(());
-                    }
-                    let _ = tx.send(SseEvent::Done).await;
-                    return Ok(());
-                }
-
-                let Ok(chunk) = serde_json::from_str::<ChatStreamChunk>(payload) else {
-                    continue;
-                };
-                let Some(content) = chunk
-                    .choices
-                    .first()
-                    .and_then(|choice| choice.delta.content.as_deref())
-                else {
-                    continue;
-                };
-                let visible = filter.feed(content);
-                if !visible.is_empty()
-                    && tx
-                        .send(SseEvent::TextDelta { text: visible })
-                        .await
-                        .is_err()
-                {
-                    return Ok(());
+                match forward_chat_sse_line(&line, &tx, &mut filter).await? {
+                    ChatSseProgress::Continue => {}
+                    ChatSseProgress::Complete | ChatSseProgress::ReceiverClosed => return Ok(()),
                 }
             }
         }
 
-        if !send_filter_remainder(&tx, &mut filter).await {
-            return Ok(());
+        if !buffer.is_empty() {
+            match forward_chat_sse_line(&buffer, &tx, &mut filter).await? {
+                ChatSseProgress::Complete | ChatSseProgress::ReceiverClosed => return Ok(()),
+                ChatSseProgress::Continue => {}
+            }
         }
-        let _ = tx.send(SseEvent::Done).await;
-        Ok(())
+        Err(CloudModelError::InvalidResponse {
+            operation: ModelOperation::Chat,
+            message: "stream ended before the [DONE] marker".to_string(),
+        })
     }
 
     pub async fn chat_once(
@@ -868,9 +955,7 @@ impl CloudModelClient {
             2048,
             Some(0.2),
         );
-        let response = self
-            .send_json(ModelOperation::Chat, &self.chat_endpoint, &request)
-            .await?;
+        let response = self.send_chat_request(&request).await?;
         self.chat_content(response).await
     }
 
@@ -1023,10 +1108,58 @@ impl CloudModelClient {
         max_tokens: u32,
         temperature: Option<f32>,
     ) -> ChatCompletionRequest {
+        self.chat_request_with_optional_context(
+            system_prompt,
+            None,
+            messages,
+            stream,
+            max_tokens,
+            temperature,
+        )
+    }
+
+    fn chat_request_with_context(
+        &self,
+        system_prompt: String,
+        context: ApiChatContent,
+        messages: Vec<ChatMessage>,
+        stream: bool,
+        max_tokens: u32,
+        temperature: Option<f32>,
+    ) -> ChatCompletionRequest {
+        let context = match context {
+            ApiChatContent::Parts(parts) if parts.is_empty() => None,
+            context => Some(context),
+        };
+        self.chat_request_with_optional_context(
+            system_prompt,
+            context,
+            messages,
+            stream,
+            max_tokens,
+            temperature,
+        )
+    }
+
+    fn chat_request_with_optional_context(
+        &self,
+        system_prompt: String,
+        context: Option<ApiChatContent>,
+        messages: Vec<ChatMessage>,
+        stream: bool,
+        max_tokens: u32,
+        temperature: Option<f32>,
+    ) -> ChatCompletionRequest {
         let mut api_messages = vec![ApiChatMessage {
             role: "system".to_string(),
             content: ApiChatContent::Text(system_prompt),
         }];
+        if let Some(context) = context {
+            api_messages.push(ApiChatMessage {
+                role: "user".to_string(),
+                content: context,
+            });
+        }
         api_messages.extend(messages.into_iter().map(|message| ApiChatMessage {
             role: if message.role == "assistant" {
                 "assistant".to_string()
@@ -1042,6 +1175,28 @@ impl CloudModelClient {
             stream,
             max_tokens,
             temperature,
+        }
+    }
+
+    async fn send_chat_request(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> CloudModelResult<Response> {
+        let payload = serialize_chat_request_with_limit(request, MAX_CHAT_REQUEST_BYTES)?;
+        let response = self
+            .http
+            .post(self.chat_endpoint.clone())
+            .bearer_auth(&self.api_key)
+            .header(CONTENT_TYPE, "application/json")
+            .body(payload)
+            .send()
+            .await
+            .map_err(|error| self.request_error(ModelOperation::Chat, error))?;
+
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            Err(self.http_error(ModelOperation::Chat, response).await)
         }
     }
 
@@ -1109,13 +1264,7 @@ impl CloudModelClient {
             match result {
                 Ok(response) => return Ok(response),
                 Err(error) if error.is_retryable() && attempt < self.rerank_retry.max_attempts => {
-                    let error_kind = match &error {
-                        CloudModelError::Http { .. } => "http",
-                        CloudModelError::Timeout { .. } => "timeout",
-                        CloudModelError::Transport { .. } => "transport",
-                        CloudModelError::InvalidRequest { .. } => "invalid_request",
-                        CloudModelError::InvalidResponse { .. } => "invalid_response",
-                    };
+                    let error_kind = error.safe_kind();
                     tracing::warn!(
                         stage = "rerank_request",
                         attempt,
@@ -1241,6 +1390,33 @@ impl CloudModelClient {
         auth_header
             .replace_all(&without_base64, "[REDACTED-HEADER]")
             .to_string()
+    }
+}
+
+fn serialize_chat_request_with_limit(
+    request: &ChatCompletionRequest,
+    maximum_bytes: usize,
+) -> CloudModelResult<Vec<u8>> {
+    let payload = serialize_chat_request(request)?;
+    if payload.len() > maximum_bytes {
+        return Err(chat_request_too_large(payload.len(), maximum_bytes));
+    }
+    Ok(payload)
+}
+
+fn serialize_chat_request(request: &ChatCompletionRequest) -> CloudModelResult<Vec<u8>> {
+    serde_json::to_vec(request).map_err(|_| CloudModelError::InvalidRequest {
+        operation: ModelOperation::Chat,
+        message: "chat request could not be serialized".to_string(),
+    })
+}
+
+fn chat_request_too_large(actual_bytes: usize, maximum_bytes: usize) -> CloudModelError {
+    CloudModelError::InvalidRequest {
+        operation: ModelOperation::Chat,
+        message: format!(
+            "serialized request is {actual_bytes} bytes; maximum is {maximum_bytes} bytes"
+        ),
     }
 }
 
@@ -1376,6 +1552,72 @@ fn retryable_status(status: StatusCode) -> bool {
     ) || status.is_server_error()
 }
 
+enum ChatSseProgress {
+    Continue,
+    Complete,
+    ReceiverClosed,
+}
+
+async fn forward_chat_sse_line(
+    line: &[u8],
+    tx: &Sender<SseEvent>,
+    filter: &mut ThinkFilter,
+) -> CloudModelResult<ChatSseProgress> {
+    let line = std::str::from_utf8(line)
+        .map_err(|_| CloudModelError::InvalidResponse {
+            operation: ModelOperation::Chat,
+            message: "SSE stream contained a non-UTF-8 line".to_string(),
+        })?
+        .trim_end_matches(['\r', '\n']);
+    let Some(payload) = line
+        .strip_prefix("data:")
+        .map(str::trim_start)
+        .filter(|payload| !payload.is_empty())
+    else {
+        return Ok(ChatSseProgress::Continue);
+    };
+
+    if payload == "[DONE]" {
+        if !send_filter_remainder(tx, filter).await {
+            return Ok(ChatSseProgress::ReceiverClosed);
+        }
+        return Ok(if tx.send(SseEvent::Done).await.is_ok() {
+            ChatSseProgress::Complete
+        } else {
+            ChatSseProgress::ReceiverClosed
+        });
+    }
+
+    let chunk = serde_json::from_str::<ChatStreamChunk>(payload).map_err(|error| {
+        CloudModelError::InvalidResponse {
+            operation: ModelOperation::Chat,
+            message: format!(
+                "SSE data was not a valid chat chunk at line {}, column {}",
+                error.line(),
+                error.column()
+            ),
+        }
+    })?;
+    let Some(content) = chunk
+        .choices
+        .first()
+        .and_then(|choice| choice.delta.content.as_deref())
+    else {
+        return Ok(ChatSseProgress::Continue);
+    };
+    let visible = filter.feed(content);
+    if visible.is_empty() {
+        return Ok(ChatSseProgress::Continue);
+    }
+    Ok(
+        if tx.send(SseEvent::TextDelta { text: visible }).await.is_ok() {
+            ChatSseProgress::Continue
+        } else {
+            ChatSseProgress::ReceiverClosed
+        },
+    )
+}
+
 async fn send_filter_remainder(tx: &Sender<SseEvent>, filter: &mut ThinkFilter) -> bool {
     match filter.flush() {
         Some(text) if !text.is_empty() => tx.send(SseEvent::TextDelta { text }).await.is_ok(),
@@ -1464,17 +1706,20 @@ fn partial_suffix_len(value: &str, tag: &str) -> usize {
 mod tests {
     use super::*;
     use axum::Router;
-    use axum::body::to_bytes;
+    use axum::body::{Body, Bytes, to_bytes};
     use axum::extract::{Request, State};
     use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
     use axum::response::{IntoResponse, Response as AxumResponse};
     use axum::routing::post;
     use std::collections::HashMap;
+    use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Copy)]
     enum MockMode {
         Success,
+        SplitSse,
+        ChatStatus(StatusCode),
         EchoSecretError,
         Slow,
         RetryOnce(StatusCode),
@@ -1544,7 +1789,18 @@ mod tests {
             MockMode::PermanentBadRequest => {
                 return (StatusCode::BAD_REQUEST, "invalid request").into_response();
             }
+            MockMode::ChatStatus(status)
+                if matches!(path.as_str(), "/chat/completions" | "/capabilities/chat") =>
+            {
+                return (
+                    status,
+                    "provider-secret-body data:image/jpeg;base64,PRIVATEPAYLOAD /private/path",
+                )
+                    .into_response();
+            }
             MockMode::Success
+            | MockMode::SplitSse
+            | MockMode::ChatStatus(_)
             | MockMode::RetryOnce(_)
             | MockMode::WrongDimensions
             | MockMode::MalformedRerank
@@ -1554,6 +1810,25 @@ mod tests {
         }
 
         match path.as_str() {
+            "/chat/completions" | "/capabilities/chat"
+                if body.get("stream") == Some(&serde_json::Value::Bool(true))
+                    && matches!(state.mode, MockMode::SplitSse) =>
+            {
+                let chunks = [
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"<thi",
+                    "nk>hidden</think>跨\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"con",
+                    "tent\":\"區塊 [S1]\"}}]}\n\ndata: [DO",
+                    "NE]\n\n",
+                ]
+                .into_iter()
+                .map(|chunk| Ok::<_, Infallible>(Bytes::from_static(chunk.as_bytes())));
+                (
+                    StatusCode::OK,
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(futures::stream::iter(chunks)),
+                )
+                    .into_response()
+            }
             "/chat/completions" | "/capabilities/chat"
                 if body.get("stream") == Some(&serde_json::Value::Bool(true)) =>
             {
@@ -1721,6 +1996,25 @@ mod tests {
         ])
         .expect_err("Gemma 14 must not be mistaken for Gemma 4");
         assert!(misleading_version.to_string().contains("Gemma 4"));
+
+        for false_positive in [
+            "vendor/notgemma4",
+            "vendor/gemma4fallback",
+            "vendor/gemma-4fallback",
+            "vendor/gemma-4b",
+        ] {
+            let error = config_from(&[
+                ("NVIDIA_API_KEY", "secret"),
+                ("GEMMA_4_MODEL_ID", false_positive),
+            ])
+            .expect_err("Gemma 4 marker must have model-token boundaries");
+            assert!(error.to_string().contains("Gemma 4"));
+        }
+
+        for valid in ["vendor/gemma4-production", "vendor/google.gemma_4.preview"] {
+            config_from(&[("NVIDIA_API_KEY", "secret"), ("GEMMA_4_MODEL_ID", valid)])
+                .expect("boundary-aware Gemma 4 model id");
+        }
     }
 
     #[test]
@@ -1897,6 +2191,11 @@ mod tests {
             .expect("chat request");
         assert_eq!(chat.body["model"], "hosted/google-gemma-4-test");
         assert_eq!(chat.body["stream"], true);
+        let chat_messages = chat.body["messages"].as_array().expect("chat messages");
+        assert_eq!(chat_messages.len(), 2);
+        assert_eq!(chat_messages[0]["role"], "system");
+        assert_eq!(chat_messages[1]["role"], "user");
+        assert_eq!(chat_messages[1]["content"], "問題");
 
         let embeds = requests
             .iter()
@@ -1973,6 +2272,397 @@ mod tests {
         assert!(!rerank_debug.contains("private query"));
         assert!(!rerank_debug.contains("base64"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemma_multimodal_request_places_three_to_six_page_context_before_history() {
+        for source_count in [3_usize, 6] {
+            let (base_url, state, server) = spawn_mock(MockMode::Success).await;
+            let client = test_client(&base_url, "test-api-key", Duration::from_secs(1));
+            let mut parts = Vec::new();
+            for page in 1..=source_count {
+                parts.push(ApiChatContentPart::Text {
+                    text: format!(
+                        "[S{page}] source_id: S{page}\nfilename: manual.pdf\npage: {page}"
+                    ),
+                });
+                parts.push(ApiChatContentPart::ImageUrl {
+                    image_url: ApiImageUrl {
+                        url: format!("data:image/jpeg;base64,PAGE{page}"),
+                    },
+                });
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            client
+                .stream_chat_with_context(
+                    "只依來源回答".to_string(),
+                    ApiChatContent::Parts(parts),
+                    vec![
+                        ChatMessage {
+                            role: "user".to_string(),
+                            content: "歷史問題".to_string(),
+                        },
+                        ChatMessage {
+                            role: "assistant".to_string(),
+                            content: "歷史回答".to_string(),
+                        },
+                    ],
+                    tx,
+                )
+                .await;
+            assert!(rx.recv().await.is_some());
+
+            let requests = state.requests.lock().expect("request lock");
+            let chat = requests.last().expect("chat request");
+            assert_eq!(chat.body["model"], "hosted/google-gemma-4-test");
+            let messages = chat.body["messages"].as_array().expect("messages array");
+            assert_eq!(messages.len(), 4);
+            assert_eq!(messages[0]["role"], "system");
+            assert_eq!(messages[1]["role"], "user");
+            assert_eq!(messages[2]["content"], "歷史問題");
+            assert_eq!(messages[3]["role"], "assistant");
+            let context = messages[1]["content"]
+                .as_array()
+                .expect("multipart context");
+            assert_eq!(context.len(), source_count * 2);
+            for page in 1..=source_count {
+                let text = context[(page - 1) * 2]["text"]
+                    .as_str()
+                    .expect("source text block");
+                assert!(text.contains(&format!("source_id: S{page}")));
+                assert!(text.contains(&format!("page: {page}")));
+                assert!(
+                    context[(page - 1) * 2 + 1]["image_url"]["url"]
+                        .as_str()
+                        .is_some_and(|url| url.starts_with("data:image/jpeg;base64,"))
+                );
+            }
+            drop(requests);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn candidates_flow_to_matching_gemma_parts_and_structured_sources_without_inline_citation()
+     {
+        let fixture_root =
+            std::env::temp_dir().join(format!("km-rag-integration-{}", uuid::Uuid::new_v4()));
+        let files_root = fixture_root.join("files");
+        let page_document_id = uuid::Uuid::new_v4();
+        let page_dir = files_root.join(page_document_id.to_string()).join("pages");
+        std::fs::create_dir_all(&page_dir).expect("create integration page directory");
+        let page_path = page_dir.join("0005.png");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([20, 40, 60]))
+            .save(&page_path)
+            .expect("write valid integration PNG");
+        let text_document_id = uuid::Uuid::new_v4();
+        let candidates = vec![
+            crate::search::RetrievalCandidate {
+                unit_id: 41,
+                document_id: page_document_id,
+                filename: "shared-name.pdf".to_string(),
+                kind: "page".to_string(),
+                page_number: Some(5),
+                image_path: Some(page_path.to_string_lossy().into_owned()),
+                content: Some("page fact".to_string()),
+                dense_rank: Some(1),
+                dense_score: Some(0.9),
+                bm25_rank: None,
+                bm25_score: None,
+                rrf_score: 0.1,
+                rerank_score: Some(0.8),
+                rerank_rank: Some(1),
+            },
+            crate::search::RetrievalCandidate {
+                unit_id: 42,
+                document_id: text_document_id,
+                filename: "shared-name.pdf".to_string(),
+                kind: "text".to_string(),
+                page_number: None,
+                image_path: None,
+                content: Some("text fact".to_string()),
+                dense_rank: Some(2),
+                dense_score: Some(0.8),
+                bm25_rank: Some(1),
+                bm25_score: Some(2.0),
+                rrf_score: 0.09,
+                rerank_score: Some(0.7),
+                rerank_rank: Some(2),
+            },
+        ];
+        let context = crate::rag_context::build_rag_context(&candidates, &files_root)
+            .await
+            .expect("build real RAG context");
+        assert_eq!(context.sources.len(), 2);
+        assert_eq!(context.sources[0].source_id, "S1");
+        assert_eq!(context.sources[0].page_number, Some(5));
+        assert_eq!(context.sources[1].source_id, "S2");
+        assert_eq!(context.sources[1].page_number, None);
+        assert_ne!(
+            context.sources[0].document_id,
+            context.sources[1].document_id
+        );
+
+        let (base_url, state, server) = spawn_mock(MockMode::Success).await;
+        let client = test_client(&base_url, "test-api-key", Duration::from_secs(1));
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "question".to_string(),
+        }];
+        let context = client
+            .fit_rag_context_to_request(crate::rag_context::RAG_SYSTEM_PROMPT, context, &messages)
+            .expect("fit complete request");
+        let sources = context.sources.clone();
+        let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel(8);
+        client
+            .stream_chat_with_context(
+                crate::rag_context::RAG_SYSTEM_PROMPT.to_string(),
+                context.content,
+                messages,
+                inner_tx,
+            )
+            .await;
+
+        let (outer_tx, mut outer_rx) = tokio::sync::mpsc::channel(8);
+        let upstream = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = upstream.abort_handle();
+        assert!(crate::forward_rag_events(&mut inner_rx, &outer_tx, &sources, &abort_handle).await);
+        upstream.abort();
+        drop(outer_tx);
+        let mut answer = String::new();
+        let structured_sources = loop {
+            match outer_rx.recv().await {
+                Some(SseEvent::TextDelta { text }) => answer.push_str(&text),
+                Some(SseEvent::Sources { sources }) => break sources,
+                other => panic!("expected text deltas followed by sources, got {other:?}"),
+            }
+        };
+        assert_eq!(answer, "雲端回答");
+        assert!(!answer.contains("[S"));
+        assert_eq!(structured_sources.len(), 2);
+        assert_eq!(structured_sources[0].source_id, "S1");
+        assert_eq!(structured_sources[0].page_number, Some(5));
+        assert_eq!(structured_sources[1].source_id, "S2");
+        assert!(structured_sources[1].page_number.is_none());
+        assert!(matches!(outer_rx.recv().await, Some(SseEvent::Done)));
+
+        let requests = state.requests.lock().expect("request lock");
+        let context_parts = requests[0].body["messages"][1]["content"]
+            .as_array()
+            .expect("real multipart context");
+        assert!(
+            context_parts[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("source_id: S1") && text.contains("page: 5"))
+        );
+        assert!(
+            context_parts[1]["image_url"]["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:image/jpeg;base64,"))
+        );
+        assert!(
+            context_parts[2]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("source_id: S2") && !text.contains("page:"))
+        );
+        drop(requests);
+        server.abort();
+        std::fs::remove_dir_all(fixture_root).expect("remove integration fixture");
+    }
+
+    #[tokio::test]
+    async fn chat_sse_parser_handles_events_split_across_transport_chunks() {
+        let (base_url, _state, server) = spawn_mock(MockMode::SplitSse).await;
+        let client = test_client(&base_url, "test-api-key", Duration::from_secs(1));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        client
+            .stream_chat_with_context(
+                "system".to_string(),
+                ApiChatContent::Parts(Vec::new()),
+                vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "question".to_string(),
+                }],
+                tx,
+            )
+            .await;
+
+        let mut text = String::new();
+        let mut done_count = 0;
+        while let Some(event) = rx.recv().await {
+            match event {
+                SseEvent::TextDelta { text: delta } => text.push_str(&delta),
+                SseEvent::Done => done_count += 1,
+                SseEvent::Error { message } => panic!("unexpected error: {message}"),
+                SseEvent::Sources { .. } => panic!("provider must not emit sources"),
+            }
+        }
+        assert_eq!(text, "跨區塊 [S1]");
+        assert_eq!(done_count, 1);
+        server.abort();
+    }
+
+    #[test]
+    fn serialized_chat_request_hard_cap_counts_entire_multimodal_payload() {
+        let client = CloudModelClient::for_test();
+        let secret = "DO_NOT_LEAK_REQUEST_CONTENT";
+        let request = client.chat_request_with_context(
+            format!("system-{secret}"),
+            ApiChatContent::Parts(vec![
+                ApiChatContentPart::Text {
+                    text: format!("[S1] {secret}"),
+                },
+                ApiChatContentPart::ImageUrl {
+                    image_url: ApiImageUrl {
+                        url: format!("data:image/jpeg;base64,{secret}"),
+                    },
+                },
+            ]),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: format!("history-{secret}"),
+            }],
+            true,
+            4096,
+            None,
+        );
+        let request_debug = format!("{request:?}");
+        assert!(request_debug.contains("message_count"));
+        assert!(!request_debug.contains(secret));
+        assert!(!request_debug.contains("base64"));
+        let complete = serialize_chat_request_with_limit(&request, usize::MAX)
+            .expect("serialize complete request");
+        let error = serialize_chat_request_with_limit(&request, complete.len() - 1)
+            .expect_err("one-byte-short cap must reject the complete request");
+        assert!(matches!(
+            error,
+            CloudModelError::InvalidRequest {
+                operation: ModelOperation::Chat,
+                ..
+            }
+        ));
+        assert!(!error.chat_client_message().contains(secret));
+
+        let oversized = client.chat_request(
+            "x".repeat(MAX_CHAT_REQUEST_BYTES),
+            Vec::new(),
+            true,
+            4096,
+            None,
+        );
+        assert!(matches!(
+            serialize_chat_request_with_limit(&oversized, MAX_CHAT_REQUEST_BYTES),
+            Err(CloudModelError::InvalidRequest {
+                operation: ModelOperation::Chat,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn complete_request_budget_evicts_lowest_source_before_rejecting_rank_one() {
+        let client = CloudModelClient::for_test();
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: format!("history-overhead-{}", "h".repeat(300)),
+        }];
+        let first_part = ApiChatContentPart::Text {
+            text: format!("[S1] {}", "a".repeat(400)),
+        };
+        let second_part = ApiChatContentPart::Text {
+            text: format!("[S2] {}", "b".repeat(400)),
+        };
+        let source = |index: u128| crate::rag_context::SourceRef {
+            source_id: format!("S{index}"),
+            document_id: uuid::Uuid::from_u128(index),
+            unit_id: index as i64,
+            filename: format!("source-{index}.md"),
+            page_number: None,
+            kind: "text".to_string(),
+        };
+
+        let one_source_request = client.chat_request_with_context(
+            "system".to_string(),
+            ApiChatContent::Parts(vec![first_part.clone()]),
+            messages.clone(),
+            true,
+            4096,
+            None,
+        );
+        let one_source_bytes =
+            serialize_chat_request(&one_source_request).expect("measure one-source request");
+        let context = crate::rag_context::RagContext {
+            content: ApiChatContent::Parts(vec![first_part, second_part]),
+            sources: vec![source(1), source(2)],
+        };
+        let fitted = client
+            .fit_rag_context_to_request_with_limit(
+                "system",
+                context,
+                &messages,
+                one_source_bytes.len(),
+            )
+            .expect("lowest source should be evicted");
+        assert_eq!(fitted.sources.len(), 1);
+        assert_eq!(fitted.sources[0].source_id, "S1");
+        let ApiChatContent::Parts(parts) = &fitted.content else {
+            panic!("fitted context must remain multipart");
+        };
+        assert_eq!(parts.len(), 1);
+
+        let error = client
+            .fit_rag_context_to_request_with_limit(
+                "system",
+                fitted,
+                &messages,
+                one_source_bytes.len() - 1,
+            )
+            .expect_err("rank one must not be silently removed");
+        assert!(matches!(
+            error,
+            CloudModelError::InvalidRequest {
+                operation: ModelOperation::Chat,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_4xx_and_5xx_emit_one_safe_error_without_done() {
+        for status in [StatusCode::BAD_REQUEST, StatusCode::INTERNAL_SERVER_ERROR] {
+            let (base_url, state, server) = spawn_mock(MockMode::ChatStatus(status)).await;
+            let client = test_client(&base_url, "never-print-api-key", Duration::from_secs(1));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            client
+                .stream_chat_with_context(
+                    "system".to_string(),
+                    ApiChatContent::Parts(vec![ApiChatContentPart::ImageUrl {
+                        image_url: ApiImageUrl {
+                            url: "data:image/jpeg;base64,PRIVATEPAYLOAD".to_string(),
+                        },
+                    }]),
+                    Vec::new(),
+                    tx,
+                )
+                .await;
+
+            let message = match rx.recv().await {
+                Some(SseEvent::Error { message }) => message,
+                other => panic!("expected one error, got {other:?}"),
+            };
+            for forbidden in [
+                "provider-secret-body",
+                "never-print-api-key",
+                "PRIVATEPAYLOAD",
+                "/private/path",
+            ] {
+                assert!(!message.contains(forbidden));
+            }
+            assert!(message.contains("chat_model_http"));
+            assert!(rx.recv().await.is_none());
+            assert_eq!(state.requests.lock().expect("request lock").len(), 1);
+            server.abort();
+        }
     }
 
     #[tokio::test]
