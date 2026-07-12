@@ -43,6 +43,7 @@ pub struct SourceRef {
     pub source_id: String,
     pub document_id: Uuid,
     pub unit_id: i64,
+    pub unit_index: i32,
     pub filename: String,
     // This must remain present as JSON null for text sources.
     pub page_number: Option<i32>,
@@ -221,6 +222,7 @@ enum PreparedSourceKind {
 #[derive(Debug)]
 struct PreparedSource {
     unit_id: i64,
+    unit_index: i32,
     document_id: Uuid,
     filename: String,
     kind: PreparedSourceKind,
@@ -426,6 +428,7 @@ async fn prepare_source(
 
     Ok(PreparedSource {
         unit_id: candidate.unit_id,
+        unit_index: candidate.unit_index,
         document_id: candidate.document_id,
         filename: candidate.filename.clone(),
         kind,
@@ -592,6 +595,7 @@ page_image: 緊接在此文字區塊之後",
                     source_id,
                     document_id: source.document_id,
                     unit_id: source.unit_id,
+                    unit_index: source.unit_index,
                     filename: source.filename.clone(),
                     page_number: Some(*page_number),
                     kind: "page".to_string(),
@@ -616,6 +620,7 @@ content:\n\
                     source_id,
                     document_id: source.document_id,
                     unit_id: source.unit_id,
+                    unit_index: source.unit_index,
                     filename: source.filename.clone(),
                     page_number: None,
                     kind: "text".to_string(),
@@ -691,6 +696,7 @@ mod tests {
     ) -> RetrievalCandidate {
         RetrievalCandidate {
             unit_id,
+            unit_index: unit_id as i32 - 1,
             document_id,
             filename: filename.to_string(),
             kind: kind.to_string(),
@@ -852,6 +858,7 @@ mod tests {
         let source = serde_json::to_value(&context.sources[0]).expect("serialize source");
         assert_eq!(source["sourceId"], "S1");
         assert_eq!(source["unitId"], 1);
+        assert_eq!(source["unitIndex"], 0);
         assert!(source.get("pageNumber").is_some());
         assert!(source["pageNumber"].is_null());
 
@@ -996,6 +1003,7 @@ mod tests {
         let mut context = build_context_prefix(&[
             PreparedSource {
                 unit_id: 1,
+                unit_index: 0,
                 document_id: Uuid::new_v4(),
                 filename: "first.md".to_string(),
                 kind: PreparedSourceKind::Text {
@@ -1004,6 +1012,7 @@ mod tests {
             },
             PreparedSource {
                 unit_id: 2,
+                unit_index: 1,
                 document_id: Uuid::new_v4(),
                 filename: "second.md".to_string(),
                 kind: PreparedSourceKind::Text {

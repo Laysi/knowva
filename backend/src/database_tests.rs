@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use pgvector::HalfVector;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower::ServiceExt;
@@ -18,6 +18,10 @@ use uuid::Uuid;
 struct EmbeddingMockState {
     requests: Arc<Mutex<Vec<Value>>>,
     fail: Arc<AtomicBool>,
+    summary_requests: Arc<Mutex<Vec<Value>>>,
+    summary_status: Arc<AtomicU16>,
+    summary_delay_ms: Arc<AtomicU64>,
+    summary_response: Arc<Mutex<String>>,
 }
 
 async fn embedding_mock(
@@ -42,8 +46,48 @@ async fn embedding_mock(
     .into_response()
 }
 
+async fn summary_mock(
+    State(state): State<EmbeddingMockState>,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .summary_requests
+        .lock()
+        .expect("summary request lock")
+        .push(body);
+    let delay_ms = state.summary_delay_ms.load(Ordering::SeqCst);
+    if delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+    let status = StatusCode::from_u16(state.summary_status.load(Ordering::SeqCst))
+        .expect("valid summary mock status");
+    if !status.is_success() {
+        return (status, "provider-secret-summary-error").into_response();
+    }
+    let content = state
+        .summary_response
+        .lock()
+        .expect("summary response lock")
+        .clone();
+    Json(serde_json::json!({
+        "choices": [{ "message": { "content": content } }]
+    }))
+    .into_response()
+}
+
 async fn spawn_embedding_mock(
     fail: bool,
+) -> (
+    CloudModelClient,
+    EmbeddingMockState,
+    tokio::task::JoinHandle<()>,
+) {
+    spawn_embedding_mock_with_timeout(fail, Duration::from_secs(1)).await
+}
+
+async fn spawn_embedding_mock_with_timeout(
+    fail: bool,
+    timeout: Duration,
 ) -> (
     CloudModelClient,
     EmbeddingMockState,
@@ -52,9 +96,16 @@ async fn spawn_embedding_mock(
     let state = EmbeddingMockState {
         requests: Arc::new(Mutex::new(Vec::new())),
         fail: Arc::new(AtomicBool::new(fail)),
+        summary_requests: Arc::new(Mutex::new(Vec::new())),
+        summary_status: Arc::new(AtomicU16::new(StatusCode::OK.as_u16())),
+        summary_delay_ms: Arc::new(AtomicU64::new(0)),
+        summary_response: Arc::new(Mutex::new(
+            r#"{"summary":"測試文件摘要","tags":["測試","文件","知識庫"]}"#.to_string(),
+        )),
     };
     let app = Router::new()
         .route("/embeddings", post(embedding_mock))
+        .route("/chat/completions", post(summary_mock))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -65,8 +116,9 @@ async fn spawn_embedding_mock(
             .await
             .expect("serve embedding mock");
     });
-    let endpoint = format!("http://{address}/embeddings");
-    let client = CloudModelClient::for_test_embed_endpoint(&endpoint, Duration::from_secs(1));
+    let embed_endpoint = format!("http://{address}/embeddings");
+    let chat_endpoint = format!("http://{address}/chat/completions");
+    let client = CloudModelClient::for_test_endpoints(&chat_endpoint, &embed_endpoint, timeout);
     (client, state, handle)
 }
 
@@ -956,8 +1008,9 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
 
     sqlx::query(
         "INSERT INTO documents \
-         (id, filename, storage_path, mime_type, status, artifact_status) \
-         VALUES ($1, 'api.pdf', $2, 'application/pdf', 'processing', 'ready')",
+         (id, filename, storage_path, mime_type, status, artifact_status, error) \
+         VALUES ($1, 'api.pdf', $2, 'application/pdf', 'processing', 'ready', \
+                 'provider-secret Authorization: Bearer should-never-leak')",
     )
     .bind(document_id)
     .bind(storage_path.to_string_lossy().as_ref())
@@ -1018,10 +1071,17 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
     let document = &documents.as_array().unwrap()[0];
     assert_eq!(document["id"], document_id.to_string());
     assert_eq!(document["status"], "processing");
+    assert_eq!(document["processingStage"], "indexing");
+    assert!(document["processingError"].is_null());
+    assert!(document["error"].is_null());
     assert_eq!(document["artifact_status"], "ready");
+    assert_eq!(document["pageCount"], 1);
+    assert_eq!(document["unitCount"], 2);
     assert_eq!(document["page_count"], 1);
     assert_eq!(document["unit_count"], 2);
     assert_eq!(document["chunk_count"], 2);
+    assert_eq!(document["createdAt"], document["created_at"]);
+    assert!(!String::from_utf8_lossy(&body).contains("provider-secret"));
 
     let processing_guard = state.document_locks.lock(document_id).await;
     let request = Request::builder()
@@ -1262,6 +1322,153 @@ async fn embedding_failure_keeps_artifacts_ready_but_document_not_ready_and_retr
 
     server.abort();
     tokio::fs::remove_dir_all(files_dir).await?;
+    Ok(())
+}
+
+#[sqlx::test]
+async fn summary_success_and_permanent_failures_publish_ready_without_reembedding(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    async fn process_text_fixture(
+        pool: &PgPool,
+        state: Arc<AppState>,
+        root: &std::path::Path,
+        filename: &str,
+    ) -> anyhow::Result<Uuid> {
+        let document_id = Uuid::new_v4();
+        let document_dir = root.join(document_id.to_string());
+        tokio::fs::create_dir_all(&document_dir).await?;
+        let storage_path = document_dir.join("original.md");
+        tokio::fs::write(
+            &storage_path,
+            "# 測試文件\n\n這是供摘要與索引測試使用的繁體中文內容。",
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO documents \
+             (id, filename, storage_path, mime_type, status, artifact_status) \
+             VALUES ($1, $2, $3, 'text/markdown', 'processing', 'pending')",
+        )
+        .bind(document_id)
+        .bind(filename)
+        .bind(storage_path.to_string_lossy().as_ref())
+        .execute(pool)
+        .await?;
+        crate::ingest::process_document(
+            state,
+            document_id,
+            storage_path,
+            crate::page_artifacts::SourceKind::Text,
+        )
+        .await;
+        Ok(document_id)
+    }
+
+    async fn metadata_row(
+        pool: &PgPool,
+        document_id: Uuid,
+    ) -> anyhow::Result<(
+        String,
+        String,
+        Option<String>,
+        Option<Vec<String>>,
+        Option<String>,
+        i64,
+    )> {
+        Ok(sqlx::query_as(
+            "SELECT d.status, d.artifact_status, d.summary, d.tags, d.error, \
+                    (SELECT count(*) FROM document_units u WHERE u.document_id = d.id) \
+             FROM documents d WHERE d.id = $1",
+        )
+        .bind(document_id)
+        .fetch_one(pool)
+        .await?)
+    }
+
+    let root = std::env::temp_dir().join(format!("km-summary-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&root).await?;
+    let (models, mock, server) =
+        spawn_embedding_mock_with_timeout(false, Duration::from_millis(20)).await;
+    let state = Arc::new(AppState {
+        pool: pool.clone(),
+        models,
+        files_dir: root.to_string_lossy().into_owned(),
+        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
+        document_locks: crate::ingest::DocumentLocks::default(),
+    });
+
+    let success = process_text_fixture(&pool, state.clone(), &root, "success.md").await?;
+    let success_row = metadata_row(&pool, success).await?;
+    assert_eq!(success_row.0, "ready");
+    assert_eq!(success_row.1, "ready");
+    assert_eq!(success_row.2.as_deref(), Some("測試文件摘要"));
+    assert_eq!(
+        success_row.3,
+        Some(vec![
+            "測試".to_string(),
+            "文件".to_string(),
+            "知識庫".to_string()
+        ])
+    );
+    assert!(success_row.4.is_none());
+    assert_eq!(success_row.5, 1);
+
+    mock.summary_status
+        .store(StatusCode::TOO_MANY_REQUESTS.as_u16(), Ordering::SeqCst);
+    let rate_limited = process_text_fixture(&pool, state.clone(), &root, "rate-limit.md").await?;
+    let rate_limited_row = metadata_row(&pool, rate_limited).await?;
+    assert_eq!(
+        rate_limited_row,
+        (
+            "ready".to_string(),
+            "ready".to_string(),
+            None,
+            None,
+            None,
+            1
+        )
+    );
+
+    mock.summary_status
+        .store(StatusCode::OK.as_u16(), Ordering::SeqCst);
+    *mock.summary_response.lock().expect("summary response lock") = "not-json".to_string();
+    let malformed = process_text_fixture(&pool, state.clone(), &root, "malformed.md").await?;
+    let malformed_row = metadata_row(&pool, malformed).await?;
+    assert_eq!(malformed_row.0, "ready");
+    assert_eq!(malformed_row.1, "ready");
+    assert!(malformed_row.2.is_none());
+    assert!(malformed_row.3.is_none());
+    assert!(malformed_row.4.is_none());
+    assert_eq!(malformed_row.5, 1);
+
+    *mock.summary_response.lock().expect("summary response lock") =
+        r#"{"summary":"不應抵達","tags":["一","二","三"]}"#.to_string();
+    mock.summary_delay_ms.store(100, Ordering::SeqCst);
+    let timed_out = process_text_fixture(&pool, state, &root, "timeout.md").await?;
+    let timed_out_row = metadata_row(&pool, timed_out).await?;
+    assert_eq!(timed_out_row.0, "ready");
+    assert_eq!(timed_out_row.1, "ready");
+    assert!(timed_out_row.2.is_none());
+    assert!(timed_out_row.3.is_none());
+    assert!(timed_out_row.4.is_none());
+    assert_eq!(timed_out_row.5, 1);
+
+    assert_eq!(
+        mock.requests.lock().expect("embedding request lock").len(),
+        4,
+        "each document must be embedded exactly once"
+    );
+    assert_eq!(
+        mock.summary_requests
+            .lock()
+            .expect("summary request lock")
+            .len(),
+        6,
+        "success/malformed use one request; 429/timeout use two bounded attempts"
+    );
+
+    server.abort();
+    tokio::fs::remove_dir_all(root).await?;
     Ok(())
 }
 

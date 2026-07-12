@@ -1,25 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { UploadIcon, DocsIcon, TrashIcon } from "./Icons";
-
-type DocumentRow = {
-  id: string;
-  filename: string;
-  status: "processing" | "ready" | "failed";
-  artifact_status: "pending" | "processing" | "ready" | "failed";
-  summary: string | null;
-  tags: string[] | null;
-  error: string | null;
-  created_at: string;
-  page_count: number;
-  unit_count: number;
-  chunk_count: number;
-};
-
-const statusLabel: Record<DocumentRow["status"], string> = {
-  processing: "處理中",
-  ready: "完成",
-  failed: "失敗",
-};
+import {
+  documentFailureMessage,
+  documentRequestErrorMessage,
+  documentStatusLabel,
+  documentSummary,
+  documentVisualStatus,
+  shouldPollDocuments,
+  UPLOAD_ACCEPT,
+  validateUploadFile,
+} from "./DocumentModel";
+import type { DocumentRow } from "./DocumentModel";
 
 function fileExt(name: string): string {
   const dot = name.lastIndexOf(".");
@@ -27,10 +18,10 @@ function fileExt(name: string): string {
   return name.slice(dot + 1).toUpperCase().slice(0, 4);
 }
 
-function relativeTime(iso: string): string {
+function relativeTime(iso: string, now: number): string {
   const then = new Date(iso).getTime();
   if (Number.isNaN(then)) return "";
-  const diff = Math.max(0, Date.now() - then);
+  const diff = Math.max(0, now - then);
   const min = 60_000;
   const hr = 3_600_000;
   const day = 86_400_000;
@@ -46,57 +37,154 @@ function relativeTime(iso: string): string {
 }
 
 const StatusBadge = ({ doc }: { doc: DocumentRow }) => (
-  // artifact_status=ready means page conversion is complete, but #5 has not
-  // embedded the staged artifacts yet, so the document is not searchable.
-  <span className={`status status-${doc.status}`}>
+  <span className={`status status-${documentVisualStatus(doc)}`}>
     <span className="status-dot" />
-    {doc.status === "processing" && doc.artifact_status === "ready"
-      ? "前處理完成"
-      : statusLabel[doc.status]}
+    {documentStatusLabel(doc)}
   </span>
+);
+
+type DocumentListProps = {
+  documents: readonly DocumentRow[];
+  onDelete?: (doc: DocumentRow) => void;
+  now?: number;
+};
+
+export const DocumentList = ({
+  documents,
+  onDelete,
+  now = Date.now(),
+}: DocumentListProps) => (
+  <div className="doc-list">
+    {documents.map((doc) => {
+      const created = relativeTime(doc.createdAt, now);
+      return (
+        <div
+          key={doc.id}
+          className={"doc-row" + (doc.status === "failed" ? " is-failed" : "")}
+          tabIndex={doc.status === "failed" ? 0 : undefined}
+        >
+          <span className="doc-glyph">{fileExt(doc.filename)}</span>
+          <div className="doc-main">
+            <div className="doc-line1">
+              <span className="doc-name" title={doc.filename}>
+                {doc.filename}
+              </span>
+              <StatusBadge doc={doc} />
+            </div>
+            <p
+              className={
+                "doc-summary" + (doc.summary?.trim() ? "" : " is-empty")
+              }
+            >
+              {documentSummary(doc)}
+            </p>
+            <div className="doc-meta">
+              {(doc.tags ?? []).length > 0 && (
+                <span className="doc-tags">
+                  {(doc.tags ?? []).map((tag, index) => (
+                    <span key={`${tag}-${index}`} className="chip">
+                      {tag}
+                    </span>
+                  ))}
+                </span>
+              )}
+              <span className="doc-metrics">
+                <span className="doc-metric">頁數 {doc.pageCount}</span>
+                <span aria-hidden="true"> · </span>
+                <span className="doc-metric">檢索單元 {doc.unitCount}</span>
+                {created && (
+                  <>
+                    <span aria-hidden="true"> · </span>
+                    <span className="doc-metric">{created}</span>
+                  </>
+                )}
+              </span>
+            </div>
+            {doc.status === "failed" && (
+              <p className="doc-error">{documentFailureMessage(doc)}</p>
+            )}
+          </div>
+          <button
+            type="button"
+            className="doc-delete"
+            aria-label={`刪除 ${doc.filename}`}
+            title="刪除文件"
+            onClick={() => onDelete?.(doc)}
+          >
+            <TrashIcon />
+          </button>
+        </div>
+      );
+    })}
+  </div>
+);
+
+const DocumentListError = ({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry: () => void;
+}) => (
+  <div className="docs-request-error" role="alert">
+    <span>{message}</span>
+    <button type="button" onClick={onRetry}>
+      重新載入
+    </button>
+  </div>
 );
 
 export const Documents = () => {
   const [docs, setDocs] = useState<DocumentRow[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [listError, setListError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const pollRef = useRef<number | null>(null);
 
   const fetchDocs = useCallback(async () => {
-    const res = await fetch("/api/documents");
-    if (!res.ok) return;
-    const data: DocumentRow[] = await res.json();
-    setDocs(data);
-    return data;
+    try {
+      const res = await fetch("/api/documents");
+      if (!res.ok) {
+        setListError(documentRequestErrorMessage("list", res.status));
+        return undefined;
+      }
+      const data: unknown = await res.json();
+      if (!Array.isArray(data)) {
+        setListError(documentRequestErrorMessage("list", 502));
+        return undefined;
+      }
+      const documents = data as DocumentRow[];
+      setDocs(documents);
+      setListError(null);
+      return documents;
+    } catch {
+      setListError(documentRequestErrorMessage("list"));
+      return undefined;
+    }
   }, []);
 
   useEffect(() => {
-    fetchDocs().finally(() => setLoaded(true));
+    void fetchDocs().finally(() => setLoaded(true));
   }, [fetchDocs]);
 
+  const polling = shouldPollDocuments(docs);
   useEffect(() => {
-    const hasProcessing = docs.some(
-      (d) => d.status === "processing" && d.artifact_status !== "ready",
-    );
-    if (hasProcessing && pollRef.current === null) {
-      pollRef.current = window.setInterval(() => {
-        fetchDocs();
-      }, 3000);
-    } else if (!hasProcessing && pollRef.current !== null) {
-      window.clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-    return () => {
-      if (pollRef.current !== null) {
-        window.clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
-    };
-  }, [docs, fetchDocs]);
+    if (!polling) return undefined;
+    const pollId = window.setInterval(() => {
+      void fetchDocs();
+    }, 3000);
+    return () => window.clearInterval(pollId);
+  }, [fetchDocs, polling]);
 
   const uploadFile = async (file: File) => {
+    const validationError = validateUploadFile(file);
+    if (validationError) {
+      window.alert(validationError);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
+
     setUploading(true);
     try {
       const formData = new FormData();
@@ -106,36 +194,38 @@ export const Documents = () => {
         body: formData,
       });
       if (!res.ok) {
-        const detail = res.status >= 400 && res.status < 500
-          ? (await res.text()).trim()
-          : "";
-        alert(
-          detail
-            ? `上傳失敗：${detail}`
-            : `上傳失敗：伺服器暫時無法處理（${res.status}）`,
-        );
+        window.alert(documentRequestErrorMessage("upload", res.status));
         return;
       }
       if (fileInputRef.current) fileInputRef.current.value = "";
       await fetchDocs();
+    } catch {
+      window.alert(documentRequestErrorMessage("upload"));
     } finally {
       setUploading(false);
     }
   };
 
   const handleDelete = async (doc: DocumentRow) => {
-    if (!confirm(`確定要刪除「${doc.filename}」嗎?`)) return;
-    const res = await fetch(`/api/documents/${doc.id}`, { method: "DELETE" });
-    if (!res.ok && res.status !== 204) {
-      alert(`刪除失敗:${res.status}`);
-      return;
+    if (!window.confirm(`確定要刪除「${doc.filename}」嗎？`)) return;
+    try {
+      const res = await fetch(`/api/documents/${doc.id}`, { method: "DELETE" });
+      if (!res.ok) {
+        window.alert(documentRequestErrorMessage("delete", res.status));
+        if (res.status === 404) await fetchDocs();
+        return;
+      }
+      await fetchDocs();
+    } catch {
+      window.alert(documentRequestErrorMessage("delete"));
     }
-    await fetchDocs();
   };
 
-  const openPicker = () => fileInputRef.current?.click();
+  const openPicker = () => {
+    if (!uploading) fileInputRef.current?.click();
+  };
 
-  const readyCount = docs.filter((d) => d.status === "ready").length;
+  const readyCount = docs.filter((doc) => doc.status === "ready").length;
 
   return (
     <div className="documents">
@@ -147,41 +237,46 @@ export const Documents = () => {
             (uploading ? " uploading" : "")
           }
           role="button"
-          tabIndex={0}
+          tabIndex={uploading ? -1 : 0}
+          aria-disabled={uploading}
+          aria-busy={uploading}
           onClick={openPicker}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
+          onKeyDown={(event) => {
+            if (!uploading && (event.key === "Enter" || event.key === " ")) {
+              event.preventDefault();
               openPicker();
             }
           }}
-          onDragOver={(e) => {
-            e.preventDefault();
+          onDragOver={(event) => {
+            event.preventDefault();
             if (!uploading) setDragging(true);
           }}
           onDragLeave={() => setDragging(false)}
-          onDrop={(e) => {
-            e.preventDefault();
+          onDrop={(event) => {
+            event.preventDefault();
             setDragging(false);
-            const file = e.dataTransfer.files?.[0];
-            if (file && !uploading) uploadFile(file);
+            const file = event.dataTransfer.files?.[0];
+            if (file && !uploading) void uploadFile(file);
           }}
         >
           <input
             ref={fileInputRef}
             type="file"
-            accept=".pdf,.png,.jpg,.jpeg,.webp,.docx,.pptx,.xlsx,.md,.markdown,.txt"
+            accept={UPLOAD_ACCEPT}
+            disabled={uploading}
             hidden
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) uploadFile(file);
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void uploadFile(file);
             }}
           />
           <span className="dropzone-icon">
             {uploading ? <span className="spinner spinner-lg" /> : <UploadIcon />}
           </span>
           <div className="dropzone-text">
-            <strong>{uploading ? "上傳與解析中…" : "拖曳檔案到這裡,或點擊選擇檔案"}</strong>
+            <strong>
+              {uploading ? "上傳與解析中…" : "拖曳檔案到這裡，或點擊選擇檔案"}
+            </strong>
             <span>
               支援 PDF、DOCX、PPTX、XLSX、PNG/JPEG/WebP、TXT/MD（單檔 ≤ 50 MiB）
             </span>
@@ -203,80 +298,32 @@ export const Documents = () => {
             載入文件中…
           </div>
         ) : docs.length === 0 ? (
-          <div className="docs-empty">
-            <span className="docs-empty-icon">
-              <DocsIcon />
-            </span>
-            <h3>尚未建立任何文件</h3>
-            <p>
-              上傳手冊、規範、簡報或報表,系統會自動解析內容並建立可檢索的知識庫。
-            </p>
-          </div>
+          listError ? (
+            <DocumentListError
+              message={listError}
+              onRetry={() => void fetchDocs()}
+            />
+          ) : (
+            <div className="docs-empty">
+              <span className="docs-empty-icon">
+                <DocsIcon />
+              </span>
+              <h3>尚未建立任何文件</h3>
+              <p>
+                上傳手冊、規範、簡報或報表，系統會自動解析內容並建立可檢索的知識庫。
+              </p>
+            </div>
+          )
         ) : (
-          <div className="doc-list">
-            {docs.map((doc) => (
-              <div
-                key={doc.id}
-                className={"doc-row" + (doc.status === "failed" ? " is-failed" : "")}
-                tabIndex={doc.status === "failed" ? 0 : undefined}
-              >
-                <span className="doc-glyph">{fileExt(doc.filename)}</span>
-                <div className="doc-main">
-                  <div className="doc-line1">
-                    <span className="doc-name" title={doc.filename}>
-                      {doc.filename}
-                    </span>
-                    <StatusBadge doc={doc} />
-                  </div>
-                  <p
-                    className={
-                      "doc-summary" + (doc.summary ? "" : " is-empty")
-                    }
-                  >
-                    {doc.summary ??
-                      (doc.status === "processing"
-                        ? doc.artifact_status === "ready"
-                          ? "前處理完成，等待建立檢索索引…"
-                          : "正在建立可追蹤的頁面 artifact…"
-                        : doc.status === "failed"
-                          ? "處理失敗,無法產生摘要。"
-                          : "尚無摘要")}
-                  </p>
-                  <div className="doc-meta">
-                    {(doc.tags ?? []).length > 0 && (
-                      <span className="doc-tags">
-                        {(doc.tags ?? []).map((tag) => (
-                          <span key={tag} className="chip">
-                            {tag}
-                          </span>
-                        ))}
-                      </span>
-                    )}
-                    <span className="doc-metrics">
-                      {doc.page_count > 0
-                        ? `頁面 ${doc.page_count}`
-                        : `段落 ${doc.unit_count}`}
-                      {" · "}{relativeTime(doc.created_at)}
-                    </span>
-                  </div>
-                  {doc.status === "failed" && doc.error && (
-                    <p className="doc-error" title={doc.error}>
-                      {doc.error}
-                    </p>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  className="doc-delete"
-                  aria-label={`刪除 ${doc.filename}`}
-                  title="刪除文件"
-                  onClick={() => handleDelete(doc)}
-                >
-                  <TrashIcon />
-                </button>
-              </div>
-            ))}
-          </div>
+          <>
+            {listError && (
+              <DocumentListError
+                message={listError}
+                onRetry={() => void fetchDocs()}
+              />
+            )}
+            <DocumentList documents={docs} onDelete={handleDelete} />
+          </>
         )}
       </div>
     </div>

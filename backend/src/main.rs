@@ -1,4 +1,5 @@
 pub mod cloud_models;
+mod document_summary;
 mod embedding;
 mod ingest;
 mod page_artifacts;
@@ -126,26 +127,116 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
-struct DocumentRow {
+#[derive(Debug, sqlx::FromRow)]
+struct DocumentDbRow {
     id: uuid::Uuid,
     filename: String,
     status: String,
     artifact_status: String,
     summary: Option<String>,
     tags: Option<Vec<String>>,
-    error: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     page_count: i64,
     unit_count: i64,
-    // Kept during the MVP API transition for clients that still display chunk_count.
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentProcessingError {
+    code: &'static str,
+    message: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct DocumentResponse {
+    id: uuid::Uuid,
+    filename: String,
+    status: String,
+    #[serde(rename = "processingStage")]
+    processing_stage: &'static str,
+    #[serde(rename = "processingError")]
+    processing_error: Option<DocumentProcessingError>,
+    summary: Option<String>,
+    tags: Option<Vec<String>>,
+    #[serde(rename = "createdAt")]
+    canonical_created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(rename = "pageCount")]
+    canonical_page_count: i64,
+    #[serde(rename = "unitCount")]
+    canonical_unit_count: i64,
+    // Deprecated compatibility aliases retained for existing MVP clients.
+    artifact_status: String,
+    page_count: i64,
+    unit_count: i64,
     chunk_count: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+    // This compatibility field is a fixed safe message, never the raw DB diagnostic.
+    error: Option<&'static str>,
+}
+
+impl From<DocumentDbRow> for DocumentResponse {
+    fn from(row: DocumentDbRow) -> Self {
+        let processing_stage = document_processing_stage(&row.status, &row.artifact_status);
+        let processing_error = document_processing_error(&row.status, &row.artifact_status);
+        Self {
+            id: row.id,
+            filename: row.filename,
+            status: row.status,
+            processing_stage,
+            processing_error,
+            summary: row.summary,
+            tags: row.tags,
+            canonical_created_at: row.created_at,
+            canonical_page_count: row.page_count,
+            canonical_unit_count: row.unit_count,
+            artifact_status: row.artifact_status,
+            page_count: row.page_count,
+            unit_count: row.unit_count,
+            chunk_count: row.unit_count,
+            created_at: row.created_at,
+            error: processing_error.map(|error| error.message),
+        }
+    }
+}
+
+fn document_processing_stage(status: &str, artifact_status: &str) -> &'static str {
+    match (status, artifact_status) {
+        ("ready", _) => "ready",
+        ("failed", _) => "failed",
+        ("processing", "pending") => "queued",
+        ("processing", "ready") => "indexing",
+        ("processing", _) => "extracting",
+        _ => "failed",
+    }
+}
+
+fn document_processing_error(
+    status: &str,
+    artifact_status: &str,
+) -> Option<DocumentProcessingError> {
+    if status != "failed" {
+        return None;
+    }
+    Some(match artifact_status {
+        "failed" => DocumentProcessingError {
+            code: "artifact_processing_failed",
+            message: "文件解析失敗，請確認檔案格式後重試。",
+        },
+        "ready" => DocumentProcessingError {
+            code: "indexing_failed",
+            message: "文件索引建立失敗，請稍後重試。",
+        },
+        _ => DocumentProcessingError {
+            code: "document_processing_failed",
+            message: "文件處理失敗，請稍後重試。",
+        },
+    })
 }
 
 async fn list_documents(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<DocumentRow>>, (axum::http::StatusCode, String)> {
-    let rows = sqlx::query_as::<_, DocumentRow>(
+) -> Result<Json<Vec<DocumentResponse>>, (axum::http::StatusCode, String)> {
+    let rows = sqlx::query_as::<_, DocumentDbRow>(
         "WITH unit_counts AS ( \
            SELECT document_id, COUNT(*) AS unit_count, \
                   COUNT(*) FILTER (WHERE kind = 'page') AS page_count \
@@ -159,10 +250,9 @@ async fn list_documents(
            GROUP BY d.id \
          ) \
          SELECT d.id, d.filename, d.status, d.artifact_status, d.summary, d.tags, \
-                d.error, d.created_at, \
+                d.created_at, \
                 GREATEST(COALESCE(u.page_count, 0), COALESCE(a.page_count, 0)) AS page_count, \
-                GREATEST(COALESCE(u.unit_count, 0), COALESCE(a.unit_count, 0)) AS unit_count, \
-                GREATEST(COALESCE(u.unit_count, 0), COALESCE(a.unit_count, 0)) AS chunk_count \
+                GREATEST(COALESCE(u.unit_count, 0), COALESCE(a.unit_count, 0)) AS unit_count \
          FROM documents d \
          LEFT JOIN unit_counts u ON u.document_id = d.id \
          LEFT JOIN artifact_counts a ON a.document_id = d.id \
@@ -170,9 +260,18 @@ async fn list_documents(
     )
     .fetch_all(&state.pool)
     .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|error| {
+        tracing::error!(
+            stage = "document_list",
+            "document list query failed: {error}"
+        );
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "無法載入文件列表，請稍後再試。".to_string(),
+        )
+    })?;
 
-    Ok(Json(rows))
+    Ok(Json(rows.into_iter().map(DocumentResponse::from).collect()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,6 +473,43 @@ mod tests {
         tokio::spawn(std::future::pending())
     }
 
+    #[test]
+    fn document_api_maps_stages_and_only_serializes_safe_errors() {
+        for (status, artifact_status, expected) in [
+            ("processing", "pending", "queued"),
+            ("processing", "processing", "extracting"),
+            ("processing", "ready", "indexing"),
+            ("ready", "ready", "ready"),
+            ("failed", "failed", "failed"),
+        ] {
+            assert_eq!(document_processing_stage(status, artifact_status), expected);
+        }
+
+        let created_at = chrono::Utc::now();
+        let response = DocumentResponse::from(DocumentDbRow {
+            id: uuid::Uuid::new_v4(),
+            filename: "fixture.pdf".to_string(),
+            status: "failed".to_string(),
+            artifact_status: "ready".to_string(),
+            summary: None,
+            tags: None,
+            created_at,
+            page_count: 2,
+            unit_count: 3,
+        });
+        let json = serde_json::to_value(response).expect("serialize document response");
+        assert_eq!(json["processingStage"], "failed");
+        assert_eq!(json["processingError"]["code"], "indexing_failed");
+        assert_eq!(json["error"], json["processingError"]["message"]);
+        assert_eq!(json["pageCount"], 2);
+        assert_eq!(json["unitCount"], 3);
+        assert_eq!(json["page_count"], json["pageCount"]);
+        assert_eq!(json["unit_count"], json["unitCount"]);
+        assert_eq!(json["chunk_count"], json["unitCount"]);
+        assert_eq!(json["created_at"], json["createdAt"]);
+        assert!(!json.to_string().contains("provider-secret"));
+    }
+
     #[tokio::test]
     async fn rag_sse_keeps_text_sources_done_order() {
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel(4);
@@ -383,6 +519,7 @@ mod tests {
             source_id: "S1".to_string(),
             document_id,
             unit_id: 17,
+            unit_index: 0,
             filename: "source.pdf".to_string(),
             page_number: Some(1),
             kind: "page".to_string(),

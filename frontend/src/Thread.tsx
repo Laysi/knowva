@@ -4,6 +4,7 @@ import {
   MessagePrimitive,
   ErrorPrimitive,
 } from "@assistant-ui/react";
+import type { DataMessagePartProps } from "@assistant-ui/react";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -16,10 +17,42 @@ import {
   ArrowRightIcon,
 } from "./Icons";
 import type { ReactNode } from "react";
+import type { ChatSource } from "./BackendAdapter";
 
 const MarkdownText = () => (
   <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} className="aui-md" />
 );
+
+const sourceLabel = (source: ChatSource): string => {
+  if (source.kind === "page") {
+    return source.pageNumber !== null && Number.isFinite(source.pageNumber)
+      ? `${source.filename} · 第 ${source.pageNumber} 頁`
+      : `${source.filename} · 頁面來源`;
+  }
+
+  return typeof source.unitIndex === "number" &&
+    Number.isInteger(source.unitIndex) &&
+    source.unitIndex >= 0
+    ? `${source.filename} · 第 ${source.unitIndex + 1} 段`
+    : `${source.filename} · 文字來源`;
+};
+
+type SourceListProps = Pick<DataMessagePartProps<ChatSource[]>, "data">;
+
+export const SourceList = ({ data }: SourceListProps) => {
+  if (!Array.isArray(data) || data.length === 0) return null;
+
+  return (
+    <section className="source-list" aria-label="資料來源">
+      <h3>資料來源</h3>
+      <ol>
+        {data.map((source) => (
+          <li key={source.sourceId}>{sourceLabel(source)}</li>
+        ))}
+      </ol>
+    </section>
+  );
+};
 
 const SUGGESTIONS: { icon: ReactNode; text: string }[] = [
   { icon: <AlertIcon />, text: "知識庫目前涵蓋哪些主題?" },
@@ -69,7 +102,12 @@ const AssistantMessage = () => (
       <BrandMark />
     </span>
     <div className="msg-body">
-      <MessagePrimitive.Parts components={{ Text: MarkdownText }} />
+      <MessagePrimitive.Parts
+        components={{
+          Text: MarkdownText,
+          data: { by_name: { sources: SourceList } },
+        }}
+      />
       <MessagePrimitive.Error>
         <ErrorPrimitive.Root className="msg-error">
           <ErrorPrimitive.Message />
