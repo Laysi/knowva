@@ -23,7 +23,18 @@ pub const MIN_RERANK_TOP_N: usize = 3;
 pub const MAX_RERANK_TOP_N: usize = 8;
 pub const MAX_RERANK_BATCH_SIZE: usize = 512;
 
-const DEFAULT_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
+/// All cloud model traffic is routed through a Cloudflare AI Gateway. The two
+/// NVIDIA hosts are registered on the gateway as custom providers with the
+/// slugs `nvidia-build` (https://integrate.api.nvidia.com) and `nvidia-ai`
+/// (https://ai.api.nvidia.com); requests address them as `custom-<slug>`.
+/// Provider API keys are stored gateway-side via BYOK, so the backend never
+/// sends an upstream Authorization header; its only secret is the gateway
+/// Run token sent as `cf-aig-authorization`.
+const GATEWAY_NVIDIA_BUILD_SEGMENT: &str = "custom-nvidia-build";
+const GATEWAY_NVIDIA_AI_SEGMENT: &str = "custom-nvidia-ai";
+const GATEWAY_BASE_URL_HINT: &str =
+    "https://gateway.ai.cloudflare.com/v1/<account_id>/<gateway_id>";
+const GATEWAY_AUTHORIZATION_HEADER: &str = "cf-aig-authorization";
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_CHAT_REQUEST_BYTES: usize = 24 * 1024 * 1024;
 const MAX_EMBED_REQUEST_BYTES: usize = 36 * 1024 * 1024;
@@ -57,7 +68,7 @@ pub enum SseEvent {
 
 #[derive(Clone)]
 pub struct CloudModelConfig {
-    api_key: String,
+    gateway_token: String,
     chat_endpoint: Url,
     embed_endpoint: Url,
     rerank_endpoint: Url,
@@ -73,7 +84,7 @@ pub struct CloudModelConfig {
 impl fmt::Debug for CloudModelConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CloudModelConfig")
-            .field("api_key", &"[REDACTED]")
+            .field("gateway_token", &"[REDACTED]")
             .field("chat_endpoint", &self.chat_endpoint)
             .field("embed_endpoint", &self.embed_endpoint)
             .field("rerank_endpoint", &self.rerank_endpoint)
@@ -107,7 +118,10 @@ impl CloudModelConfig {
     fn from_lookup(
         mut get: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, CloudModelConfigError> {
-        let api_key = required_value(&mut get, "NVIDIA_API_KEY")?;
+        // Provider API keys live in the Cloudflare AI Gateway BYOK store; the
+        // gateway Run token is the backend's only secret and BYOK requires the
+        // gateway to be authenticated, so the token is mandatory.
+        let gateway_token = required_value(&mut get, "CF_AI_GATEWAY_TOKEN")?;
         let chat_model = required_value(&mut get, "GEMMA_4_MODEL_ID")?;
         if !is_gemma_4_model_id(&chat_model) {
             return Err(CloudModelConfigError(
@@ -127,16 +141,29 @@ impl CloudModelConfig {
             RERANK_MODEL_FAMILY,
         )?;
 
-        let base_url = optional_value(&mut get, "CLOUD_MODEL_BASE_URL")
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let base_url = base_url.trim_end_matches('/');
+        let gateway_base = optional_value(&mut get, "CF_AI_GATEWAY_BASE_URL")
+            .map(|value| value.trim_end_matches('/').to_string());
 
-        let chat_endpoint = optional_value(&mut get, "CLOUD_CHAT_URL")
-            .unwrap_or_else(|| format!("{base_url}/chat/completions"));
-        let embed_endpoint = optional_value(&mut get, "CLOUD_EMBED_URL")
-            .unwrap_or_else(|| format!("{base_url}/embeddings"));
-        let rerank_endpoint = optional_value(&mut get, "CLOUD_RERANK_URL")
-            .unwrap_or_else(|| format!("{base_url}/ranking"));
+        let chat_endpoint = capability_endpoint(
+            &mut get,
+            "CLOUD_CHAT_URL",
+            &gateway_base,
+            &format!("{GATEWAY_NVIDIA_BUILD_SEGMENT}/v1/chat/completions"),
+        )?;
+        let embed_endpoint = capability_endpoint(
+            &mut get,
+            "CLOUD_EMBED_URL",
+            &gateway_base,
+            &format!("{GATEWAY_NVIDIA_BUILD_SEGMENT}/v1/embeddings"),
+        )?;
+        let rerank_endpoint = capability_endpoint(
+            &mut get,
+            "CLOUD_RERANK_URL",
+            &gateway_base,
+            &format!(
+                "{GATEWAY_NVIDIA_AI_SEGMENT}/v1/retrieval/nvidia/{RERANK_MODEL_FAMILY}/reranking"
+            ),
+        )?;
 
         let timeout_secs = match optional_value(&mut get, "CLOUD_MODEL_REQUEST_TIMEOUT_SECS") {
             Some(raw) => raw
@@ -175,10 +202,10 @@ impl CloudModelConfig {
         }
 
         Ok(Self {
-            api_key,
-            chat_endpoint: parse_endpoint("CLOUD_CHAT_URL", &chat_endpoint)?,
-            embed_endpoint: parse_endpoint("CLOUD_EMBED_URL", &embed_endpoint)?,
-            rerank_endpoint: parse_endpoint("CLOUD_RERANK_URL", &rerank_endpoint)?,
+            gateway_token,
+            chat_endpoint,
+            embed_endpoint,
+            rerank_endpoint,
             chat_model,
             embed_model,
             rerank_model,
@@ -248,6 +275,30 @@ fn optional_value(
     get(name)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Resolves one capability URL: an explicit full gateway route wins, otherwise
+/// the default NVIDIA custom-provider path is appended to the gateway base.
+/// Missing both is a startup error so nothing can silently bypass the gateway.
+fn capability_endpoint(
+    get: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+    gateway_base: &Option<String>,
+    default_gateway_path: &str,
+) -> Result<Url, CloudModelConfigError> {
+    if let Some(url) = optional_value(get, name) {
+        return parse_endpoint(name, &url);
+    }
+    match gateway_base {
+        Some(base) => parse_endpoint(
+            "CF_AI_GATEWAY_BASE_URL",
+            &format!("{base}/{default_gateway_path}"),
+        ),
+        None => Err(CloudModelConfigError(format!(
+            "{name} is empty and CF_AI_GATEWAY_BASE_URL is not set; configure the Cloudflare AI \
+             Gateway base URL ({GATEWAY_BASE_URL_HINT}) or a full gateway route in {name}"
+        ))),
+    }
 }
 
 fn positive_usize_setting(
@@ -692,7 +743,7 @@ impl Default for RerankRetryConfig {
 #[derive(Clone)]
 pub struct CloudModelClient {
     http: reqwest::Client,
-    api_key: String,
+    gateway_token: String,
     chat_endpoint: Url,
     embed_endpoint: Url,
     rerank_endpoint: Url,
@@ -723,7 +774,7 @@ impl CloudModelClient {
 
         Ok(Self {
             http,
-            api_key: config.api_key,
+            gateway_token: config.gateway_token,
             chat_endpoint: config.chat_endpoint,
             embed_endpoint: config.embed_endpoint,
             rerank_endpoint: config.rerank_endpoint,
@@ -750,7 +801,7 @@ impl CloudModelClient {
                 .expect("static test endpoint must be valid")
         };
         let config = CloudModelConfig {
-            api_key: "test-api-key".to_string(),
+            gateway_token: "test-gateway-token".to_string(),
             chat_endpoint: endpoint("chat/completions"),
             embed_endpoint: endpoint("embeddings"),
             rerank_endpoint: endpoint("ranking"),
@@ -1184,9 +1235,7 @@ impl CloudModelClient {
     ) -> CloudModelResult<Response> {
         let payload = serialize_chat_request_with_limit(request, MAX_CHAT_REQUEST_BYTES)?;
         let response = self
-            .http
-            .post(self.chat_endpoint.clone())
-            .bearer_auth(&self.api_key)
+            .authorized(self.http.post(self.chat_endpoint.clone()))
             .header(CONTENT_TYPE, "application/json")
             .body(payload)
             .send()
@@ -1297,6 +1346,16 @@ impl CloudModelClient {
         )
     }
 
+    /// Authenticates the request to the Cloudflare AI Gateway. Upstream
+    /// provider keys live in the gateway's BYOK store, so no provider
+    /// `Authorization` header is ever sent from the backend.
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request.header(
+            GATEWAY_AUTHORIZATION_HEADER,
+            format!("Bearer {}", self.gateway_token),
+        )
+    }
+
     async fn send_json<T: Serialize + ?Sized>(
         &self,
         operation: ModelOperation,
@@ -1304,9 +1363,7 @@ impl CloudModelClient {
         request: &T,
     ) -> CloudModelResult<Response> {
         let response = self
-            .http
-            .post(endpoint.clone())
-            .bearer_auth(&self.api_key)
+            .authorized(self.http.post(endpoint.clone()))
             .json(request)
             .send()
             .await
@@ -1371,10 +1428,10 @@ impl CloudModelClient {
     }
 
     fn sanitize(&self, text: &str) -> String {
-        let without_key = if self.api_key.is_empty() {
+        let without_key = if self.gateway_token.is_empty() {
             text.to_string()
         } else {
-            text.replace(&self.api_key, "[REDACTED]")
+            text.replace(&self.gateway_token, "[REDACTED]")
         };
         let data_urls = regex::Regex::new(r"(?i)data:image/(?:png|jpeg);base64,[A-Za-z0-9+/=_-]*")
             .expect("valid data URL regex");
@@ -1715,6 +1772,15 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
 
+    /// Paths produced by the default CF_AI_GATEWAY_BASE_URL derivation when the
+    /// mock server address is used as the gateway base.
+    const MOCK_GATEWAY_CHAT_PATH: &str = "/custom-nvidia-build/v1/chat/completions";
+    const MOCK_GATEWAY_EMBED_PATH: &str = "/custom-nvidia-build/v1/embeddings";
+    const MOCK_GATEWAY_RERANK_PATH: &str =
+        "/custom-nvidia-ai/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking";
+    const TEST_GATEWAY_BASE: &str =
+        "https://gateway.ai.cloudflare.com/v1/test-account/test-gateway";
+
     #[derive(Clone, Copy)]
     enum MockMode {
         Success,
@@ -1735,6 +1801,7 @@ mod tests {
     struct RecordedRequest {
         path: String,
         authorization: Option<String>,
+        gateway_authorization: Option<String>,
         body: serde_json::Value,
     }
 
@@ -1752,6 +1819,11 @@ mod tests {
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        let gateway_authorization = parts
+            .headers
+            .get(super::GATEWAY_AUTHORIZATION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let bytes = to_bytes(body, usize::MAX).await.expect("read mock request");
         let body: serde_json::Value =
             serde_json::from_slice(&bytes).expect("mock request contains JSON");
@@ -1760,6 +1832,7 @@ mod tests {
             requests.push(RecordedRequest {
                 path: path.clone(),
                 authorization: authorization.clone(),
+                gateway_authorization: gateway_authorization.clone(),
                 body: body.clone(),
             });
             requests.len()
@@ -1768,8 +1841,9 @@ mod tests {
         match state.mode {
             MockMode::EchoSecretError => {
                 let response_body = format!(
-                    "Authorization: {} echoed-input={} {}",
+                    "Authorization: {} cf-aig-authorization: {} echoed-input={} {}",
                     authorization.unwrap_or_default(),
+                    gateway_authorization.unwrap_or_default(),
                     body.pointer("/input/0")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default(),
@@ -1790,7 +1864,7 @@ mod tests {
                 return (StatusCode::BAD_REQUEST, "invalid request").into_response();
             }
             MockMode::ChatStatus(status)
-                if matches!(path.as_str(), "/chat/completions" | "/capabilities/chat") =>
+                if matches!(path.as_str(), MOCK_GATEWAY_CHAT_PATH | "/capabilities/chat") =>
             {
                 return (
                     status,
@@ -1810,14 +1884,17 @@ mod tests {
         }
 
         match path.as_str() {
-            "/chat/completions" | "/capabilities/chat"
+            MOCK_GATEWAY_CHAT_PATH | "/capabilities/chat"
                 if body.get("stream") == Some(&serde_json::Value::Bool(true))
                     && matches!(state.mode, MockMode::SplitSse) =>
             {
+                // Includes OpenRouter-style `:` keep-alive comment lines and
+                // unknown JSON fields, which the parser must ignore.
                 let chunks = [
+                    ": OPENROUTER PROCESSING\n\n",
                     "data: {\"choices\":[{\"delta\":{\"content\":\"<thi",
-                    "nk>hidden</think>跨\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"con",
-                    "tent\":\"區塊 [S1]\"}}]}\n\ndata: [DO",
+                    "nk>hidden</think>跨\"}}]}\n\n: OPENROUTER PROCESSING\n\ndata: {\"id\":\"gen-1\",\"choices\":[{\"delta\":{\"con",
+                    "tent\":\"區塊 [S1]\",\"reasoning\":null}}],\"usage\":{\"total_tokens\":3}}\n\ndata: [DO",
                     "NE]\n\n",
                 ]
                 .into_iter()
@@ -1829,7 +1906,7 @@ mod tests {
                 )
                     .into_response()
             }
-            "/chat/completions" | "/capabilities/chat"
+            MOCK_GATEWAY_CHAT_PATH | "/capabilities/chat"
                 if body.get("stream") == Some(&serde_json::Value::Bool(true)) =>
             {
                 let sse = concat!(
@@ -1839,13 +1916,13 @@ mod tests {
                 );
                 (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], sse).into_response()
             }
-            "/chat/completions" | "/capabilities/chat" => (
+            MOCK_GATEWAY_CHAT_PATH | "/capabilities/chat" => (
                 StatusCode::OK,
                 [(CONTENT_TYPE, "application/json")],
                 r#"{"choices":[{"message":{"content":"ok"}}]}"#,
             )
                 .into_response(),
-            "/embeddings" | "/capabilities/embed" => {
+            MOCK_GATEWAY_EMBED_PATH | "/capabilities/embed" => {
                 let dimensions = if matches!(state.mode, MockMode::WrongDimensions) {
                     EMBEDDING_DIMENSIONS - 1
                 } else {
@@ -1863,7 +1940,7 @@ mod tests {
                 )
                     .into_response()
             }
-            "/ranking" | "/capabilities/rerank" => {
+            MOCK_GATEWAY_RERANK_PATH | "/capabilities/rerank" => {
                 let passage_count = body["passages"]
                     .as_array()
                     .map(Vec::len)
@@ -1917,9 +1994,9 @@ mod tests {
             requests: Arc::new(Mutex::new(Vec::new())),
         };
         let app = Router::new()
-            .route("/chat/completions", post(mock_cloud))
-            .route("/embeddings", post(mock_cloud))
-            .route("/ranking", post(mock_cloud))
+            .route(MOCK_GATEWAY_CHAT_PATH, post(mock_cloud))
+            .route(MOCK_GATEWAY_EMBED_PATH, post(mock_cloud))
+            .route(MOCK_GATEWAY_RERANK_PATH, post(mock_cloud))
             .route("/capabilities/chat", post(mock_cloud))
             .route("/capabilities/embed", post(mock_cloud))
             .route("/capabilities/rerank", post(mock_cloud))
@@ -1942,17 +2019,17 @@ mod tests {
         CloudModelConfig::from_lookup(|name| values.get(name).cloned())
     }
 
-    fn test_config(base_url: &str, api_key: &str) -> CloudModelConfig {
+    fn test_config(gateway_base_url: &str, gateway_token: &str) -> CloudModelConfig {
         config_from(&[
-            ("NVIDIA_API_KEY", api_key),
+            ("CF_AI_GATEWAY_TOKEN", gateway_token),
             ("GEMMA_4_MODEL_ID", "hosted/google-gemma-4-test"),
-            ("CLOUD_MODEL_BASE_URL", base_url),
+            ("CF_AI_GATEWAY_BASE_URL", gateway_base_url),
         ])
         .expect("valid test config")
     }
 
-    fn test_client(base_url: &str, api_key: &str, timeout: Duration) -> CloudModelClient {
-        let mut config = test_config(base_url, api_key);
+    fn test_client(base_url: &str, gateway_token: &str, timeout: Duration) -> CloudModelClient {
+        let mut config = test_config(base_url, gateway_token);
         config.request_timeout = timeout;
         let mut client = CloudModelClient::new(config).expect("cloud client");
         client.embedding_retry = EmbeddingRetryConfig {
@@ -1975,23 +2052,23 @@ mod tests {
     }
 
     #[test]
-    fn config_requires_api_key_and_explicit_gemma_4_model() {
-        let missing_key = config_from(&[]).expect_err("API key must be required");
-        assert!(missing_key.to_string().contains("NVIDIA_API_KEY"));
+    fn config_requires_gateway_token_and_explicit_gemma_4_model() {
+        let missing_token = config_from(&[]).expect_err("gateway token must be required");
+        assert!(missing_token.to_string().contains("CF_AI_GATEWAY_TOKEN"));
 
         let missing_model =
-            config_from(&[("NVIDIA_API_KEY", "secret")]).expect_err("model must be required");
+            config_from(&[("CF_AI_GATEWAY_TOKEN", "secret")]).expect_err("model must be required");
         assert!(missing_model.to_string().contains("GEMMA_4_MODEL_ID"));
 
         let wrong_family = config_from(&[
-            ("NVIDIA_API_KEY", "secret"),
+            ("CF_AI_GATEWAY_TOKEN", "secret"),
             ("GEMMA_4_MODEL_ID", "some-other-chat-model"),
         ])
         .expect_err("chat family must be locked");
         assert!(wrong_family.to_string().contains("Gemma 4"));
 
         let misleading_version = config_from(&[
-            ("NVIDIA_API_KEY", "secret"),
+            ("CF_AI_GATEWAY_TOKEN", "secret"),
             ("GEMMA_4_MODEL_ID", "hosted/gemma-14b"),
         ])
         .expect_err("Gemma 14 must not be mistaken for Gemma 4");
@@ -2004,7 +2081,7 @@ mod tests {
             "vendor/gemma-4b",
         ] {
             let error = config_from(&[
-                ("NVIDIA_API_KEY", "secret"),
+                ("CF_AI_GATEWAY_TOKEN", "secret"),
                 ("GEMMA_4_MODEL_ID", false_positive),
             ])
             .expect_err("Gemma 4 marker must have model-token boundaries");
@@ -2012,16 +2089,21 @@ mod tests {
         }
 
         for valid in ["vendor/gemma4-production", "vendor/google.gemma_4.preview"] {
-            config_from(&[("NVIDIA_API_KEY", "secret"), ("GEMMA_4_MODEL_ID", valid)])
-                .expect("boundary-aware Gemma 4 model id");
+            config_from(&[
+                ("CF_AI_GATEWAY_TOKEN", "secret"),
+                ("GEMMA_4_MODEL_ID", valid),
+                ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
+            ])
+            .expect("boundary-aware Gemma 4 model id");
         }
     }
 
     #[test]
     fn config_locks_embed_and_rerank_families() {
         let config = config_from(&[
-            ("NVIDIA_API_KEY", "secret"),
+            ("CF_AI_GATEWAY_TOKEN", "gateway-secret"),
             ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+            ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
         ])
         .expect("default model config");
         assert_eq!(config.embed_model(), DEFAULT_EMBED_MODEL_ID);
@@ -2031,7 +2113,7 @@ mod tests {
         assert!(!debug.contains("authorization"));
 
         let replacement = config_from(&[
-            ("NVIDIA_API_KEY", "secret"),
+            ("CF_AI_GATEWAY_TOKEN", "secret"),
             ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
             ("NEMOTRON_EMBED_MODEL_ID", "vendor/arbitrary-embedder"),
         ])
@@ -2039,7 +2121,7 @@ mod tests {
         assert!(replacement.to_string().contains(EMBED_MODEL_FAMILY));
 
         let replacement = config_from(&[
-            ("NVIDIA_API_KEY", "secret"),
+            ("CF_AI_GATEWAY_TOKEN", "secret"),
             ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
             ("NEMOTRON_RERANK_MODEL_ID", "vendor/arbitrary-reranker"),
         ])
@@ -2048,10 +2130,67 @@ mod tests {
     }
 
     #[test]
+    fn config_derives_gateway_routes_and_requires_base_or_full_urls() {
+        let config = config_from(&[
+            ("CF_AI_GATEWAY_TOKEN", "secret"),
+            ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+            // Trailing slash must not produce a double slash in derived routes.
+            (
+                "CF_AI_GATEWAY_BASE_URL",
+                "https://gateway.ai.cloudflare.com/v1/acct/gw/",
+            ),
+        ])
+        .expect("gateway-derived config");
+        assert_eq!(
+            config.chat_endpoint().as_str(),
+            "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-build/v1/chat/completions"
+        );
+        assert_eq!(
+            config.embed_endpoint().as_str(),
+            "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-build/v1/embeddings"
+        );
+        assert_eq!(
+            config.rerank_endpoint().as_str(),
+            "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-ai/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking"
+        );
+
+        let missing_base = config_from(&[
+            ("CF_AI_GATEWAY_TOKEN", "secret"),
+            ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+        ])
+        .expect_err("no gateway base and no full URLs must fail before startup");
+        assert!(missing_base.to_string().contains("CF_AI_GATEWAY_BASE_URL"));
+        assert!(missing_base.to_string().contains("CLOUD_CHAT_URL"));
+
+        let overrides_only = config_from(&[
+            ("CF_AI_GATEWAY_TOKEN", "secret"),
+            ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+            (
+                "CLOUD_CHAT_URL",
+                "https://gateway.ai.cloudflare.com/v1/acct/gw/openrouter/v1/chat/completions",
+            ),
+            (
+                "CLOUD_EMBED_URL",
+                "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-build/v1/embeddings",
+            ),
+            (
+                "CLOUD_RERANK_URL",
+                "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-ai/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking",
+            ),
+        ])
+        .expect("three full gateway routes do not need the shared base");
+        assert_eq!(
+            overrides_only.chat_endpoint().as_str(),
+            "https://gateway.ai.cloudflare.com/v1/acct/gw/openrouter/v1/chat/completions"
+        );
+    }
+
+    #[test]
     fn config_validates_rerank_pool_batch_and_top_n() {
         let config = config_from(&[
-            ("NVIDIA_API_KEY", "secret"),
+            ("CF_AI_GATEWAY_TOKEN", "secret"),
             ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+            ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
         ])
         .expect("default rerank config");
         assert_eq!(
@@ -2064,8 +2203,9 @@ mod tests {
         for top_n in [MIN_RERANK_TOP_N, DEFAULT_RERANK_TOP_N, MAX_RERANK_TOP_N] {
             let raw = top_n.to_string();
             let config = config_from(&[
-                ("NVIDIA_API_KEY", "secret"),
+                ("CF_AI_GATEWAY_TOKEN", "secret"),
                 ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+                ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
                 ("RERANK_TOP_N", &raw),
             ])
             .expect("supported top_n");
@@ -2079,8 +2219,9 @@ mod tests {
             ("RERANK_CANDIDATE_TOP_K", "0"),
         ] {
             let error = config_from(&[
-                ("NVIDIA_API_KEY", "secret"),
+                ("CF_AI_GATEWAY_TOKEN", "secret"),
                 ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+                ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
                 (name, value),
             ])
             .expect_err("invalid rerank config must fail before startup");
@@ -2089,8 +2230,9 @@ mod tests {
 
         let oversized_batch = (MAX_RERANK_BATCH_SIZE + 1).to_string();
         let error = config_from(&[
-            ("NVIDIA_API_KEY", "secret"),
+            ("CF_AI_GATEWAY_TOKEN", "secret"),
             ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+            ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
             ("RERANK_BATCH_SIZE", &oversized_batch),
         ])
         .expect_err("hosted batch limit must fail before startup");
@@ -2104,9 +2246,8 @@ mod tests {
         let embed_url = format!("{base_url}/capabilities/embed");
         let rerank_url = format!("{base_url}/capabilities/rerank");
         let config = config_from(&[
-            ("NVIDIA_API_KEY", "test-api-key"),
+            ("CF_AI_GATEWAY_TOKEN", "gateway-run-token"),
             ("GEMMA_4_MODEL_ID", "hosted/google-gemma-4-test"),
-            ("CLOUD_MODEL_BASE_URL", "https://unused.example/v1"),
             ("CLOUD_CHAT_URL", &chat_url),
             ("CLOUD_EMBED_URL", &embed_url),
             ("CLOUD_RERANK_URL", &rerank_url),
@@ -2179,10 +2320,15 @@ mod tests {
 
         let requests = state.requests.lock().expect("request lock");
         assert_eq!(requests.len(), 6);
+        assert!(requests.iter().all(|request| {
+            request.gateway_authorization.as_deref() == Some("Bearer gateway-run-token")
+        }));
+        // Provider keys live in the gateway's BYOK store; the backend must
+        // never send an upstream Authorization header.
         assert!(
             requests
                 .iter()
-                .all(|request| request.authorization.as_deref() == Some("Bearer test-api-key"))
+                .all(|request| request.authorization.is_none())
         );
 
         let chat = requests
@@ -2471,8 +2617,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_sse_parser_handles_events_split_across_transport_chunks() {
-        let (base_url, _state, server) = spawn_mock(MockMode::SplitSse).await;
+    async fn chat_sse_parser_handles_split_chunks_comment_keepalives_and_unknown_fields() {
+        let (base_url, state, server) = spawn_mock(MockMode::SplitSse).await;
         let client = test_client(&base_url, "test-api-key", Duration::from_secs(1));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         client
@@ -2499,6 +2645,18 @@ mod tests {
         }
         assert_eq!(text, "跨區塊 [S1]");
         assert_eq!(done_count, 1);
+
+        // The default gateway-derived chat route was used, the gateway token
+        // authenticated the request, and no provider Authorization header
+        // left the backend (provider keys live in the gateway's BYOK store).
+        let requests = state.requests.lock().expect("request lock");
+        assert_eq!(requests[0].path, MOCK_GATEWAY_CHAT_PATH);
+        assert_eq!(
+            requests[0].gateway_authorization.as_deref(),
+            Some("Bearer test-api-key")
+        );
+        assert!(requests[0].authorization.is_none());
+        drop(requests);
         server.abort();
     }
 

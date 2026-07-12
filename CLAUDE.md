@@ -20,7 +20,7 @@ The specification priority is the active GitHub issue, then tracker issue #1, th
 - Native conversion smoke test: `docker build --target native-test -t ai-km-demo:native-test .`
 - Stop the backend with `pkill -x km-server`; never use `pkill -f`.
 
-The backend requires `NVIDIA_API_KEY` and a confirmed `GEMMA_4_MODEL_ID`. Shared and per-capability cloud URLs, the two locked Nemotron model IDs, and request timeout are documented in `.env.example`. Restart after changing configuration.
+The backend requires `CF_AI_GATEWAY_TOKEN`, a confirmed `GEMMA_4_MODEL_ID`, and `CF_AI_GATEWAY_BASE_URL` (unless all three per-capability `CLOUD_*_URL` gateway routes are set). Provider API keys are not backend configuration; they live in the gateway's BYOK store. The per-capability gateway routes, the two locked Nemotron model IDs, and request timeout are documented in `.env.example`. Restart after changing configuration.
 
 ## Architecture
 
@@ -36,8 +36,10 @@ The backend requires `NVIDIA_API_KEY` and a confirmed `GEMMA_4_MODEL_ID`. Shared
 
 ## Cloud model safety
 
+- All model traffic is routed through a Cloudflare AI Gateway; there are no direct provider endpoint defaults. The NVIDIA hosts are reached via the gateway custom providers `nvidia-build` and `nvidia-ai`, and chat may alternatively use the gateway's OpenRouter route.
+- The backend holds no provider API keys and never sends an upstream `Authorization` header; provider keys live in the gateway's BYOK store, and the backend's only secret is the AI Gateway Run token sent as `cf-aig-authorization`.
 - Parse model configuration before connecting to the database so missing secrets/model IDs fail before traffic is accepted.
-- Logs may include endpoint and model ID, never the API key or request Authorization header.
+- Logs may include endpoint and model ID, never the gateway token or request auth headers.
 - Model HTTP errors use a maximum 500-character sanitized snippet and expose HTTP status, timeout, and retryability through one error type.
 - The Gemma model ID has no repository default. Embed and rerank settings may only vendor-qualify their locked family names.
 - Do not send an embedding dimension-reduction parameter; the fixed Embed VL response is validated as 2048 dimensions.
