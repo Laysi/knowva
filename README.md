@@ -8,7 +8,7 @@
 
 | 能力 | 固定契約 |
 |---|---|
-| 回答／多模態閱讀 | 雲端 Gemma 4；`GEMMA_4_MODEL_ID` 必填，不提供猜測值或其他 family fallback |
+| 回答／多模態閱讀 | 雲端 chat endpoint；model 由 `GEMMA_4_MODEL_ID` 放入 request body |
 | 向量嵌入 | `nvidia/llama-nemotron-embed-vl-1b-v2`，輸出 2048 維 float embedding |
 | 精排 | `nvidia/llama-nemotron-rerank-vl-1b-v2` |
 
@@ -47,16 +47,18 @@ cp .env.example .env
 ```dotenv
 CF_AI_GATEWAY_BASE_URL=https://gateway.ai.cloudflare.com/v1/<account_id>/<gateway_id>
 CF_AI_GATEWAY_TOKEN=your-ai-gateway-run-token
-GEMMA_4_MODEL_ID=the-confirmed-cloud-gemma-4-id
+CLOUD_CHAT_URL=https://gateway.ai.cloudflare.com/v1/<account_id>/<gateway_id>/custom-nvidia-build/chat/completions
+GEMMA_4_MODEL_ID=google/gemma-4-31b-it
 ```
 
 其他 cloud-model 設定：
 
 | 環境變數 | 必要性 | 說明 |
 |---|---|---|
-| `CLOUD_CHAT_URL` | 選填 | 完整 chat gateway route；空值時使用 `${CF_AI_GATEWAY_BASE_URL}/custom-nvidia-build/v1/chat/completions`，改走 OpenRouter 則填 `${CF_AI_GATEWAY_BASE_URL}/openrouter/v1/chat/completions` |
-| `CLOUD_EMBED_URL` | 選填 | 完整 embedding gateway route；空值時使用 `${CF_AI_GATEWAY_BASE_URL}/custom-nvidia-build/v1/embeddings` |
-| `CLOUD_RERANK_URL` | 選填 | 完整 reranking gateway route；空值時使用 `${CF_AI_GATEWAY_BASE_URL}/custom-nvidia-ai/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking` |
+| `CLOUD_CHAT_URL` | 選填 | 完整 chat gateway route；model 放在 JSON body；空值時使用預設 route |
+| `CLOUD_EMBED_URL` | 選填 | 完整 embedding gateway route，可獨立切換 provider；空值時使用預設 route |
+| `CLOUD_RERANK_URL` | 選填 | 完整 reranking gateway route，可獨立切換 provider；空值時使用預設 route |
+| `GEMMA_4_MODEL_ID` | 必填 | 放入 Chat request body 的 provider/model ID |
 | `NEMOTRON_EMBED_MODEL_ID` | 有鎖定預設 | 只接受 `llama-nemotron-embed-vl-1b-v2` family |
 | `NEMOTRON_RERANK_MODEL_ID` | 有鎖定預設 | 只接受 `llama-nemotron-rerank-vl-1b-v2` family |
 | `RERANK_CANDIDATE_TOP_K` | `50` | RRF 候選池送入 VL rerank 的數量，必須不小於 `RERANK_TOP_N` |
@@ -64,7 +66,9 @@ GEMMA_4_MODEL_ID=the-confirmed-cloud-gemma-4-id
 | `RERANK_BATCH_SIZE` | `8` | 每次 hosted rerank request 的 passage 數量，範圍為 1–512 |
 | `CLOUD_MODEL_REQUEST_TIMEOUT_SECS` | 有預設 | 所有模型 HTTP/SSE request timeout，必須是正整數 |
 
-Gateway base URL、gateway token、Gemma 4 model id 缺失或 rerank 設定無效時，後端會在連接資料庫與接受流量前停止並顯示可理解的錯誤。啟動 log 只會列 endpoint、model id、timeout 與非敏感 rerank limits，不會列出 token。
+Gateway token、chat model、endpoint 或 rerank 設定無效時，後端會在連接資料庫與接受流量前停止並顯示可理解的錯誤。三個完整 URL 只指定 provider operation route，model 分別放在 JSON request body；因此切換 provider 只需修改 URL，不需修改程式。
+
+三個 `CLOUD_*_URL` 都可以各自填入完整 Cloudflare AI Gateway route；當三個都填入時，`CF_AI_GATEWAY_BASE_URL` 可留空。Embedding 仍要求 2048 維向量，Rerank 仍要求目前的 ranking response contract；切換到不相容的模型需要另外調整模型契約與重建索引。
 
 文件前處理設定：
 
@@ -76,7 +80,7 @@ Gateway base URL、gateway token、Gemma 4 model id 缺失或 rerank 設定無�
 | `PDFIUM_LIBRARY_PATH` | 空 | 完整 library 路徑或所在目錄；空值時依序搜尋執行檔旁與系統 library path |
 | `LIBREOFFICE_BIN` | `libreoffice` | LibreOffice executable 路徑或命令名 |
 
-支援 PDF、PNG/JPEG/WebP、DOCX/PPTX/XLSX、MD/Markdown/TXT，HTTP 上傳上限為 50 MiB。CSV/HTML 與舊版 Office 格式目前不在支援清單。
+支援 PDF、PNG/JPEG/WebP、DOCX/PPTX/XLSX、MD/Markdown/TXT、STP/STEP 與 EML/MSG。STP/STEP 與 EML 會以文字內容建立檢索單元；MSG 保存原檔並建立檔案描述單元。MP4/AVI 目前不接受上傳，待 VLM 支援影片後再開放。CSV/HTML 與舊版 Office 格式目前不在支援清單。
 
 ## 使用 Docker Compose
 

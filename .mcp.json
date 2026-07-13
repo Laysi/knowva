@@ -16,6 +16,10 @@
       "env": {
         "AWS_REGION": "us-east-2"
       }
+    },
+    "cloudflare-api": {
+      "type": "http",
+      "url": "https://mcp.cloudflare.com/mcp"
     }
   }
 }

@@ -5,7 +5,6 @@ import {
   documentFailureMessage,
   documentRequestErrorMessage,
   documentStatusLabel,
-  MAX_UPLOAD_SIZE_BYTES,
   shouldPollDocuments,
   validateUploadFile,
 } from "./DocumentModel";
@@ -127,18 +126,15 @@ describe("DocumentList", () => {
     );
   });
 
-  it("retains the supported upload formats and the 50 MiB boundary", () => {
-    expect(
-      validateUploadFile({ name: "manual.PDF", size: MAX_UPLOAD_SIZE_BYTES }),
-    ).toBeNull();
-    expect(
-      validateUploadFile({
-        name: "manual.pdf",
-        size: MAX_UPLOAD_SIZE_BYTES + 1,
-      }),
-    ).toContain("50 MiB");
+  it("retains the supported upload formats without a client size limit", () => {
+    expect(validateUploadFile({ name: "manual.PDF", size: 500 * 1024 * 1024 })).toBeNull();
     expect(validateUploadFile({ name: "script.exe", size: 10 })).toContain(
       "不支援",
     );
+    expect(validateUploadFile({ name: "sensor.stp", size: 10 })).toBeNull();
+    expect(validateUploadFile({ name: "inspection.mp4", size: 10 })).toContain(
+      "不支援",
+    );
+    expect(validateUploadFile({ name: "alert.eml", size: 10 })).toBeNull();
   });
 });

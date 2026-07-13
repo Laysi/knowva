@@ -1,0 +1,29 @@
+From: support@samplefile.test
+To: platform@samplefile.test
+Cc: ops@samplefile.test
+Subject: Parser regression on archived ZIP bundle
+Date: Sat, 14 Mar 2026 11:48:00 -0400
+Message-ID: <support-thread-2207@samplefile.test>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="===============4080948687604954244=="
+
+--===============4080948687604954244==
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Customer report:
+- Upload accepted
+- Preview failed after archive expansion
+- Regression started after manifest diff rollout
+
+Please compare this against the previous ZIP validation fixtures.
+
+--===============4080948687604954244==
+Content-Type: text/csv
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="incident_summary.csv"
+MIME-Version: 1.0
+
+dXBsb2FkX2lkLGZvcm1hdCxzdGF0dXMKdXBsXzIyMDcsemlwLHByZXZpZXdfZmFpbGVkCg==
+
+--===============4080948687604954244==--

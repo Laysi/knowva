@@ -354,6 +354,61 @@ pub struct RetrievalDebug {
     pub fused: Vec<RetrievalCandidate>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct CatalogDocumentRow {
+    document_id: Uuid,
+    filename: String,
+    summary: Option<String>,
+    tags: Option<Vec<String>>,
+    unit_id: Option<i64>,
+}
+
+/// Returns one compact, text-only source per ready document for catalog questions.
+pub async fn catalog_candidates(pool: &sqlx::PgPool) -> anyhow::Result<Vec<RetrievalCandidate>> {
+    let rows = sqlx::query_as::<_, CatalogDocumentRow>(
+        "SELECT d.id AS document_id, d.filename, d.summary, d.tags, MIN(u.id) AS unit_id \
+         FROM documents AS d \
+         LEFT JOIN document_units AS u ON u.document_id = d.id AND u.retrieval_ready \
+         WHERE d.status = 'ready' \
+         GROUP BY d.id, d.filename, d.summary, d.tags, d.created_at \
+         ORDER BY d.created_at, d.id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let mut content = format!("文件名稱：{}", row.filename);
+            if let Some(summary) = row.summary.filter(|value| !value.trim().is_empty()) {
+                content.push_str(&format!("\n摘要：{}", summary.trim()));
+            }
+            if let Some(tags) = row.tags.filter(|values| !values.is_empty()) {
+                content.push_str(&format!("\n標籤：{}", tags.join("、")));
+            }
+            let unit_id = row.unit_id.unwrap_or(0);
+            RetrievalCandidate {
+                unit_id,
+                unit_index: 0,
+                document_id: row.document_id,
+                filename: row.filename,
+                kind: "text".to_string(),
+                page_number: None,
+                image_path: None,
+                content: Some(content),
+                dense_rank: None,
+                dense_score: None,
+                bm25_rank: None,
+                bm25_score: None,
+                rrf_score: 0.0,
+                rerank_score: None,
+                rerank_rank: Some(index + 1),
+            }
+        })
+        .collect::<Vec<_>>())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct ObservedRetrievalStage {
