@@ -3,6 +3,7 @@ services:
     build:
       context: .
       target: runtime
+    restart: unless-stopped
     init: true
     depends_on:
       postgres:
@@ -34,6 +35,7 @@ services:
 
   postgres:
     image: pgvector/pgvector:pg17
+    restart: unless-stopped
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     environment:
