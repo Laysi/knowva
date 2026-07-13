@@ -1,0 +1,492 @@
+{
+  "version": "1.0",
+  "documents": [
+    {
+      "document_key": "native-north-quarterly",
+      "relative_path": "documents/native/north/quarterly-report.pdf",
+      "sha256": "dc67a65195d33e2425c2146faa7405cfeee9232e8e1f1ade799e05043499c1b9",
+      "license": "CC0-1.0",
+      "source": "Generated synthetic fixture; no external data or production content.",
+      "kind": "native_pdf",
+      "expected": {
+        "pages": [
+          1,
+          2,
+          3
+        ],
+        "units": [
+          {
+            "unit_id": "page-1",
+            "page": 1
+          },
+          {
+            "unit_id": "page-2",
+            "page": 2
+          },
+          {
+            "unit_id": "page-3",
+            "page": 3
+          }
+        ]
+      }
+    },
+    {
+      "document_key": "native-south-quarterly",
+      "relative_path": "documents/native/south/quarterly-report.pdf",
+      "sha256": "4fce1ee597c6f9210b0869b00160fcd2888e329c18da7eeb5ff24fb5b88fa67c",
+      "license": "CC0-1.0",
+      "source": "Generated synthetic fixture; no external data or production content.",
+      "kind": "native_pdf",
+      "expected": {
+        "pages": [
+          1,
+          2,
+          3
+        ],
+        "units": [
+          {
+            "unit_id": "page-1",
+            "page": 1
+          },
+          {
+            "unit_id": "page-2",
+            "page": 2
+          },
+          {
+            "unit_id": "page-3",
+            "page": 3
+          }
+        ]
+      }
+    },
+    {
+      "document_key": "scanned-warehouse",
+      "relative_path": "documents/scanned/scanned-warehouse-report.pdf",
+      "sha256": "e6074e453c8152579c6763fde7e97e8e41dbf51a90ccf024a51998045732903d",
+      "license": "CC0-1.0",
+      "source": "Generated synthetic fixture; no external data or production content.",
+      "kind": "scanned_pdf",
+      "expected": {
+        "pages": [
+          1,
+          2
+        ],
+        "units": [
+          {
+            "unit_id": "page-1",
+            "page": 1
+          },
+          {
+            "unit_id": "page-2",
+            "page": 2
+          }
+        ]
+      }
+    },
+    {
+      "document_key": "presentation-launch",
+      "relative_path": "documents/presentation/launch-plan.pptx",
+      "sha256": "3893ed1c90241a89e6b6b3234bfe7e7f8cd31ddf52521df97a1e3e3874397dd1",
+      "license": "CC0-1.0",
+      "source": "Generated synthetic fixture; no external data or production content.",
+      "kind": "presentation",
+      "expected": {
+        "pages": [
+          1,
+          2,
+          3
+        ],
+        "units": [
+          {
+            "unit_id": "slide-1",
+            "page": 1
+          },
+          {
+            "unit_id": "slide-2",
+            "page": 2
+          },
+          {
+            "unit_id": "slide-3",
+            "page": 3
+          }
+        ]
+      }
+    },
+    {
+      "document_key": "visual-table-chart",
+      "relative_path": "documents/visual/table-chart.pdf",
+      "sha256": "c1d66afa089c26726b955139ca5ecf4a3fbd9752ad67a77909c7cc6068610d9f",
+      "license": "CC0-1.0",
+      "source": "Generated synthetic fixture; no external data or production content.",
+      "kind": "table_chart",
+      "expected": {
+        "pages": [
+          1,
+          2
+        ],
+        "units": [
+          {
+            "unit_id": "page-1",
+            "page": 1
+          },
+          {
+            "unit_id": "page-2",
+            "page": 2
+          }
+        ]
+      }
+    },
+    {
+      "document_key": "image-energy-dashboard",
+      "relative_path": "documents/image/energy-dashboard.png",
+      "sha256": "4c555f61fc16b488547826fd4a0e0b30f2271bc467491facf667b1984a4c021d",
+      "license": "CC0-1.0",
+      "source": "Generated synthetic fixture; no external data or production content.",
+      "kind": "image",
+      "expected": {
+        "pages": [
+          1
+        ],
+        "units": [
+          {
+            "unit_id": "image-1",
+            "page": 1
+          }
+        ]
+      }
+    },
+    {
+      "document_key": "markdown-operations",
+      "relative_path": "documents/text/operations.md",
+      "sha256": "2b244743083055e847eafb268be75e9d02a8fde918b08df36bbea2148c120d9a",
+      "license": "CC0-1.0",
+      "source": "Generated synthetic fixture; no external data or production content.",
+      "kind": "markdown",
+      "expected": {
+        "pages": [],
+        "units": [
+          {
+            "unit_id": "chunk-1",
+            "page": null
+          }
+        ]
+      }
+    },
+    {
+      "document_key": "text-support",
+      "relative_path": "documents/text/support.txt",
+      "sha256": "37fe59906dfbefb57530ca9cf562dcddbf0d9ab139b85745b9c56a5ed5c913ff",
+      "license": "CC0-1.0",
+      "source": "Generated synthetic fixture; no external data or production content.",
+      "kind": "text",
+      "expected": {
+        "pages": [],
+        "units": [
+          {
+            "unit_id": "chunk-1",
+            "page": null
+          }
+        ]
+      }
+    }
+  ],
+  "queries": [
+    {
+      "query_id": "native-north-current-project",
+      "query": "北區目前專案的代號、預算與負責人是什麼？",
+      "document_scope": [
+        "native-north-quarterly"
+      ],
+      "expected_sources": [
+        {
+          "document_key": "native-north-quarterly",
+          "unit_id": "page-2",
+          "page": 2
+        }
+      ],
+      "required_facts": [
+        "專案代號是極光-17",
+        "核准預算是新臺幣 420 萬元",
+        "負責人是林怡君"
+      ],
+      "answerable": true,
+      "type": "fact_lookup",
+      "difficulty": "medium",
+      "requires_visual": false
+    },
+    {
+      "query_id": "native-north-multi-page",
+      "query": "北區目前專案的代號、風險審查日期與交付期限為何？",
+      "document_scope": [
+        "native-north-quarterly"
+      ],
+      "expected_sources": [
+        {
+          "document_key": "native-north-quarterly",
+          "unit_id": "page-2",
+          "page": 2
+        },
+        {
+          "document_key": "native-north-quarterly",
+          "unit_id": "page-3",
+          "page": 3
+        }
+      ],
+      "required_facts": [
+        "專案代號是極光-17",
+        "風險審查日期是 2026 年 6 月 18 日",
+        "交付期限是 2026 年 9 月 30 日"
+      ],
+      "answerable": true,
+      "type": "multi_source",
+      "difficulty": "hard",
+      "requires_visual": false
+    },
+    {
+      "query_id": "native-same-filename-isolation",
+      "query": "南區季度報告中目前專案代號是什麼？",
+      "document_scope": [
+        "native-south-quarterly"
+      ],
+      "expected_sources": [
+        {
+          "document_key": "native-south-quarterly",
+          "unit_id": "page-2",
+          "page": 2
+        }
+      ],
+      "required_facts": [
+        "專案代號是南風-22"
+      ],
+      "answerable": true,
+      "type": "fact_lookup",
+      "difficulty": "medium",
+      "requires_visual": false
+    },
+    {
+      "query_id": "native-not-found",
+      "query": "兩份季度報告有列出員工停車位編號嗎？",
+      "document_scope": [
+        "native-north-quarterly",
+        "native-south-quarterly"
+      ],
+      "expected_sources": [],
+      "required_facts": [],
+      "answerable": false,
+      "type": "not_found",
+      "difficulty": "easy",
+      "requires_visual": false
+    },
+    {
+      "query_id": "scanned-helmet-stock",
+      "query": "掃描倉儲報告中，北區與南區安全帽各有幾頂？",
+      "document_scope": [
+        "scanned-warehouse"
+      ],
+      "expected_sources": [
+        {
+          "document_key": "scanned-warehouse",
+          "unit_id": "page-1",
+          "page": 1
+        }
+      ],
+      "required_facts": [
+        "北區安全帽庫存為 37 頂",
+        "南區安全帽庫存為 52 頂"
+      ],
+      "answerable": true,
+      "type": "visual_reasoning",
+      "difficulty": "medium",
+      "requires_visual": true
+    },
+    {
+      "query_id": "scanned-not-found",
+      "query": "掃描倉儲報告是否記載手套庫存？",
+      "document_scope": [
+        "scanned-warehouse"
+      ],
+      "expected_sources": [],
+      "required_facts": [],
+      "answerable": false,
+      "type": "not_found",
+      "difficulty": "medium",
+      "requires_visual": true
+    },
+    {
+      "query_id": "presentation-release-window",
+      "query": "晨星計畫的正式發佈日期、時間與負責人是誰？",
+      "document_scope": [
+        "presentation-launch"
+      ],
+      "expected_sources": [
+        {
+          "document_key": "presentation-launch",
+          "unit_id": "slide-2",
+          "page": 2
+        }
+      ],
+      "required_facts": [
+        "日期是 2026-11-05",
+        "時間是 09:30",
+        "負責人是王雅雯"
+      ],
+      "answerable": true,
+      "type": "fact_lookup",
+      "difficulty": "medium",
+      "requires_visual": false
+    },
+    {
+      "query_id": "presentation-not-found",
+      "query": "晨星計畫簡報有提供慶功宴地點嗎？",
+      "document_scope": [
+        "presentation-launch"
+      ],
+      "expected_sources": [],
+      "required_facts": [],
+      "answerable": false,
+      "type": "not_found",
+      "difficulty": "easy",
+      "requires_visual": false
+    },
+    {
+      "query_id": "table-chart-highest-quarter",
+      "query": "銷售長條圖中哪一季最高，數值是多少？",
+      "document_scope": [
+        "visual-table-chart"
+      ],
+      "expected_sources": [
+        {
+          "document_key": "visual-table-chart",
+          "unit_id": "page-1",
+          "page": 1
+        }
+      ],
+      "required_facts": [
+        "第二季最高",
+        "第二季數值是 180"
+      ],
+      "answerable": true,
+      "type": "visual_reasoning",
+      "difficulty": "medium",
+      "requires_visual": true
+    },
+    {
+      "query_id": "table-chart-not-found",
+      "query": "圖表文件有列出第四季銷售數值嗎？",
+      "document_scope": [
+        "visual-table-chart"
+      ],
+      "expected_sources": [],
+      "required_facts": [],
+      "answerable": false,
+      "type": "not_found",
+      "difficulty": "medium",
+      "requires_visual": true
+    },
+    {
+      "query_id": "image-renewable-mix",
+      "query": "能源儀表板中太陽能與風力各占多少？",
+      "document_scope": [
+        "image-energy-dashboard"
+      ],
+      "expected_sources": [
+        {
+          "document_key": "image-energy-dashboard",
+          "unit_id": "image-1",
+          "page": 1
+        }
+      ],
+      "required_facts": [
+        "太陽能占 64%",
+        "風力占 36%"
+      ],
+      "answerable": true,
+      "type": "visual_reasoning",
+      "difficulty": "medium",
+      "requires_visual": true
+    },
+    {
+      "query_id": "image-not-found",
+      "query": "能源儀表板有顯示水力發電占比嗎？",
+      "document_scope": [
+        "image-energy-dashboard"
+      ],
+      "expected_sources": [],
+      "required_facts": [],
+      "answerable": false,
+      "type": "not_found",
+      "difficulty": "medium",
+      "requires_visual": true
+    },
+    {
+      "query_id": "markdown-escalation",
+      "query": "維運手冊規定何時升級事件，通知代碼是什麼？",
+      "document_scope": [
+        "markdown-operations"
+      ],
+      "expected_sources": [
+        {
+          "document_key": "markdown-operations",
+          "unit_id": "chunk-1",
+          "page": null
+        }
+      ],
+      "required_facts": [
+        "連續 15 分鐘未恢復時升級給平台主管",
+        "通知代碼是 OPS-AMBER"
+      ],
+      "answerable": true,
+      "type": "fact_lookup",
+      "difficulty": "medium",
+      "requires_visual": false
+    },
+    {
+      "query_id": "markdown-not-found",
+      "query": "維運手冊有說明員工差旅報銷上限嗎？",
+      "document_scope": [
+        "markdown-operations"
+      ],
+      "expected_sources": [],
+      "required_facts": [],
+      "answerable": false,
+      "type": "not_found",
+      "difficulty": "easy",
+      "requires_visual": false
+    },
+    {
+      "query_id": "text-retention",
+      "query": "客服紀錄的一般與退款爭議保留天數各是多少？",
+      "document_scope": [
+        "text-support"
+      ],
+      "expected_sources": [
+        {
+          "document_key": "text-support",
+          "unit_id": "chunk-1",
+          "page": null
+        }
+      ],
+      "required_facts": [
+        "一般客服紀錄保留 180 天",
+        "退款爭議紀錄保留 365 天"
+      ],
+      "answerable": true,
+      "type": "fact_lookup",
+      "difficulty": "medium",
+      "requires_visual": false
+    },
+    {
+      "query_id": "text-not-found",
+      "query": "客服政策有列出電話設備採購品牌嗎？",
+      "document_scope": [
+        "text-support"
+      ],
+      "expected_sources": [],
+      "required_facts": [],
+      "answerable": false,
+      "type": "not_found",
+      "difficulty": "easy",
+      "requires_visual": false
+    }
+  ]
+}
