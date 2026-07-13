@@ -18,6 +18,43 @@ const MAX_PDF_RENDER_DIMENSION: i32 = 8_192;
 
 static PDFIUM: OnceLock<Result<Pdfium, String>> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
+fn proc_self_directory_fd(path: &Path) -> Option<std::os::fd::RawFd> {
+    let relative = path.strip_prefix("/proc/self/fd").ok()?;
+    let component = relative.components().next()?;
+    let std::path::Component::Normal(value) = component else {
+        return None;
+    };
+    value.to_str()?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn inherit_proc_directory_fd_for_child(
+    command: &mut Command,
+    path: &Path,
+) -> Result<(), ArtifactError> {
+    let Some(fd) = proc_self_directory_fd(path) else {
+        return Ok(());
+    };
+    // The parent keeps CLOEXEC set. Only the forked LibreOffice child clears
+    // it immediately before exec, so unrelated subprocesses cannot inherit it.
+    // SAFETY: the pre-exec closure performs only async-signal-safe fcntl calls
+    // against a live fd held by the evaluation RunFilesRoot.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ArtifactConfig {
     pub render_dpi: u16,
@@ -464,14 +501,22 @@ pub async fn convert_office_to_pdf(
                 format!("無法建立 LibreOffice 暫存設定目錄: {error}"),
             )
         })?;
-    let absolute_profile_dir = tokio::fs::canonicalize(&profile_dir)
-        .await
-        .map_err(|error| {
-            ArtifactError::new(
-                "office-conversion",
-                format!("無法解析 LibreOffice 暫存設定目錄: {error}"),
-            )
-        })?;
+    #[cfg(target_os = "linux")]
+    let proc_fd_profile = proc_self_directory_fd(&profile_dir).is_some();
+    #[cfg(not(target_os = "linux"))]
+    let proc_fd_profile = false;
+    let absolute_profile_dir = if proc_fd_profile {
+        profile_dir.clone()
+    } else {
+        tokio::fs::canonicalize(&profile_dir)
+            .await
+            .map_err(|error| {
+                ArtifactError::new(
+                    "office-conversion",
+                    format!("無法解析 LibreOffice 暫存設定目錄: {error}"),
+                )
+            })?
+    };
     let profile_url = url::Url::from_directory_path(&absolute_profile_dir).map_err(|_| {
         ArtifactError::new("office-conversion", "無法建立 LibreOffice 隔離設定目錄 URL")
     })?;
@@ -490,6 +535,8 @@ pub async fn convert_office_to_pdf(
         .arg("--outdir")
         .arg(run_dir)
         .arg(source_path);
+    #[cfg(target_os = "linux")]
+    inherit_proc_directory_fd_for_child(&mut command, run_dir)?;
 
     let output = match tokio::time::timeout(config.conversion_timeout, command.output()).await {
         Ok(Ok(output)) => output,
@@ -660,6 +707,88 @@ mod tests {
         assert_eq!(SourceKind::from_extension("csv"), None);
         assert_eq!(SourceKind::from_extension("html"), None);
         assert_eq!(SourceKind::from_extension("ppt"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proc_directory_fd_is_inherited_only_by_the_configured_child() -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RemoveOnDrop(PathBuf);
+
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        assert_eq!(
+            proc_self_directory_fd(Path::new("/proc/self/fd/41")),
+            Some(41)
+        );
+        assert_eq!(
+            proc_self_directory_fd(Path::new("/proc/self/fd/41/nested")),
+            Some(41)
+        );
+        for invalid_path in [
+            "/proc/self/fd",
+            "/proc/self/fd/not-a-number",
+            "/proc/self/fd/41-suffix",
+            "/proc/self/fd-other/41",
+            "/tmp/proc/self/fd/41",
+        ] {
+            assert_eq!(proc_self_directory_fd(Path::new(invalid_path)), None);
+        }
+
+        let root = test_dir("inherited-proc-directory-fd");
+        std::fs::create_dir(&root)?;
+        let _cleanup = RemoveOnDrop(root.clone());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+        assert_eq!(
+            std::fs::metadata(&root)?.permissions().mode() & 0o777,
+            0o700
+        );
+
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested)?;
+        std::fs::write(nested.join("payload"), b"visible through inherited fd")?;
+
+        let directory = std::fs::File::open(&root)?;
+        let fd = directory.as_raw_fd();
+        // SAFETY: fcntl reads descriptor flags for the live File-owned directory fd.
+        let flags_before = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags_before == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        assert_ne!(flags_before & libc::FD_CLOEXEC, 0);
+
+        let inherited_path = PathBuf::from(format!("/proc/self/fd/{fd}/nested"));
+        assert_eq!(proc_self_directory_fd(&inherited_path), Some(fd));
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(r#"test -r "$1/payload" && printf inherited > "$1/marker""#)
+            .arg("sh")
+            .arg(&inherited_path);
+        inherit_proc_directory_fd_for_child(&mut command, &inherited_path)?;
+        let output = command.output().await?;
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(nested.join("marker"))?, b"inherited");
+
+        // SAFETY: fcntl reads descriptor flags for the same live File-owned fd.
+        let flags_after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags_after == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        assert_ne!(flags_after & libc::FD_CLOEXEC, 0);
+
+        Ok(())
     }
 
     #[tokio::test]

@@ -24,6 +24,8 @@ const MAX_ERROR_CHARS: usize = 1_000;
 const EMBEDDING_CONCURRENCY: usize = 4;
 const EMBED_IMAGE_SHORT_SIDE_LIMIT: i32 = 8_192;
 const EMBED_IMAGE_LONG_SIDE_LIMIT: i32 = 16_384;
+pub const MAX_UPLOAD_BYTES: usize = 50 * 1_048_576;
+pub const MULTIPART_BODY_LIMIT_BYTES: usize = MAX_UPLOAD_BYTES + 1_048_576;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DocumentLocks {
@@ -54,6 +56,59 @@ pub struct UploadResponse {
     artifact_status: String,
     #[serde(rename = "processingStage")]
     processing_stage: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationIngestResult {
+    pub document_id: Uuid,
+    pub status: String,
+    pub artifact_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationIngestError {
+    pub code: &'static str,
+    pub safe_message: &'static str,
+}
+
+impl EvaluationIngestError {
+    fn new(code: &'static str, safe_message: &'static str) -> Self {
+        Self { code, safe_message }
+    }
+}
+
+impl fmt::Display for EvaluationIngestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.safe_message)
+    }
+}
+
+impl std::error::Error for EvaluationIngestError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessOptions {
+    generate_summary: bool,
+}
+
+impl ProcessOptions {
+    fn production() -> Self {
+        Self {
+            generate_summary: true,
+        }
+    }
+
+    fn evaluation() -> Self {
+        Self {
+            generate_summary: false,
+        }
+    }
+}
+
+struct CreatedDocument {
+    id: Uuid,
+    storage_path: PathBuf,
+    source_kind: SourceKind,
 }
 
 #[derive(Debug)]
@@ -163,38 +218,12 @@ pub async fn upload_document(
 
     let (original_filename, file_bytes) =
         upload.ok_or((StatusCode::BAD_REQUEST, "缺少 file 欄位".to_string()))?;
-    let extension = extension_for(&original_filename)?;
-    let source_kind = SourceKind::from_extension(&extension).ok_or((
-        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        "不支援此格式；請上傳 PDF、PNG/JPEG/WebP、DOCX/PPTX/XLSX、MD/TXT、STP、EML 或 MSG".to_string(),
-    ))?;
-    let mime_type = mime_type_for(&extension);
-    let id = Uuid::new_v4();
-    let files_dir = PathBuf::from(&state.files_dir);
-    let storage_path = publish_original(&files_dir, id, &extension, &file_bytes)
-        .await
-        .map_err(internal_error)?;
-    let storage_path_string = path_string(&storage_path);
-
-    let insert_result = sqlx::query(
-        "INSERT INTO documents \
-         (id, filename, storage_path, mime_type, status, artifact_status) \
-         VALUES ($1, $2, $3, $4, 'processing', 'pending')",
-    )
-    .bind(id)
-    .bind(&original_filename)
-    .bind(&storage_path_string)
-    .bind(mime_type)
-    .execute(&state.pool)
-    .await;
-    if let Err(error) = insert_result {
-        let _ = remove_document_tree(&files_dir, id).await;
-        return Err(internal_error(error));
-    }
+    let created = create_document(&state, &original_filename, &file_bytes).await?;
+    let id = created.id;
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        process_document(state_clone, id, storage_path, source_kind).await;
+        process_document(state_clone, id, created.storage_path, created.source_kind).await;
     });
 
     Ok((
@@ -206,6 +235,127 @@ pub async fn upload_document(
             processing_stage: "queued".to_string(),
         }),
     ))
+}
+
+async fn create_document(
+    state: &AppState,
+    original_filename: &str,
+    file_bytes: &[u8],
+) -> Result<CreatedDocument, (StatusCode, String)> {
+    if file_bytes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "不可上傳空檔案".to_owned()));
+    }
+    if file_bytes.len() > MAX_UPLOAD_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("檔案超過 {} MiB 上限", MAX_UPLOAD_BYTES / 1_048_576),
+        ));
+    }
+    let extension = extension_for(original_filename)?;
+    let source_kind = SourceKind::from_extension(&extension).ok_or((
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "不支援此格式；請上傳 PDF、PNG/JPEG/WebP、DOCX/PPTX/XLSX 或 MD/TXT".to_owned(),
+    ))?;
+    let mime_type = mime_type_for(&extension);
+    let id = Uuid::new_v4();
+    let files_dir = PathBuf::from(&state.files_dir);
+    let storage_path = publish_original(&files_dir, id, &extension, file_bytes)
+        .await
+        .map_err(internal_error)?;
+    let storage_path_string = path_string(&storage_path);
+
+    let insert_result = sqlx::query(
+        "INSERT INTO documents \
+         (id, filename, storage_path, mime_type, status, artifact_status) \
+         VALUES ($1, $2, $3, $4, 'processing', 'pending')",
+    )
+    .bind(id)
+    .bind(original_filename)
+    .bind(&storage_path_string)
+    .bind(mime_type)
+    .execute(&state.pool)
+    .await;
+    if let Err(error) = insert_result {
+        let _ = remove_document_tree(&files_dir, id).await;
+        return Err(internal_error(error));
+    }
+
+    Ok(CreatedDocument {
+        id,
+        storage_path,
+        source_kind,
+    })
+}
+
+/// Synchronously ingests immutable evaluation bytes through the production
+/// artifact and embedding pipeline while skipping non-critical summary calls.
+pub async fn ingest_evaluation_bytes(
+    state: Arc<AppState>,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<EvaluationIngestResult, EvaluationIngestError> {
+    if filename.trim().is_empty()
+        || Path::new(filename)
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some(filename)
+    {
+        return Err(EvaluationIngestError::new(
+            "fixture_filename_invalid",
+            "evaluation fixture filename is invalid",
+        ));
+    }
+    if bytes.is_empty() || bytes.len() > MAX_UPLOAD_BYTES {
+        return Err(EvaluationIngestError::new(
+            "fixture_size_invalid",
+            "evaluation fixture size is invalid",
+        ));
+    }
+    let created = create_document(&state, filename, bytes)
+        .await
+        .map_err(|_| {
+            EvaluationIngestError::new(
+                "fixture_create_failed",
+                "evaluation fixture could not be staged",
+            )
+        })?;
+    process_document_with_options(
+        state.clone(),
+        created.id,
+        created.storage_path,
+        created.source_kind,
+        ProcessOptions::evaluation(),
+    )
+    .await;
+
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT status, artifact_status FROM documents WHERE id = $1")
+            .bind(created.id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| {
+                EvaluationIngestError::new(
+                    "fixture_status_failed",
+                    "evaluation fixture status could not be verified",
+                )
+            })?;
+    match row {
+        Some((status, artifact_status)) if status == "ready" && artifact_status == "ready" => {
+            Ok(EvaluationIngestResult {
+                document_id: created.id,
+                status,
+                artifact_status,
+            })
+        }
+        Some(_) => Err(EvaluationIngestError::new(
+            "fixture_ingest_failed",
+            "evaluation fixture ingestion did not complete successfully",
+        )),
+        None => Err(EvaluationIngestError::new(
+            "fixture_missing_after_ingest",
+            "evaluation fixture disappeared during ingestion",
+        )),
+    }
 }
 
 fn multipart_error(error: axum::extract::multipart::MultipartError) -> (StatusCode, String) {
@@ -337,6 +487,23 @@ pub(crate) async fn process_document(
     storage_path: PathBuf,
     source_kind: SourceKind,
 ) {
+    process_document_with_options(
+        state,
+        id,
+        storage_path,
+        source_kind,
+        ProcessOptions::production(),
+    )
+    .await;
+}
+
+async fn process_document_with_options(
+    state: Arc<AppState>,
+    id: Uuid,
+    storage_path: PathBuf,
+    source_kind: SourceKind,
+    options: ProcessOptions,
+) {
     let _guard = state.document_locks.lock(id).await;
     let document_dir = match storage_path.parent() {
         Some(path) => path.to_owned(),
@@ -440,14 +607,18 @@ pub(crate) async fn process_document(
                 return;
             }
         };
-    let metadata = crate::document_summary::generate_best_effort(
-        &state.models,
-        id,
-        &prepared.pages,
-        &prepared.text_units,
-        Path::new(&state.files_dir),
-    )
-    .await;
+    let metadata = if options.generate_summary {
+        crate::document_summary::generate_best_effort(
+            &state.models,
+            id,
+            &prepared.pages,
+            &prepared.text_units,
+            Path::new(&state.files_dir),
+        )
+        .await
+    } else {
+        None
+    };
     if let Err(error) = persist_embedded_units(&state, id, &embedded_units, metadata.as_ref()).await
     {
         set_embedding_failed(&state, id, &error).await;
@@ -1225,6 +1396,12 @@ fn internal_error(error: impl fmt::Display) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evaluation_ingest_disables_only_best_effort_summary() {
+        assert!(ProcessOptions::production().generate_summary);
+        assert!(!ProcessOptions::evaluation().generate_summary);
+    }
 
     #[test]
     fn heading_aware_chunking_remains_model_free_and_bounded() {

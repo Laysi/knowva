@@ -4,6 +4,8 @@ use reqwest::header::CONTENT_TYPE;
 use reqwest::{Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
@@ -115,7 +117,7 @@ impl CloudModelConfig {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
-    fn from_lookup(
+    pub(crate) fn from_lookup(
         mut get: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, CloudModelConfigError> {
         // Provider API keys live in the Cloudflare AI Gateway BYOK store; the
@@ -123,6 +125,27 @@ impl CloudModelConfig {
         // gateway to be authenticated, so the token is mandatory.
         let gateway_token = required_value(&mut get, "CF_AI_GATEWAY_TOKEN")?;
         let chat_model = required_value(&mut get, "GEMMA_4_MODEL_ID")?;
+        if !is_gemma_4_model_id(&chat_model) {
+            return Err(CloudModelConfigError(
+                "GEMMA_4_MODEL_ID must identify a cloud-hosted Gemma 4 model".to_string(),
+            ));
+        }
+
+        let embed_model = optional_value(&mut get, "NEMOTRON_EMBED_MODEL_ID")
+            .unwrap_or_else(|| DEFAULT_EMBED_MODEL_ID.to_string());
+        validate_locked_model(
+            "NEMOTRON_EMBED_MODEL_ID",
+            &embed_model,
+            DEFAULT_EMBED_MODEL_ID,
+        )?;
+
+        let rerank_model = optional_value(&mut get, "NEMOTRON_RERANK_MODEL_ID")
+            .unwrap_or_else(|| DEFAULT_RERANK_MODEL_ID.to_string());
+        validate_locked_model(
+            "NEMOTRON_RERANK_MODEL_ID",
+            &rerank_model,
+            DEFAULT_RERANK_MODEL_ID,
+        )?;
 
         let gateway_base = optional_value(&mut get, "CF_AI_GATEWAY_BASE_URL")
             .map(|value| value.trim_end_matches('/').to_string());
@@ -149,8 +172,7 @@ impl CloudModelConfig {
                 "{GATEWAY_NVIDIA_AI_SEGMENT}/retrieval/nvidia/{RERANK_MODEL_FAMILY}/reranking"
             ),
         )?;
-        let rerank_model = optional_value(&mut get, "NEMOTRON_RERANK_MODEL_ID")
-            .unwrap_or_else(|| DEFAULT_RERANK_MODEL_ID.to_string());
+        validate_production_gateway_endpoints(&chat_endpoint, &embed_endpoint, &rerank_endpoint)?;
 
         let timeout_secs = match optional_value(&mut get, "CLOUD_MODEL_REQUEST_TIMEOUT_SECS") {
             Some(raw) => raw
@@ -301,6 +323,90 @@ fn positive_usize_setting(
             .ok_or_else(|| CloudModelConfigError(format!("{name} must be a positive integer"))),
         None => Ok(default),
     }
+}
+
+fn validate_locked_model(
+    setting: &'static str,
+    model: &str,
+    expected_model: &'static str,
+) -> Result<(), CloudModelConfigError> {
+    if model == expected_model {
+        Ok(())
+    } else {
+        Err(CloudModelConfigError(format!(
+            "{setting} must remain locked to {expected_model}"
+        )))
+    }
+}
+
+fn validate_production_gateway_endpoints(
+    chat: &Url,
+    embed: &Url,
+    rerank: &Url,
+) -> Result<(), CloudModelConfigError> {
+    let chat_identity = production_gateway_identity("CLOUD_CHAT_URL", chat)?;
+    let embed_identity = production_gateway_identity("CLOUD_EMBED_URL", embed)?;
+    let rerank_identity = production_gateway_identity("CLOUD_RERANK_URL", rerank)?;
+    if chat_identity != embed_identity || chat_identity != rerank_identity {
+        return Err(CloudModelConfigError(
+            "all cloud capability URLs must use the same Cloudflare AI Gateway account and gateway path"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn production_gateway_identity(
+    name: &'static str,
+    endpoint: &Url,
+) -> Result<(String, String), CloudModelConfigError> {
+    if endpoint.scheme() != "https"
+        || endpoint.host_str() != Some("gateway.ai.cloudflare.com")
+        || endpoint.port_or_known_default() != Some(443)
+    {
+        return Err(CloudModelConfigError(format!(
+            "{name} must use HTTPS on gateway.ai.cloudflare.com"
+        )));
+    }
+    let segments = endpoint
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    if segments.len() < 4
+        || segments.first() != Some(&"v1")
+        || segments[1].is_empty()
+        || segments[2].is_empty()
+    {
+        return Err(CloudModelConfigError(format!(
+            "{name} must include /v1/<account-id>/<gateway-id>/..."
+        )));
+    }
+    Ok((segments[1].to_owned(), segments[2].to_owned()))
+}
+
+fn is_gemma_4_model_id(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    let bytes = normalized.as_bytes();
+    normalized.match_indices("gemma").any(|(index, _)| {
+        let has_left_boundary = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
+        if !has_left_boundary {
+            return false;
+        }
+
+        let mut cursor = index + "gemma".len();
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| matches!(byte, b'-' | b'_' | b'.'))
+        {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'4') {
+            return false;
+        }
+        bytes
+            .get(cursor + 1)
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric())
+    })
 }
 
 fn parse_endpoint(name: &'static str, value: &str) -> Result<Url, CloudModelConfigError> {
@@ -688,6 +794,51 @@ impl Default for RerankRetryConfig {
     }
 }
 
+/// Content-free counters for actual HTTP attempts made by the cloud client.
+///
+/// A snapshot deliberately contains no endpoint, model input, document data, or
+/// authentication material. Cloned clients share the same underlying atomics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CloudRequestTelemetry {
+    pub chat_attempts: u64,
+    pub embedding_attempts: u64,
+    pub rerank_attempts: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudRetryPolicy {
+    pub max_attempts: u32,
+    pub base_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+    pub jitter: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudRetryPolicies {
+    pub embedding: CloudRetryPolicy,
+    pub rerank: CloudRetryPolicy,
+    pub generation: CloudRetryPolicy,
+}
+
+impl CloudRequestTelemetry {
+    pub fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            chat_attempts: self.chat_attempts.saturating_sub(earlier.chat_attempts),
+            embedding_attempts: self
+                .embedding_attempts
+                .saturating_sub(earlier.embedding_attempts),
+            rerank_attempts: self.rerank_attempts.saturating_sub(earlier.rerank_attempts),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CloudAttemptCounters {
+    chat: AtomicU64,
+    embedding: AtomicU64,
+    rerank: AtomicU64,
+}
+
 #[derive(Clone)]
 pub struct CloudModelClient {
     http: reqwest::Client,
@@ -704,10 +855,7 @@ pub struct CloudModelClient {
     rerank_batch_size: usize,
     embedding_retry: EmbeddingRetryConfig,
     rerank_retry: RerankRetryConfig,
-    #[cfg(test)]
-    embedding_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    #[cfg(test)]
-    rerank_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    attempts: Arc<CloudAttemptCounters>,
 }
 
 impl CloudModelClient {
@@ -735,10 +883,7 @@ impl CloudModelClient {
             rerank_batch_size: config.rerank_batch_size,
             embedding_retry: EmbeddingRetryConfig::default(),
             rerank_retry: RerankRetryConfig::default(),
-            #[cfg(test)]
-            embedding_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
-            rerank_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            attempts: Arc::new(CloudAttemptCounters::default()),
         })
     }
 
@@ -803,14 +948,57 @@ impl CloudModelClient {
 
     #[cfg(test)]
     fn embedding_attempt_count(&self) -> usize {
-        self.embedding_attempts
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.telemetry_snapshot().embedding_attempts as usize
     }
 
     #[cfg(test)]
     fn rerank_attempt_count(&self) -> usize {
-        self.rerank_attempts
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.telemetry_snapshot().rerank_attempts as usize
+    }
+
+    pub fn telemetry_snapshot(&self) -> CloudRequestTelemetry {
+        CloudRequestTelemetry {
+            chat_attempts: self.attempts.chat.load(Ordering::Relaxed),
+            embedding_attempts: self.attempts.embedding.load(Ordering::Relaxed),
+            rerank_attempts: self.attempts.rerank.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn with_deterministic_evaluation_retries(mut self) -> Self {
+        self.embedding_retry.jitter = false;
+        self.rerank_retry.jitter = false;
+        self
+    }
+
+    pub fn evaluation_retry_policies(&self) -> CloudRetryPolicies {
+        let policy = |max_attempts: usize, base_delay: Duration, max_delay: Duration, jitter| {
+            CloudRetryPolicy {
+                max_attempts: u32::try_from(max_attempts).unwrap_or(u32::MAX),
+                base_backoff_ms: u64::try_from(base_delay.as_millis()).unwrap_or(u64::MAX),
+                max_backoff_ms: u64::try_from(max_delay.as_millis()).unwrap_or(u64::MAX),
+                jitter,
+            }
+        };
+        CloudRetryPolicies {
+            embedding: policy(
+                self.embedding_retry.max_attempts,
+                self.embedding_retry.base_delay,
+                self.embedding_retry.max_delay,
+                self.embedding_retry.jitter,
+            ),
+            rerank: policy(
+                self.rerank_retry.max_attempts,
+                self.rerank_retry.base_delay,
+                self.rerank_retry.max_delay,
+                self.rerank_retry.jitter,
+            ),
+            generation: CloudRetryPolicy {
+                max_attempts: 1,
+                base_backoff_ms: 0,
+                max_backoff_ms: 0,
+                jitter: false,
+            },
+        }
     }
 
     pub fn rerank_model(&self) -> &str {
@@ -819,6 +1007,14 @@ impl CloudModelClient {
 
     pub fn chat_model(&self) -> &str {
         &self.chat_model
+    }
+
+    pub fn embed_model(&self) -> &str {
+        &self.embed_model
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
     }
 
     pub fn rerank_candidate_top_k(&self) -> usize {
@@ -1011,6 +1207,38 @@ impl CloudModelClient {
             Vec::new(),
             false,
             512,
+            Some(0.0),
+        );
+        let response = self.send_chat_request(&request).await?;
+        self.chat_content(response).await
+    }
+
+    /// Runs one deterministic non-streaming Gemma 4 RAG answer request.
+    ///
+    /// Evaluation modes A and B both use this exact method so the only changed
+    /// input is their retrieved context. The context precedes the user query in
+    /// the same order as the production streaming request.
+    pub async fn answer_rag_once(
+        &self,
+        system_prompt: &str,
+        context: ApiChatContent,
+        user_query: &str,
+    ) -> CloudModelResult<String> {
+        if user_query.trim().is_empty() {
+            return Err(CloudModelError::InvalidRequest {
+                operation: ModelOperation::Chat,
+                message: "evaluation query must not be empty".to_owned(),
+            });
+        }
+        let request = self.chat_request_with_context(
+            system_prompt.to_owned(),
+            context,
+            vec![ChatMessage {
+                role: "user".to_owned(),
+                content: user_query.to_owned(),
+            }],
+            false,
+            4096,
             Some(0.0),
         );
         let response = self.send_chat_request(&request).await?;
@@ -1243,6 +1471,7 @@ impl CloudModelClient {
         request: &ChatCompletionRequest,
     ) -> CloudModelResult<Response> {
         let payload = serialize_chat_request_with_limit(request, MAX_CHAT_REQUEST_BYTES)?;
+        self.attempts.chat.fetch_add(1, Ordering::Relaxed);
         let response = self
             .authorized(self.http.post(self.chat_endpoint.clone()))
             .header(CONTENT_TYPE, "application/json")
@@ -1279,9 +1508,6 @@ impl CloudModelClient {
         request: &EmbeddingRequest,
     ) -> CloudModelResult<EmbeddingResponse> {
         for attempt in 1..=self.embedding_retry.max_attempts {
-            #[cfg(test)]
-            self.embedding_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let result = async {
                 let response = self
                     .send_json(ModelOperation::Embed, &self.embed_endpoint, request)
@@ -1308,9 +1534,6 @@ impl CloudModelClient {
         expected_count: usize,
     ) -> CloudModelResult<RerankResponse> {
         for attempt in 1..=self.rerank_retry.max_attempts {
-            #[cfg(test)]
-            self.rerank_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let result = async {
                 let response = self
                     .send_json(ModelOperation::Rerank, &self.rerank_endpoint, request)
@@ -1371,6 +1594,11 @@ impl CloudModelClient {
         endpoint: &Url,
         request: &T,
     ) -> CloudModelResult<Response> {
+        match operation {
+            ModelOperation::Embed => self.attempts.embedding.fetch_add(1, Ordering::Relaxed),
+            ModelOperation::Rerank => self.attempts.rerank.fetch_add(1, Ordering::Relaxed),
+            ModelOperation::Chat => self.attempts.chat.fetch_add(1, Ordering::Relaxed),
+        };
         let response = self
             .authorized(self.http.post(endpoint.clone()))
             .json(request)
@@ -2029,12 +2257,33 @@ mod tests {
     }
 
     fn test_config(gateway_base_url: &str, gateway_token: &str) -> CloudModelConfig {
-        config_from(&[
-            ("CF_AI_GATEWAY_TOKEN", gateway_token),
-            ("GEMMA_4_MODEL_ID", "hosted/google-gemma-4-test"),
-            ("CF_AI_GATEWAY_BASE_URL", gateway_base_url),
-        ])
-        .expect("valid test config")
+        test_config_with_endpoints(
+            &format!("{gateway_base_url}{MOCK_GATEWAY_CHAT_PATH}"),
+            &format!("{gateway_base_url}{MOCK_GATEWAY_EMBED_PATH}"),
+            &format!("{gateway_base_url}{MOCK_GATEWAY_RERANK_PATH}"),
+            gateway_token,
+        )
+    }
+
+    fn test_config_with_endpoints(
+        chat_endpoint: &str,
+        embed_endpoint: &str,
+        rerank_endpoint: &str,
+        gateway_token: &str,
+    ) -> CloudModelConfig {
+        CloudModelConfig {
+            gateway_token: gateway_token.to_owned(),
+            chat_endpoint: Url::parse(chat_endpoint).expect("test chat endpoint"),
+            embed_endpoint: Url::parse(embed_endpoint).expect("test embed endpoint"),
+            rerank_endpoint: Url::parse(rerank_endpoint).expect("test rerank endpoint"),
+            chat_model: "hosted/google-gemma-4-test".to_owned(),
+            embed_model: DEFAULT_EMBED_MODEL_ID.to_owned(),
+            rerank_model: DEFAULT_RERANK_MODEL_ID.to_owned(),
+            request_timeout: Duration::from_secs(1),
+            rerank_candidate_top_k: DEFAULT_RERANK_CANDIDATE_TOP_K,
+            rerank_top_n: DEFAULT_RERANK_TOP_N,
+            rerank_batch_size: DEFAULT_RERANK_BATCH_SIZE,
+        }
     }
 
     fn test_client(base_url: &str, gateway_token: &str, timeout: Duration) -> CloudModelClient {
@@ -2058,6 +2307,113 @@ mod tests {
 
     fn minimal_png() -> Vec<u8> {
         b"\x89PNG\r\n\x1a\nmock-png-payload".to_vec()
+    }
+
+    #[tokio::test]
+    async fn telemetry_snapshots_are_content_free_deltas_shared_across_clones() {
+        let (base_url, _state, server) = spawn_mock(MockMode::Success).await;
+        let client = test_client(&base_url, "sensitive-gateway-token", Duration::from_secs(1));
+        let clone = client.clone();
+        let before = client.telemetry_snapshot();
+
+        clone
+            .embed_passage("sensitive passage that must never enter telemetry")
+            .await
+            .expect("embedding request");
+        clone
+            .rerank(
+                "sensitive query",
+                &[RerankPassage::text("sensitive passage")],
+            )
+            .await
+            .expect("rerank request");
+        clone
+            .chat_once("fixed system prompt", "sensitive user content")
+            .await
+            .expect("chat request");
+
+        let delta = client.telemetry_snapshot().delta_since(before);
+        assert_eq!(
+            delta,
+            CloudRequestTelemetry {
+                chat_attempts: 1,
+                embedding_attempts: 1,
+                rerank_attempts: 1,
+            }
+        );
+        let debug = format!("{delta:?}");
+        for forbidden in [
+            "sensitive-gateway-token",
+            &base_url,
+            "sensitive query",
+            "sensitive passage",
+            "authorization",
+        ] {
+            assert!(!debug.contains(forbidden));
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn non_streaming_rag_answer_uses_fixed_gemma_request_contract() {
+        let (base_url, state, server) = spawn_mock(MockMode::Success).await;
+        let client = test_client(&base_url, "gateway-token", Duration::from_secs(1));
+        let answer = client
+            .answer_rag_once(
+                "fixed RAG system prompt",
+                ApiChatContent::Parts(vec![ApiChatContentPart::Text {
+                    text: "[S1] bounded context".to_owned(),
+                }]),
+                "使用者問題",
+            )
+            .await
+            .expect("non-streaming RAG answer");
+        assert_eq!(answer, "ok");
+
+        let requests = state.requests.lock().expect("requests lock");
+        let request = requests.last().expect("recorded chat request");
+        assert_eq!(request.body["model"], client.chat_model());
+        assert_eq!(request.body["stream"], false);
+        assert_eq!(request.body["max_tokens"], 4096);
+        assert_eq!(request.body["temperature"], 0.0);
+        let messages = request.body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["content"][0]["text"], "[S1] bounded context");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "使用者問題");
+        drop(requests);
+        server.abort();
+    }
+
+    #[test]
+    fn evaluation_client_locks_the_reported_retry_policy_without_jitter() {
+        let client = CloudModelClient::new(test_config(TEST_GATEWAY_BASE, "gateway-token"))
+            .expect("cloud client")
+            .with_deterministic_evaluation_retries();
+        assert_eq!(
+            client.evaluation_retry_policies(),
+            CloudRetryPolicies {
+                embedding: CloudRetryPolicy {
+                    max_attempts: 3,
+                    base_backoff_ms: 250,
+                    max_backoff_ms: 2_000,
+                    jitter: false,
+                },
+                rerank: CloudRetryPolicy {
+                    max_attempts: 3,
+                    base_backoff_ms: 250,
+                    max_backoff_ms: 2_000,
+                    jitter: false,
+                },
+                generation: CloudRetryPolicy {
+                    max_attempts: 1,
+                    base_backoff_ms: 0,
+                    max_backoff_ms: 0,
+                    jitter: false,
+                },
+            }
+        );
     }
 
     #[test]
@@ -2239,14 +2595,9 @@ mod tests {
         let chat_url = format!("{base_url}/capabilities/chat");
         let embed_url = format!("{base_url}/capabilities/embed");
         let rerank_url = format!("{base_url}/capabilities/rerank");
-        let config = config_from(&[
-            ("CF_AI_GATEWAY_TOKEN", "gateway-run-token"),
-            ("GEMMA_4_MODEL_ID", "hosted/google-gemma-4-test"),
-            ("CLOUD_CHAT_URL", &chat_url),
-            ("CLOUD_EMBED_URL", &embed_url),
-            ("CLOUD_RERANK_URL", &rerank_url),
-        ])
-        .expect("capability-specific config");
+        let mut config =
+            test_config_with_endpoints(&chat_url, &embed_url, &rerank_url, "gateway-run-token");
+        config.chat_model = "hosted/google-gemma-4-test".to_owned();
         let client = CloudModelClient::new(config).expect("cloud client");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);

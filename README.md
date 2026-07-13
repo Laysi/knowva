@@ -208,6 +208,80 @@ FILES_DIR/{document_id}/
 - 每筆 `RetrievalCandidate` 直接帶 `unit_id`、0-based `unit_index`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、兩路 rank/score、`rrf_score` 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
 - Rerank 每批都嚴格驗證回應筆數、index 唯一且不越界、score finite，再驗證跨批映射。408、429、5xx、transport error 與 timeout 最多嘗試三次；耗盡後以原 RRF top_n 原序回退，且 rerank 欄位保持 null。設定、artifact 或 hosted response contract 錯誤不回退，會回傳可診斷錯誤。Structured log 僅記錄各階段筆數、延遲、fallback 與 model id，不含 query、文件內容、secret 或 base64。
 
+## A/B 評測
+
+評測資料集位於 `backend/eval/fixtures/manifest.json`。在已安裝 proto 的全新 checkout，從 repository root 執行下列命令即可做離線 dry-run；若固定版 Rust 尚未安裝，先執行 `proto install`：
+
+```bash
+cd backend && proto exec rust -- cargo run -- eval --dry-run
+```
+
+dry-run 只讀取並驗證 fixture，不連資料庫、不載入 native converter，也不呼叫雲端模型。它會檢查 dataset schema/version、未知欄位、唯一 document/query/unit id、安全相對路徑、檔案類型與副檔名、SHA-256、非空 license/source、預期 page/unit inventory，以及 query scope、expected source、required facts、answerable/not-found 等契約。所有內附文件都是 deterministic synthetic CC0 fixture，不含客戶或正式環境內容；涵蓋繁中原生 PDF、純影像掃描 PDF、PPTX、表格／圖表 PDF、PNG、Markdown 與純文字，也涵蓋同名文件隔離、相鄰頁干擾、多頁來源、無頁碼文字與 visual-only facts。完整來源與 coverage 見 [backend/eval/fixtures/README.md](backend/eval/fixtures/README.md)。
+
+可重複使用 `--document <document_key>` 與 `--query <query_id>` 選 subset；指定 document 時，只會選取其 `document_scope` 全部落在所選 documents 的 queries。dry-run 的 JSON 會列出實際選到的 documents/queries，未知或空 subset 會 fail closed。例如：
+
+```bash
+cd backend
+proto exec rust -- cargo run -- eval --dry-run \
+  --document markdown-operations \
+  --query markdown-escalation
+```
+
+### 正式 cloud A/B run
+
+Cloud run 是明確 opt-in，會 ingest fixtures 並實際呼叫 embedding、rerank 與 generation endpoint，因此會產生雲端費用；CI 與一般測試絕不自動執行。A 是 dense-only control，B 共用 A 的同一批 dense candidates，再執行 BM25、RRF 與固定 VL reranker。兩組固定使用相同 embedding 與 Gemma 4 generation model id、相同 prompt version、相同 query、相同 context top_n 與 deterministic retry policy，只有 retrieval path 不同。provider 不支援 seed 時會在 run manifest 明確記為 false。為確保 telemetry 可歸因，目前 cloud run 強制 `--concurrency 1`。
+
+執行前必須完成下列事項：
+
+1. 由固定核准者 GitHub login **`Ruisi-Lu`** 先在 `Laysi/outsourcing-ai-km` issue #1 建立一則留言，鎖定 correct-page recall 的 stage、k、minimum，citation precision/recall、answer facts recall，以及 B 相對 A improvement 的實際數值。GitHub API 回傳的 comment author 必須精確為 `Ruisi-Lu`，且 `author_association` 必須為 `OWNER`、`MEMBER` 或 `COLLABORATOR`；login 大小寫不同、其他作者或僅為 `CONTRIBUTOR` 都不會通過。所有 minimum 必須是 0 到 1 的 JSON number，k 必須是正整數；不要由執行者臨時決定門檻。先取得該留言固定的 `https://github.com/Laysi/outsourcing-ai-km/issues/1#issuecomment-<id>` permalink，再把它寫入本機 threshold JSON 的 `issue_comment_url`。下列只是 schema 示意；尖括號欄位必須換成留言已鎖定的真實內容，不能直接執行，也不要填一個看似可通過的假 URL 或猜測值：
+
+   ```text
+   {
+     "schema_version": "1.0",
+     "version": "<owner-locked-version>",
+     "issue_comment_url": "<real-Laysi/outsourcing-ai-km-issue-1-comment-permalink>",
+     "minimums": {
+       "correct_page_recall_at_k": {
+         "stage": "<dense|bm25|rrf|rerank>",
+         "k": <owner-locked-positive-integer>,
+         "minimum": <owner-locked-number-0-to-1>
+       },
+       "citation_precision": <owner-locked-number-0-to-1>,
+       "citation_recall": <owner-locked-number-0-to-1>,
+       "answer_facts_recall": <owner-locked-number-0-to-1>,
+       "b_relative_improvement": <owner-locked-number-0-to-1>
+     }
+   }
+   ```
+
+2. 完成 threshold JSON 的所有欄位與排版後，對**最終檔案 bytes**計算 SHA-256（例如 `sha256sum /absolute/path/to/thresholds.json`；之後只要檔案有任何 byte 改動就必須重算）。由同一位 owner 編輯上一步的同一則留言，加入獨立一行 `threshold_sha256: <sha256sum 輸出的 64 字元雜湊>`；編輯留言不會改變 permalink。runner 會從 GitHub 讀取該固定 URL，並要求 URL 與 hash line 都精確符合本機 snapshot。
+3. 由 PostgreSQL 管理者建立一個名稱以 `km_eval_` 開頭的全新空 database，以及名稱可辨識用途的專用登入角色（例如組織自訂的 `km_eval_runner_<識別碼>`；尖括號內容必須換成真實且唯一的值）。以該角色作為 database owner，讓它能執行 migration；接著在任何 migration 前，以 database owner 連線並執行 `COMMENT ON DATABASE <實際的 km_eval_ database 名稱> IS 'ai-km-evaluation-only:v1';`。最後把使用該專用角色與 database 的連線字串設為 `EVAL_DATABASE_URL`。runner 會檢查 current database 名稱、connect role 身分與精確 marker；它也會拒絕 production `DATABASE_URL`、repository 預設 DB，以及 migration 後含有任何 document 的 DB。不要把 placeholder、示意密碼或假 marker 當成正式設定。
+4. 準備專用且為空的 `EVAL_FILES_DIR`。它不可等於、包含或位於 production `FILES_DIR` 或預設 `./data/files` 之下；失敗後會保留完整隔離 run 供診斷，下次不可重用非空目錄。
+5. 設定 Cloudflare AI Gateway/BYOK 與確認過的 Gemma 4 model id：至少提供 `CF_AI_GATEWAY_BASE_URL`、`CF_AI_GATEWAY_TOKEN`、`GEMMA_4_MODEL_ID`；自訂 route 時另設 `CLOUD_CHAT_URL`、`CLOUD_EMBED_URL`、`CLOUD_RERANK_URL`。確認 gateway 已能存取固定 Nemotron embedding/rerank models。
+6. 主機安裝 Pdfium 與 LibreOffice/CJK 字型，並以 `PDFIUM_LIBRARY_PATH`、`LIBREOFFICE_BIN` 指向可用 binary/library，讓 PDF、掃描頁與 PPTX fixtures 能完整 ingest。
+
+完成上述前置作業後，從 `backend/` 以單一 cloud command 執行完整資料集；以下所有尖括號都必須替換為真實的隔離環境設定：
+
+```bash
+cd backend
+EVAL_DATABASE_URL='postgres://<eval-user>:<password>@<host>:<port>/<brand-new-empty-eval-db>' \
+EVAL_FILES_DIR='/absolute/path/to/empty/eval-files' \
+CF_AI_GATEWAY_BASE_URL='https://gateway.ai.cloudflare.com/v1/<account-id>/<gateway-id>' \
+CF_AI_GATEWAY_TOKEN='<gateway-run-token>' \
+GEMMA_4_MODEL_ID='<confirmed-cloud-gemma-4-model-id>' \
+PDFIUM_LIBRARY_PATH='/absolute/path/to/libpdfium.so' \
+LIBREOFFICE_BIN='/absolute/path/to/libreoffice' \
+proto exec rust -- cargo run -- eval --cloud \
+  --manifest eval/fixtures/manifest.json \
+  --thresholds /absolute/path/to/local/thresholds.json \
+  --output /absolute/path/to/eval-results \
+  --concurrency 1
+```
+
+正式 run 也接受上述 `--document` / `--query` subset flags。成功寫檔後，stdout 會回傳 `passed` 與路徑；每次輸出位於 `<output>/<run_id>/report.json`、`report.csv`、`report.md`、`run-manifest.json`。`passed: true` 只有在至少一組有效 A/B pair，且 correct-page、citation precision/recall、answer facts recall、B 相對 A improvement 全部達到 owner 鎖定門檻時成立；command 本身完成不代表門檻通過。`report.*` 會列出各 query 的 improvement/same/regression/failure、分數與 failure reasons，`run-manifest.json` 則保存 locked model ids、prompt/top_n、dataset/threshold hash、git revision、subsets、retry/latency/request/fallback telemetry 與安全化失敗案例。preflight、native conversion、cloud contract 或 DB isolation 錯誤會以非零狀態停止；已開始寫入後不會局部清掉 DB/files，以免破壞診斷一致性。
+
+Threshold JSON 只應保存在本機安全位置：不得提交本機 threshold 檔、API/gateway key、`.env` secret 或任何 customer/production 文件。fixture 只能使用 repository 內已審核、標明來源與 license 的 synthetic files。
+
 ## 驗證
 
 ```bash

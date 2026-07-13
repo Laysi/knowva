@@ -1,6 +1,7 @@
 pub mod cloud_models;
 mod document_summary;
 mod embedding;
+pub mod evaluation;
 mod ingest;
 mod page_artifacts;
 mod rag_context;
@@ -28,6 +29,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
+pub(crate) const DEFAULT_DATABASE_URL: &str = "postgres://km:km@localhost:5432/km";
+pub(crate) const DEFAULT_FILES_DIR: &str = "./data/files";
+
 #[derive(Clone)]
 pub struct AppState {
     pool: PgPool,
@@ -39,13 +43,17 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("eval") {
+        return evaluation::run_cli(std::env::args().skip(2)).await;
+    }
+
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt::init();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://km:km@localhost:5432/km".to_string());
-    let files_dir = std::env::var("FILES_DIR").unwrap_or_else(|_| "./data/files".to_string());
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
+    let files_dir = std::env::var("FILES_DIR").unwrap_or_else(|_| DEFAULT_FILES_DIR.to_string());
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -119,7 +127,7 @@ fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/documents/{id}", delete(ingest::delete_document))
         .route("/api/chat", post(chat))
-        .layer(DefaultBodyLimit::disable())
+        .layer(DefaultBodyLimit::max(ingest::MULTIPART_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 
@@ -310,7 +318,11 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
             let retrieval = if catalog_query {
                 search::catalog_candidates(&state.pool)
                     .await
-                    .map_err(search::RetrieveError::Candidates)
+                    .map_err(|error| {
+                        search::RetrieveError::Candidates(search::CandidateRetrievalError::Bm25(
+                            error,
+                        ))
+                    })
             } else {
                 tokio::select! {
                     biased;

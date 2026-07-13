@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -223,8 +224,37 @@ impl fmt::Display for RerankStageError {
 impl std::error::Error for RerankStageError {}
 
 #[derive(Debug)]
+pub enum CandidateRetrievalError {
+    DenseModel(CloudModelError),
+    Dense(anyhow::Error),
+    Bm25(anyhow::Error),
+    Configuration(anyhow::Error),
+}
+
+impl CandidateRetrievalError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::DenseModel(error) if error.is_retryable())
+    }
+}
+
+impl fmt::Display for CandidateRetrievalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DenseModel(error) => write!(formatter, "dense model retrieval failed: {error}"),
+            Self::Dense(error) => write!(formatter, "dense database retrieval failed: {error}"),
+            Self::Bm25(error) => write!(formatter, "BM25 database retrieval failed: {error}"),
+            Self::Configuration(error) => {
+                write!(formatter, "retrieval configuration failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CandidateRetrievalError {}
+
+#[derive(Debug)]
 pub enum RetrieveError {
-    Candidates(anyhow::Error),
+    Candidates(CandidateRetrievalError),
     Rerank(RerankStageError),
 }
 
@@ -235,6 +265,13 @@ impl RetrieveError {
                 "知識庫檢索暫時無法使用（錯誤代碼：candidate_retrieval）".to_string()
             }
             Self::Rerank(error) => error.client_message(),
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Candidates(error) => error.is_retryable(),
+            Self::Rerank(error) => error.is_transient(),
         }
     }
 }
@@ -372,23 +409,120 @@ pub async fn catalog_candidates(pool: &sqlx::PgPool) -> anyhow::Result<Vec<Retri
         .collect::<Vec<_>>())
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ObservedRetrievalStage {
+    pub candidates: Vec<RetrievalCandidate>,
+    pub latency_ms: u64,
+    /// Logical backend calls made for this stage. A reused shared stage has zero.
+    pub request_count: u32,
+    pub reused: bool,
+    pub fallback: bool,
+}
+
+impl ObservedRetrievalStage {
+    fn empty() -> Self {
+        Self {
+            candidates: Vec::new(),
+            latency_ms: 0,
+            request_count: 0,
+            reused: false,
+            fallback: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ObservedModeRetrieval {
+    pub dense: ObservedRetrievalStage,
+    pub bm25: ObservedRetrievalStage,
+    pub rrf: ObservedRetrievalStage,
+    pub rerank: ObservedRetrievalStage,
+    pub final_candidates: Vec<RetrievalCandidate>,
+    pub failure: Option<ObservedRetrievalFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedFailureStage {
+    Bm25,
+    Rerank,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedRetrievalFailure {
+    pub stage: ObservedFailureStage,
+    pub code: &'static str,
+    pub safe_message: String,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ObservedAbRetrieval {
+    pub mode_a: ObservedModeRetrieval,
+    pub mode_b: ObservedModeRetrieval,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedRerankOutcome {
+    pub candidates: Vec<RetrievalCandidate>,
+    /// Logical batch calls into the rerank backend. HTTP attempts, including
+    /// retries, are exposed separately by `CloudModelClient` telemetry.
+    pub request_count: u32,
+    pub fallback: bool,
+}
+
 /// Injectable boundary around the two independently testable candidate stages.
 pub trait CandidateRetrievalBackend: Send + Sync {
     fn dense_candidates<'a>(
         &'a self,
         query: &'a str,
         top_k: usize,
-    ) -> BoxFuture<'a, anyhow::Result<Vec<RankedCandidate>>>;
+    ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>>;
 
     fn bm25_candidates<'a>(
         &'a self,
         query: &'a str,
         top_k: usize,
-    ) -> BoxFuture<'a, anyhow::Result<Vec<RankedCandidate>>>;
+    ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>>;
 }
 
 struct PostgresRetrievalBackend<'a> {
     state: &'a AppState,
+}
+
+struct CountingRerankBackend<'a, B: RerankBackend + ?Sized> {
+    inner: &'a B,
+    calls: AtomicU32,
+}
+
+impl<'a, B: RerankBackend + ?Sized> CountingRerankBackend<'a, B> {
+    fn new(inner: &'a B) -> Self {
+        Self {
+            inner,
+            calls: AtomicU32::new(0),
+        }
+    }
+
+    fn request_count(&self) -> u32 {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl<B: RerankBackend + ?Sized> RerankBackend for CountingRerankBackend<'_, B> {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn rerank<'a>(
+        &'a self,
+        query: &'a str,
+        passages: &'a [RerankPassage],
+    ) -> BoxFuture<'a, CloudModelResult<RerankResponse>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.rerank(query, passages)
+    }
 }
 
 impl CandidateRetrievalBackend for PostgresRetrievalBackend<'_> {
@@ -396,11 +530,19 @@ impl CandidateRetrievalBackend for PostgresRetrievalBackend<'_> {
         &'a self,
         query: &'a str,
         top_k: usize,
-    ) -> BoxFuture<'a, anyhow::Result<Vec<RankedCandidate>>> {
+    ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>> {
         Box::pin(async move {
-            let embedding = self.state.models.embed_query(query).await?;
-            let embedding = crate::embedding::to_halfvec(embedding)?;
-            dense_candidates_from_pool(&self.state.pool, &embedding, top_k).await
+            let embedding = self
+                .state
+                .models
+                .embed_query(query)
+                .await
+                .map_err(CandidateRetrievalError::DenseModel)?;
+            let embedding =
+                crate::embedding::to_halfvec(embedding).map_err(CandidateRetrievalError::Dense)?;
+            dense_candidates_from_pool(&self.state.pool, &embedding, top_k)
+                .await
+                .map_err(CandidateRetrievalError::Dense)
         })
     }
 
@@ -408,8 +550,12 @@ impl CandidateRetrievalBackend for PostgresRetrievalBackend<'_> {
         &'a self,
         query: &'a str,
         top_k: usize,
-    ) -> BoxFuture<'a, anyhow::Result<Vec<RankedCandidate>>> {
-        Box::pin(async move { bm25_candidates_from_pool(&self.state.pool, query, top_k).await })
+    ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>> {
+        Box::pin(async move {
+            bm25_candidates_from_pool(&self.state.pool, query, top_k)
+                .await
+                .map_err(CandidateRetrievalError::Bm25)
+        })
     }
 }
 
@@ -604,6 +750,209 @@ pub async fn retrieve_with_backend<B: CandidateRetrievalBackend + ?Sized>(
     Ok(RetrievalDebug { dense, bm25, fused })
 }
 
+/// Evaluates the control and treatment retrieval paths over one shared dense call.
+///
+/// Mode A is strictly dense-only. Its lexical, fusion, and rerank observations are
+/// empty and report zero requests. Mode B reuses the exact dense candidate values,
+/// calls BM25 once, performs deterministic RRF, and invokes only the locked rerank
+/// backend. The reused B dense observation has `request_count = 0`, so summing the
+/// two mode observations still represents the one physical dense backend call.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn retrieve_ab_with_backends<
+    C: CandidateRetrievalBackend + ?Sized,
+    R: RerankBackend + ?Sized,
+>(
+    candidate_backend: &C,
+    rerank_backend: &R,
+    query: &str,
+    artifact_root: &Path,
+    retrieval_config: RetrievalConfig,
+    rerank_config: RerankConfig,
+) -> Result<ObservedAbRetrieval, RetrieveError> {
+    let retrieval_config = RetrievalConfig::new(
+        retrieval_config.dense_top_k,
+        retrieval_config.bm25_top_k,
+        retrieval_config.final_top_n,
+    )
+    .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Configuration(error)))?;
+    let rerank_config = RerankConfig::new(
+        rerank_config.candidate_top_k,
+        rerank_config.top_n,
+        rerank_config.batch_size,
+    )
+    .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Configuration(error)))?;
+
+    let dense_started = Instant::now();
+    let dense = candidate_backend
+        .dense_candidates(query, retrieval_config.dense_top_k)
+        .await
+        .map_err(RetrieveError::Candidates)?;
+    let dense_latency_ms = dense_started.elapsed().as_millis() as u64;
+    let dense_candidates = ranked_route_candidates(&dense, true);
+    let mode_a_final = dense_candidates
+        .iter()
+        .take(rerank_config.top_n)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mode_a_dense = ObservedRetrievalStage {
+        candidates: dense_candidates.clone(),
+        latency_ms: dense_latency_ms,
+        request_count: 1,
+        reused: false,
+        fallback: false,
+    };
+    let mode_b_dense = ObservedRetrievalStage {
+        candidates: dense_candidates,
+        latency_ms: dense_latency_ms,
+        request_count: 0,
+        reused: true,
+        fallback: false,
+    };
+    let mode_a = ObservedModeRetrieval {
+        dense: mode_a_dense,
+        bm25: ObservedRetrievalStage::empty(),
+        rrf: ObservedRetrievalStage::empty(),
+        rerank: ObservedRetrievalStage::empty(),
+        final_candidates: mode_a_final,
+        failure: None,
+    };
+
+    let bm25_started = Instant::now();
+    let bm25 = match candidate_backend
+        .bm25_candidates(query, retrieval_config.bm25_top_k)
+        .await
+    {
+        Ok(candidates) => candidates,
+        Err(_) => {
+            return Ok(ObservedAbRetrieval {
+                mode_a,
+                mode_b: ObservedModeRetrieval {
+                    dense: mode_b_dense,
+                    bm25: ObservedRetrievalStage {
+                        candidates: Vec::new(),
+                        latency_ms: bm25_started.elapsed().as_millis() as u64,
+                        request_count: 1,
+                        reused: false,
+                        fallback: false,
+                    },
+                    rrf: ObservedRetrievalStage::empty(),
+                    rerank: ObservedRetrievalStage::empty(),
+                    final_candidates: Vec::new(),
+                    failure: Some(ObservedRetrievalFailure {
+                        stage: ObservedFailureStage::Bm25,
+                        code: "bm25_failed",
+                        safe_message: "知識庫詞彙檢索暫時無法使用（錯誤代碼：bm25_retrieval）"
+                            .to_owned(),
+                        retryable: false,
+                    }),
+                },
+            });
+        }
+    };
+    let mode_b_bm25 = ObservedRetrievalStage {
+        candidates: ranked_route_candidates(&bm25, false),
+        latency_ms: bm25_started.elapsed().as_millis() as u64,
+        request_count: 1,
+        reused: false,
+        fallback: false,
+    };
+
+    let rrf_started = Instant::now();
+    let fused = reciprocal_rank_fusion(&dense, &bm25, retrieval_config.final_top_n);
+    let mode_b_rrf = ObservedRetrievalStage {
+        candidates: fused.clone(),
+        latency_ms: rrf_started.elapsed().as_millis() as u64,
+        request_count: 0,
+        reused: false,
+        fallback: false,
+    };
+
+    let rerank_started = Instant::now();
+    let counted_reranker = CountingRerankBackend::new(rerank_backend);
+    let reranked = match rerank_candidates_observed(
+        &counted_reranker,
+        query,
+        &fused,
+        artifact_root,
+        rerank_config,
+    )
+    .await
+    {
+        Ok(reranked) => reranked,
+        Err(error) => {
+            return Ok(ObservedAbRetrieval {
+                mode_a,
+                mode_b: ObservedModeRetrieval {
+                    dense: mode_b_dense,
+                    bm25: mode_b_bm25,
+                    rrf: mode_b_rrf,
+                    rerank: ObservedRetrievalStage {
+                        candidates: Vec::new(),
+                        latency_ms: rerank_started.elapsed().as_millis() as u64,
+                        request_count: counted_reranker.request_count(),
+                        reused: false,
+                        fallback: false,
+                    },
+                    final_candidates: Vec::new(),
+                    failure: Some(ObservedRetrievalFailure {
+                        stage: ObservedFailureStage::Rerank,
+                        code: "rerank_failed",
+                        safe_message: error.client_message(),
+                        retryable: error.is_transient(),
+                    }),
+                },
+            });
+        }
+    };
+    let mode_b_rerank = ObservedRetrievalStage {
+        candidates: reranked.candidates.clone(),
+        latency_ms: rerank_started.elapsed().as_millis() as u64,
+        request_count: reranked.request_count,
+        reused: false,
+        fallback: reranked.fallback,
+    };
+
+    Ok(ObservedAbRetrieval {
+        mode_a,
+        mode_b: ObservedModeRetrieval {
+            dense: mode_b_dense,
+            bm25: mode_b_bm25,
+            rrf: mode_b_rrf,
+            rerank: mode_b_rerank,
+            final_candidates: reranked.candidates,
+            failure: None,
+        },
+    })
+}
+
+/// Production-backed entry point for the evaluation runner. The PostgreSQL
+/// backend embeds the query inside its one dense call; the B path only reuses
+/// those candidates and therefore never embeds the query again.
+#[allow(dead_code)]
+pub async fn retrieve_ab_observed(
+    state: &AppState,
+    query: &str,
+) -> Result<ObservedAbRetrieval, RetrieveError> {
+    let rerank_config = RerankConfig::from_client(&state.models);
+    let route_top_k = DEFAULT_DENSE_TOP_K.max(rerank_config.candidate_top_k);
+    let retrieval_config = RetrievalConfig::new(
+        route_top_k,
+        DEFAULT_BM25_TOP_K.max(rerank_config.candidate_top_k),
+        rerank_config.candidate_top_k,
+    )
+    .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Configuration(error)))?;
+    let backend = PostgresRetrievalBackend { state };
+    retrieve_ab_with_backends(
+        &backend,
+        &state.models,
+        query,
+        Path::new(&state.files_dir),
+        retrieval_config,
+        rerank_config,
+    )
+    .await
+}
+
 /// Retrieves a stable RRF pool, reranks it with the locked VL model, and
 /// returns the configured top 3-8 candidates. Exhausted transient model
 /// failures fall back to the unchanged RRF prefix; contract/artifact failures
@@ -619,10 +968,10 @@ pub async fn retrieve(
         DEFAULT_BM25_TOP_K.max(rerank_config.candidate_top_k),
         rerank_config.candidate_top_k,
     )
-    .map_err(RetrieveError::Candidates)?;
+    .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Configuration(error)))?;
     let debug = retrieve_debug(state, query, retrieval_config)
         .await
-        .map_err(RetrieveError::Candidates)?;
+        .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Dense(error)))?;
     rerank_candidates(
         &state.models,
         query,
@@ -652,6 +1001,18 @@ pub async fn rerank_candidates<B: RerankBackend + ?Sized>(
     artifact_root: &Path,
     config: RerankConfig,
 ) -> Result<Vec<RetrievalCandidate>, RerankStageError> {
+    rerank_candidates_observed(backend, query, rrf_candidates, artifact_root, config)
+        .await
+        .map(|outcome| outcome.candidates)
+}
+
+pub async fn rerank_candidates_observed<B: RerankBackend + ?Sized>(
+    backend: &B,
+    query: &str,
+    rrf_candidates: &[RetrievalCandidate],
+    artifact_root: &Path,
+    config: RerankConfig,
+) -> Result<ObservedRerankOutcome, RerankStageError> {
     let started = Instant::now();
     let candidate_count = rrf_candidates.len().min(config.candidate_top_k);
     let result =
@@ -678,7 +1039,7 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
     rrf_candidates: &[RetrievalCandidate],
     artifact_root: &Path,
     config: RerankConfig,
-) -> Result<Vec<RetrievalCandidate>, RerankStageError> {
+) -> Result<ObservedRerankOutcome, RerankStageError> {
     let config = RerankConfig::new(config.candidate_top_k, config.top_n, config.batch_size)
         .map_err(|error| RerankStageError::Mapping(error.to_string()))?;
     let candidates = &rrf_candidates[..rrf_candidates.len().min(config.candidate_top_k)];
@@ -693,7 +1054,11 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
             model_id = backend.model_id(),
             "retrieval stage completed"
         );
-        return Ok(Vec::new());
+        return Ok(ObservedRerankOutcome {
+            candidates: Vec::new(),
+            request_count: 0,
+            fallback: false,
+        });
     }
 
     let started = Instant::now();
@@ -710,10 +1075,12 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
         None
     };
     let mut scores = vec![None; candidates.len()];
+    let mut request_count = 0_u32;
 
     for (batch_index, batch) in candidates.chunks(config.batch_size).enumerate() {
         let batch_started = Instant::now();
         let passages = prepare_rerank_passages(batch, canonical_root.as_deref()).await?;
+        request_count = request_count.saturating_add(1);
         let response = match backend.rerank(query, &passages).await {
             Ok(response) => response,
             Err(error) => {
@@ -741,7 +1108,11 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
                         model_id = backend.model_id(),
                         "retrieval stage completed"
                     );
-                    return Ok(fallback);
+                    return Ok(ObservedRerankOutcome {
+                        candidates: fallback,
+                        request_count,
+                        fallback: true,
+                    });
                 }
                 return Err(stage_error);
             }
@@ -818,7 +1189,11 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
         model_id = backend.model_id(),
         "retrieval stage completed"
     );
-    Ok(reranked)
+    Ok(ObservedRerankOutcome {
+        candidates: reranked,
+        request_count,
+        fallback: false,
+    })
 }
 
 fn validate_batch_rankings(
@@ -961,6 +1336,30 @@ async fn prepare_rerank_passages(
     Ok(passages)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn ranked_route_candidates(candidates: &[RankedCandidate], dense: bool) -> Vec<RetrievalCandidate> {
+    candidates
+        .iter()
+        .map(|ranked| RetrievalCandidate {
+            unit_id: ranked.metadata.unit_id,
+            unit_index: ranked.metadata.unit_index,
+            document_id: ranked.metadata.document_id,
+            filename: ranked.metadata.filename.clone(),
+            kind: ranked.metadata.kind.clone(),
+            page_number: ranked.metadata.page_number,
+            image_path: ranked.metadata.image_path.clone(),
+            content: ranked.metadata.content.clone(),
+            dense_rank: dense.then_some(ranked.rank),
+            dense_score: dense.then_some(ranked.score),
+            bm25_rank: (!dense).then_some(ranked.rank),
+            bm25_score: (!dense).then_some(ranked.score),
+            rrf_score: 0.0,
+            rerank_score: None,
+            rerank_rank: None,
+        })
+        .collect()
+}
+
 fn rrf_fallback(candidates: &[RetrievalCandidate], top_n: usize) -> Vec<RetrievalCandidate> {
     candidates
         .iter()
@@ -1099,6 +1498,14 @@ mod tests {
             rank,
             score,
         }
+    }
+
+    fn text_ranked(unit_id: i64, rank: usize, score: f64) -> RankedCandidate {
+        let mut candidate = ranked(unit_id, rank, score);
+        candidate.metadata.kind = "text".to_owned();
+        candidate.metadata.page_number = None;
+        candidate.metadata.image_path = None;
+        candidate
     }
 
     fn retrieval_candidate(
@@ -1784,7 +2191,7 @@ mod tests {
             &'a self,
             _query: &'a str,
             top_k: usize,
-        ) -> BoxFuture<'a, anyhow::Result<Vec<RankedCandidate>>> {
+        ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>> {
             Box::pin(async move {
                 self.calls
                     .lock()
@@ -1798,12 +2205,81 @@ mod tests {
             &'a self,
             _query: &'a str,
             top_k: usize,
-        ) -> BoxFuture<'a, anyhow::Result<Vec<RankedCandidate>>> {
+        ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>> {
             Box::pin(async move {
                 self.calls.lock().expect("calls lock").push(("bm25", top_k));
                 Ok(self.bm25.clone())
             })
         }
+    }
+
+    struct TransientDenseFailureBackend;
+
+    impl CandidateRetrievalBackend for TransientDenseFailureBackend {
+        fn dense_candidates<'a>(
+            &'a self,
+            _query: &'a str,
+            _top_k: usize,
+        ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>> {
+            Box::pin(async {
+                Err(CandidateRetrievalError::DenseModel(
+                    CloudModelError::Timeout {
+                        operation: ModelOperation::Embed,
+                        timeout: std::time::Duration::from_millis(10),
+                    },
+                ))
+            })
+        }
+
+        fn bm25_candidates<'a>(
+            &'a self,
+            _query: &'a str,
+            _top_k: usize,
+        ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>> {
+            Box::pin(async { panic!("BM25 must not run after dense retrieval fails") })
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_dense_model_failure_is_a_retryable_retrieve_error() {
+        let error = retrieve_ab_with_backends(
+            &TransientDenseFailureBackend,
+            &FakeReranker::new(Vec::new()),
+            "fixture query",
+            Path::new("."),
+            RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
+            RerankConfig::new(3, 3, 8).expect("rerank config"),
+        )
+        .await
+        .expect_err("dense timeout must fail candidate retrieval");
+
+        assert!(matches!(
+            &error,
+            RetrieveError::Candidates(CandidateRetrievalError::DenseModel(
+                CloudModelError::Timeout { .. }
+            ))
+        ));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn database_and_permanent_candidate_errors_are_not_retryable() {
+        let errors = [
+            RetrieveError::Candidates(CandidateRetrievalError::Dense(anyhow::anyhow!(
+                "database unavailable"
+            ))),
+            RetrieveError::Candidates(CandidateRetrievalError::Bm25(anyhow::anyhow!(
+                "database unavailable"
+            ))),
+            RetrieveError::Candidates(CandidateRetrievalError::DenseModel(
+                CloudModelError::InvalidResponse {
+                    operation: ModelOperation::Embed,
+                    message: "malformed embedding response".to_owned(),
+                },
+            )),
+        ];
+
+        assert!(errors.iter().all(|error| !error.is_retryable()));
     }
 
     #[tokio::test]
@@ -1822,5 +2298,174 @@ mod tests {
         let mut calls = backend.calls.lock().expect("calls lock").clone();
         calls.sort_unstable();
         assert_eq!(calls, vec![("bm25", 50), ("dense", 50)]);
+    }
+
+    #[tokio::test]
+    async fn ab_observation_shares_dense_and_keeps_mode_a_strictly_dense_only() {
+        let backend = FakeBackend {
+            dense: vec![text_ranked(1, 1, 0.9), text_ranked(2, 2, 0.8)],
+            bm25: vec![text_ranked(2, 1, 3.0)],
+            calls: Mutex::new(Vec::new()),
+        };
+        let reranker = FakeReranker::new(vec![Ok(RerankResponse {
+            rankings: vec![
+                RerankResult {
+                    index: 0,
+                    logit: 0.2,
+                },
+                RerankResult {
+                    index: 1,
+                    logit: 0.9,
+                },
+            ],
+        })]);
+        let observed = retrieve_ab_with_backends(
+            &backend,
+            &reranker,
+            "fixture query",
+            Path::new("."),
+            RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
+            RerankConfig::new(3, 3, 8).expect("rerank config"),
+        )
+        .await
+        .expect("observed A/B retrieval");
+
+        let calls = backend.calls.lock().expect("calls lock").clone();
+        assert_eq!(
+            calls.iter().filter(|(stage, _)| *stage == "dense").count(),
+            1
+        );
+        assert_eq!(
+            calls.iter().filter(|(stage, _)| *stage == "bm25").count(),
+            1
+        );
+        assert_eq!(reranker.requests.lock().expect("requests lock").len(), 1);
+
+        assert_eq!(observed.mode_a.dense.request_count, 1);
+        assert!(!observed.mode_a.dense.reused);
+        for stage in [
+            &observed.mode_a.bm25,
+            &observed.mode_a.rrf,
+            &observed.mode_a.rerank,
+        ] {
+            assert!(stage.candidates.is_empty());
+            assert_eq!(stage.request_count, 0);
+            assert!(!stage.fallback);
+        }
+        assert_eq!(observed.mode_a.final_candidates.len(), 2);
+        assert_eq!(
+            observed.mode_a.dense.candidates,
+            observed.mode_b.dense.candidates
+        );
+        assert!(observed.mode_b.dense.reused);
+        assert_eq!(observed.mode_b.dense.request_count, 0);
+        assert_eq!(observed.mode_b.bm25.request_count, 1);
+        assert_eq!(observed.mode_b.rrf.request_count, 0);
+        assert_eq!(observed.mode_b.rerank.request_count, 1);
+        assert!(!observed.mode_b.rerank.fallback);
+        assert_eq!(observed.mode_b.final_candidates[0].unit_id, 1);
+    }
+
+    #[tokio::test]
+    async fn observed_ab_marks_transient_rerank_fallback_explicitly() {
+        let backend = FakeBackend {
+            dense: vec![text_ranked(1, 1, 0.9)],
+            bm25: vec![text_ranked(1, 1, 3.0)],
+            calls: Mutex::new(Vec::new()),
+        };
+        let reranker = FakeReranker::new(vec![Err(CloudModelError::Timeout {
+            operation: ModelOperation::Rerank,
+            timeout: std::time::Duration::from_millis(1),
+        })]);
+        let observed = retrieve_ab_with_backends(
+            &backend,
+            &reranker,
+            "fixture query",
+            Path::new("."),
+            RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
+            RerankConfig::new(3, 3, 8).expect("rerank config"),
+        )
+        .await
+        .expect("fallback is a successful observed outcome");
+
+        assert!(observed.mode_b.rerank.fallback);
+        assert_eq!(observed.mode_b.rerank.request_count, 1);
+        assert_eq!(
+            observed.mode_b.final_candidates,
+            observed.mode_b.rrf.candidates
+        );
+        assert!(
+            observed
+                .mode_b
+                .final_candidates
+                .iter()
+                .all(|candidate| candidate.rerank_rank.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_b_rerank_failure_preserves_the_dense_control() {
+        let backend = FakeBackend {
+            dense: vec![text_ranked(1, 1, 0.9)],
+            bm25: vec![text_ranked(1, 1, 3.0)],
+            calls: Mutex::new(Vec::new()),
+        };
+        let reranker = FakeReranker::new(vec![Err(CloudModelError::InvalidResponse {
+            operation: ModelOperation::Rerank,
+            message: "malformed provider payload".to_owned(),
+        })]);
+        let observed = retrieve_ab_with_backends(
+            &backend,
+            &reranker,
+            "fixture query",
+            Path::new("."),
+            RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
+            RerankConfig::new(3, 3, 8).expect("rerank config"),
+        )
+        .await
+        .expect("B failure must remain an observed pair");
+
+        assert!(observed.mode_a.failure.is_none());
+        assert_eq!(observed.mode_a.final_candidates.len(), 1);
+        let failure = observed.mode_b.failure.expect("B failure");
+        assert_eq!(failure.stage, ObservedFailureStage::Rerank);
+        assert_eq!(failure.code, "rerank_failed");
+        assert!(!failure.retryable);
+        assert_eq!(observed.mode_b.rerank.request_count, 1);
+        assert!(observed.mode_b.final_candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_rerank_api_returns_the_observed_candidates_unchanged() {
+        let response = RerankResponse {
+            rankings: vec![RerankResult {
+                index: 0,
+                logit: 0.7,
+            }],
+        };
+        let candidates = reciprocal_rank_fusion(&[text_ranked(1, 1, 0.9)], &[], 3);
+        let legacy = rerank_candidates(
+            &FakeReranker::new(vec![Ok(RerankResponse {
+                rankings: response.rankings.clone(),
+            })]),
+            "fixture query",
+            &candidates,
+            Path::new("."),
+            RerankConfig::new(3, 3, 8).expect("rerank config"),
+        )
+        .await
+        .expect("legacy rerank");
+        let observed = rerank_candidates_observed(
+            &FakeReranker::new(vec![Ok(response)]),
+            "fixture query",
+            &candidates,
+            Path::new("."),
+            RerankConfig::new(3, 3, 8).expect("rerank config"),
+        )
+        .await
+        .expect("observed rerank");
+        assert_eq!(legacy, observed.candidates);
+        assert!(!observed.fallback);
+        assert_eq!(observed.request_count, 1);
     }
 }
