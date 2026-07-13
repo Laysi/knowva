@@ -304,12 +304,19 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
         .find(|message| message.role == "user")
         .map(|message| message.content.clone());
 
+    let catalog_query = last_user_text.as_deref().is_some_and(is_catalog_query);
     let candidates = match last_user_text {
         Some(text) if !text.trim().is_empty() => {
-            let retrieval = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                result = search::retrieve(&state, &text) => result,
+            let retrieval = if catalog_query {
+                search::catalog_candidates(&state.pool)
+                    .await
+                    .map_err(search::RetrieveError::Candidates)
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => return,
+                    result = search::retrieve(&state, &text) => result,
+                }
             };
             match retrieval {
                 Ok(candidates) => candidates,
@@ -337,10 +344,14 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
 
     // Complete artifact validation, image conversion, and payload trimming before the
     // provider request is opened. Structured metadata remains separate from model content.
-    let context = tokio::select! {
-        biased;
-        _ = tx.closed() => return,
-        result = rag_context::build_rag_context(&candidates, Path::new(&state.files_dir)) => result,
+    let context = if catalog_query {
+        rag_context::build_catalog_context(&candidates)
+    } else {
+        tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            result = rag_context::build_rag_context(&candidates, Path::new(&state.files_dir)) => result,
+        }
     };
     let context = match context {
         Ok(context) => context,
@@ -358,13 +369,19 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
             return;
         }
     };
-    let system_prompt = if context.sources.is_empty() {
+    let system_prompt = if catalog_query {
+        rag_context::RAG_CATALOG_SYSTEM_PROMPT
+    } else if context.sources.is_empty() {
         rag_context::RAG_NO_SOURCES_SYSTEM_PROMPT
     } else {
         rag_context::RAG_SYSTEM_PROMPT
     };
     let models = state.models.clone();
-    let context = match models.fit_rag_context_to_request(system_prompt, context, &req.messages) {
+    let context = match if catalog_query {
+        models.fit_catalog_context_to_request(system_prompt, context, &req.messages)
+    } else {
+        models.fit_rag_context_to_request(system_prompt, context, &req.messages)
+    } {
         Ok(context) => context,
         Err(error) => {
             tracing::error!(
@@ -394,6 +411,13 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
     if client_connected {
         let _ = stream_task.await;
     }
+}
+
+fn is_catalog_query(query: &str) -> bool {
+    let query = query.to_lowercase();
+    let scope = ["知識庫", "資料庫", "專案", "全庫", "所有文件", "整個"];
+    let intent = ["主題", "文件", "內容", "涵蓋", "有哪些", "什麼資料"];
+    scope.iter().any(|term| query.contains(term)) && intent.iter().any(|term| query.contains(term))
 }
 
 async fn forward_rag_events(
@@ -661,5 +685,13 @@ mod tests {
             Some(SseEvent::Error { message }) if message.contains("chat_stream_closed")
         ));
         assert!(outer_rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn catalog_query_detection_is_limited_to_whole_kb_intent() {
+        assert!(is_catalog_query("知識庫目前涵蓋哪些主題？"));
+        assert!(is_catalog_query("專案有哪些文件？"));
+        assert!(!is_catalog_query("維護報告涵蓋哪些主題？"));
+        assert!(!is_catalog_query("感測器告警怎麼處理？"));
     }
 }

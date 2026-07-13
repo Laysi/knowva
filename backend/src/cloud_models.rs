@@ -853,6 +853,29 @@ impl CloudModelClient {
         )
     }
 
+    /// Validates a catalog context against the complete request budget without dropping any
+    /// document source. Catalog completeness is more important than silently fitting a prefix.
+    pub fn fit_catalog_context_to_request(
+        &self,
+        system_prompt: &str,
+        context: crate::rag_context::RagContext,
+        messages: &[ChatMessage],
+    ) -> CloudModelResult<crate::rag_context::RagContext> {
+        let request = self.chat_request_with_context(
+            system_prompt.to_string(),
+            context.content.clone(),
+            messages.to_vec(),
+            true,
+            4096,
+            None,
+        );
+        let payload = serialize_chat_request(&request)?;
+        if payload.len() > MAX_CHAT_REQUEST_BYTES {
+            return Err(chat_request_too_large(payload.len(), MAX_CHAT_REQUEST_BYTES));
+        }
+        Ok(context)
+    }
+
     fn fit_rag_context_to_request_with_limit(
         &self,
         system_prompt: &str,
