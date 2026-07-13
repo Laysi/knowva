@@ -20,8 +20,6 @@ export type DocumentRow = {
 
 type DocumentAction = "list" | "upload" | "delete";
 
-export const MAX_UPLOAD_SIZE_BYTES = 50 * 1024 * 1024;
-
 export const SUPPORTED_UPLOAD_EXTENSIONS = [
   ".pdf",
   ".png",
@@ -34,6 +32,10 @@ export const SUPPORTED_UPLOAD_EXTENSIONS = [
   ".md",
   ".markdown",
   ".txt",
+  ".stp",
+  ".step",
+  ".eml",
+  ".msg",
 ] as const;
 
 export const UPLOAD_ACCEPT = SUPPORTED_UPLOAD_EXTENSIONS.join(",");
@@ -95,7 +97,7 @@ export function documentRequestErrorMessage(
   }
 
   if (action === "upload") {
-    if (status === 413) return "檔案超過 50 MiB 上限，請縮小後再試。";
+    if (status === 413) return "檔案太大，伺服器無法處理，請稍後再試。";
     if (status === 400 || status === 415) {
       return "檔案格式不受支援或內容無法解析，請確認檔案後再試。";
     }
@@ -123,10 +125,7 @@ export function validateUploadFile(
   );
 
   if (!hasSupportedExtension) {
-    return "不支援此檔案格式，請選擇 PDF、Office 文件、圖片、TXT 或 MD。";
-  }
-  if (file.size > MAX_UPLOAD_SIZE_BYTES) {
-    return "檔案超過 50 MiB 上限，請縮小檔案後再上傳。";
+    return "不支援此檔案格式，請選擇 PDF、Office、圖片、STP 或 email 檔案。";
   }
   return null;
 }

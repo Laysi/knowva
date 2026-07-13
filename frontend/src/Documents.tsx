@@ -278,7 +278,7 @@ export const Documents = () => {
               {uploading ? "上傳與解析中…" : "拖曳檔案到這裡，或點擊選擇檔案"}
             </strong>
             <span>
-              支援 PDF、DOCX、PPTX、XLSX、PNG/JPEG/WebP、TXT/MD（單檔 ≤ 50 MiB）
+              支援 PDF、DOCX、PPTX、XLSX、PNG/JPEG/WebP、STP、EML/MSG、TXT/MD
             </span>
           </div>
         </div>

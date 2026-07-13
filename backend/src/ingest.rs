@@ -24,8 +24,6 @@ const MAX_ERROR_CHARS: usize = 1_000;
 const EMBEDDING_CONCURRENCY: usize = 4;
 const EMBED_IMAGE_SHORT_SIDE_LIMIT: i32 = 8_192;
 const EMBED_IMAGE_LONG_SIDE_LIMIT: i32 = 16_384;
-pub const MAX_UPLOAD_BYTES: usize = 50 * 1_048_576;
-pub const MULTIPART_BODY_LIMIT_BYTES: usize = MAX_UPLOAD_BYTES + 1_048_576;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DocumentLocks {
@@ -160,12 +158,6 @@ pub async fn upload_document(
         if bytes.is_empty() {
             return Err((StatusCode::BAD_REQUEST, "不可上傳空檔案".to_string()));
         }
-        if bytes.len() > MAX_UPLOAD_BYTES {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("檔案超過 {} MiB 上限", MAX_UPLOAD_BYTES / 1_048_576),
-            ));
-        }
         upload = Some((filename, bytes.to_vec()));
     }
 
@@ -174,7 +166,7 @@ pub async fn upload_document(
     let extension = extension_for(&original_filename)?;
     let source_kind = SourceKind::from_extension(&extension).ok_or((
         StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        "不支援此格式；請上傳 PDF、PNG/JPEG/WebP、DOCX/PPTX/XLSX 或 MD/TXT".to_string(),
+        "不支援此格式；請上傳 PDF、PNG/JPEG/WebP、DOCX/PPTX/XLSX、MD/TXT、STP、EML 或 MSG".to_string(),
     ))?;
     let mime_type = mime_type_for(&extension);
     let id = Uuid::new_v4();
@@ -218,11 +210,7 @@ pub async fn upload_document(
 
 fn multipart_error(error: axum::extract::multipart::MultipartError) -> (StatusCode, String) {
     let status = error.status();
-    let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
-        format!("檔案超過 {} MiB 上限", MAX_UPLOAD_BYTES / 1_048_576)
-    } else {
-        error.body_text()
-    };
+    let message = error.body_text();
     (status, message)
 }
 
@@ -249,6 +237,9 @@ fn mime_type_for(extension: &str) -> &'static str {
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "md" | "markdown" => "text/markdown",
         "txt" => "text/plain",
+        "stp" | "step" => "application/step",
+        "eml" => "message/rfc822",
+        "msg" => "application/vnd.ms-outlook",
         _ => "application/octet-stream",
     }
 }
@@ -501,7 +492,7 @@ async fn prepare_artifact_set(
             converted_pdf_path = Some(final_dir.join("converted.pdf"));
             pages
         }
-        SourceKind::Text => Vec::new(),
+        SourceKind::Text | SourceKind::Binary => Vec::new(),
     };
 
     let pages = rendered_pages
@@ -539,11 +530,25 @@ async fn prepare_artifact_set(
                 })
             })
             .collect::<Result<Vec<_>, ArtifactError>>()?
+    } else if source_kind == SourceKind::Binary {
+        let extension = original_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("file");
+        vec![TextArtifact {
+            document_id,
+            unit_index: 0,
+            content: format!(
+                "工業物聯網媒體檔案：{}。檔案格式：{}。原始檔案已保存，可供後續影音或郵件解析流程使用。",
+                original_path.file_name().and_then(|value| value.to_str()).unwrap_or("unknown"),
+                extension.to_ascii_uppercase()
+            ),
+        }]
     } else {
         Vec::new()
     };
 
-    if source_kind != SourceKind::Text && pages.is_empty() {
+    if source_kind != SourceKind::Text && source_kind != SourceKind::Binary && pages.is_empty() {
         return Err(ArtifactError::new(
             "artifact-validate",
             "轉換結果不含任何頁面",

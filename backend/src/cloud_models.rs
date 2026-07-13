@@ -123,23 +123,6 @@ impl CloudModelConfig {
         // gateway to be authenticated, so the token is mandatory.
         let gateway_token = required_value(&mut get, "CF_AI_GATEWAY_TOKEN")?;
         let chat_model = required_value(&mut get, "GEMMA_4_MODEL_ID")?;
-        if !is_gemma_4_model_id(&chat_model) {
-            return Err(CloudModelConfigError(
-                "GEMMA_4_MODEL_ID must identify a cloud-hosted Gemma 4 model".to_string(),
-            ));
-        }
-
-        let embed_model = optional_value(&mut get, "NEMOTRON_EMBED_MODEL_ID")
-            .unwrap_or_else(|| DEFAULT_EMBED_MODEL_ID.to_string());
-        validate_locked_model("NEMOTRON_EMBED_MODEL_ID", &embed_model, EMBED_MODEL_FAMILY)?;
-
-        let rerank_model = optional_value(&mut get, "NEMOTRON_RERANK_MODEL_ID")
-            .unwrap_or_else(|| DEFAULT_RERANK_MODEL_ID.to_string());
-        validate_locked_model(
-            "NEMOTRON_RERANK_MODEL_ID",
-            &rerank_model,
-            RERANK_MODEL_FAMILY,
-        )?;
 
         let gateway_base = optional_value(&mut get, "CF_AI_GATEWAY_BASE_URL")
             .map(|value| value.trim_end_matches('/').to_string());
@@ -148,22 +131,26 @@ impl CloudModelConfig {
             &mut get,
             "CLOUD_CHAT_URL",
             &gateway_base,
-            &format!("{GATEWAY_NVIDIA_BUILD_SEGMENT}/v1/chat/completions"),
+            &format!("{GATEWAY_NVIDIA_BUILD_SEGMENT}/chat/completions"),
         )?;
         let embed_endpoint = capability_endpoint(
             &mut get,
             "CLOUD_EMBED_URL",
             &gateway_base,
-            &format!("{GATEWAY_NVIDIA_BUILD_SEGMENT}/v1/embeddings"),
+            &format!("{GATEWAY_NVIDIA_BUILD_SEGMENT}/embeddings"),
         )?;
+        let embed_model = optional_value(&mut get, "NEMOTRON_EMBED_MODEL_ID")
+            .unwrap_or_else(|| DEFAULT_EMBED_MODEL_ID.to_string());
         let rerank_endpoint = capability_endpoint(
             &mut get,
             "CLOUD_RERANK_URL",
             &gateway_base,
             &format!(
-                "{GATEWAY_NVIDIA_AI_SEGMENT}/v1/retrieval/nvidia/{RERANK_MODEL_FAMILY}/reranking"
+                "{GATEWAY_NVIDIA_AI_SEGMENT}/retrieval/nvidia/{RERANK_MODEL_FAMILY}/reranking"
             ),
         )?;
+        let rerank_model = optional_value(&mut get, "NEMOTRON_RERANK_MODEL_ID")
+            .unwrap_or_else(|| DEFAULT_RERANK_MODEL_ID.to_string());
 
         let timeout_secs = match optional_value(&mut get, "CLOUD_MODEL_REQUEST_TIMEOUT_SECS") {
             Some(raw) => raw
@@ -314,45 +301,6 @@ fn positive_usize_setting(
             .ok_or_else(|| CloudModelConfigError(format!("{name} must be a positive integer"))),
         None => Ok(default),
     }
-}
-
-fn validate_locked_model(
-    setting: &'static str,
-    model: &str,
-    expected_family: &'static str,
-) -> Result<(), CloudModelConfigError> {
-    if model.rsplit('/').next() == Some(expected_family) {
-        Ok(())
-    } else {
-        Err(CloudModelConfigError(format!(
-            "{setting} must remain locked to {expected_family}"
-        )))
-    }
-}
-
-fn is_gemma_4_model_id(model: &str) -> bool {
-    let normalized = model.to_ascii_lowercase();
-    let bytes = normalized.as_bytes();
-    normalized.match_indices("gemma").any(|(index, _)| {
-        let has_left_boundary = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
-        if !has_left_boundary {
-            return false;
-        }
-
-        let mut cursor = index + "gemma".len();
-        while bytes
-            .get(cursor)
-            .is_some_and(|byte| matches!(byte, b'-' | b'_' | b'.'))
-        {
-            cursor += 1;
-        }
-        if bytes.get(cursor) != Some(&b'4') {
-            return false;
-        }
-        bytes
-            .get(cursor + 1)
-            .is_none_or(|byte| !byte.is_ascii_alphanumeric())
-    })
 }
 
 fn parse_endpoint(name: &'static str, value: &str) -> Result<Url, CloudModelConfigError> {
@@ -602,7 +550,7 @@ pub struct EmbeddingRequest {
     pub encoding_format: String,
     pub embedding_type: String,
     pub input_type: String,
-    pub modality: String,
+    pub modality: Vec<String>,
     pub truncate: String,
 }
 
@@ -1104,8 +1052,10 @@ impl CloudModelClient {
             encoding_format: "float".to_string(),
             embedding_type: "float".to_string(),
             input_type: input_type.to_string(),
-            modality: modality.to_string(),
-            truncate: "END".to_string(),
+            // `input` is a one-item list, so modality must also contain one
+            // item. `text_image` is one multimodal input, not two inputs.
+            modality: vec![modality.to_string()],
+            truncate: "NONE".to_string(),
         };
         let payload_size = serde_json::to_vec(&request)
             .map_err(|_| CloudModelError::InvalidRequest {
@@ -1182,7 +1132,7 @@ impl CloudModelClient {
                 text: query.to_string(),
             },
             passages: passages.to_vec(),
-            truncate: "END".to_string(),
+            truncate: "NONE".to_string(),
         };
         self.send_rerank_request(&request, passages.len()).await
     }
@@ -1810,10 +1760,10 @@ mod tests {
 
     /// Paths produced by the default CF_AI_GATEWAY_BASE_URL derivation when the
     /// mock server address is used as the gateway base.
-    const MOCK_GATEWAY_CHAT_PATH: &str = "/custom-nvidia-build/v1/chat/completions";
-    const MOCK_GATEWAY_EMBED_PATH: &str = "/custom-nvidia-build/v1/embeddings";
+    const MOCK_GATEWAY_CHAT_PATH: &str = "/custom-nvidia-build/chat/completions";
+    const MOCK_GATEWAY_EMBED_PATH: &str = "/custom-nvidia-build/embeddings";
     const MOCK_GATEWAY_RERANK_PATH: &str =
-        "/custom-nvidia-ai/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking";
+        "/custom-nvidia-ai/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking";
     const TEST_GATEWAY_BASE: &str =
         "https://gateway.ai.cloudflare.com/v1/test-account/test-gateway";
 
@@ -2088,54 +2038,33 @@ mod tests {
     }
 
     #[test]
-    fn config_requires_gateway_token_and_explicit_gemma_4_model() {
+    fn config_requires_gateway_token_and_explicit_chat_model() {
         let missing_token = config_from(&[]).expect_err("gateway token must be required");
         assert!(missing_token.to_string().contains("CF_AI_GATEWAY_TOKEN"));
 
-        let missing_model =
-            config_from(&[("CF_AI_GATEWAY_TOKEN", "secret")]).expect_err("model must be required");
-        assert!(missing_model.to_string().contains("GEMMA_4_MODEL_ID"));
-
-        let wrong_family = config_from(&[
+        let config = config_from(&[
             ("CF_AI_GATEWAY_TOKEN", "secret"),
-            ("GEMMA_4_MODEL_ID", "some-other-chat-model"),
+            ("GEMMA_4_MODEL_ID", "google/gemma-4-31b-it"),
+            (
+                "CLOUD_CHAT_URL",
+                "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-build/chat/completions",
+            ),
+            ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
         ])
-        .expect_err("chat family must be locked");
-        assert!(wrong_family.to_string().contains("Gemma 4"));
+        .expect("full provider URL and explicit model should be sufficient");
+        assert_eq!(config.chat_model(), "google/gemma-4-31b-it");
 
-        let misleading_version = config_from(&[
+        let explicit = config_from(&[
             ("CF_AI_GATEWAY_TOKEN", "secret"),
-            ("GEMMA_4_MODEL_ID", "hosted/gemma-14b"),
+            ("GEMMA_4_MODEL_ID", "provider/custom-chat-model"),
+            ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
         ])
-        .expect_err("Gemma 14 must not be mistaken for Gemma 4");
-        assert!(misleading_version.to_string().contains("Gemma 4"));
-
-        for false_positive in [
-            "vendor/notgemma4",
-            "vendor/gemma4fallback",
-            "vendor/gemma-4fallback",
-            "vendor/gemma-4b",
-        ] {
-            let error = config_from(&[
-                ("CF_AI_GATEWAY_TOKEN", "secret"),
-                ("GEMMA_4_MODEL_ID", false_positive),
-            ])
-            .expect_err("Gemma 4 marker must have model-token boundaries");
-            assert!(error.to_string().contains("Gemma 4"));
-        }
-
-        for valid in ["vendor/gemma4-production", "vendor/google.gemma_4.preview"] {
-            config_from(&[
-                ("CF_AI_GATEWAY_TOKEN", "secret"),
-                ("GEMMA_4_MODEL_ID", valid),
-                ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
-            ])
-            .expect("boundary-aware Gemma 4 model id");
-        }
+        .expect("explicit model id remains supported");
+        assert_eq!(explicit.chat_model(), "provider/custom-chat-model");
     }
 
     #[test]
-    fn config_locks_embed_and_rerank_families() {
+    fn config_uses_explicit_embed_and_rerank_models_with_full_urls() {
         let config = config_from(&[
             ("CF_AI_GATEWAY_TOKEN", "gateway-secret"),
             ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
@@ -2148,21 +2077,27 @@ mod tests {
         assert!(!debug.contains("secret"));
         assert!(!debug.contains("authorization"));
 
-        let replacement = config_from(&[
+        let configured = config_from(&[
             ("CF_AI_GATEWAY_TOKEN", "secret"),
             ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
-            ("NEMOTRON_EMBED_MODEL_ID", "vendor/arbitrary-embedder"),
+            ("NEMOTRON_EMBED_MODEL_ID", "vendor/custom-embedder"),
+            ("NEMOTRON_RERANK_MODEL_ID", "vendor/custom-reranker"),
+            (
+                "CLOUD_CHAT_URL",
+                "https://gateway.ai.cloudflare.com/v1/acct/gw/provider/chat/completions",
+            ),
+            (
+                "CLOUD_EMBED_URL",
+                "https://gateway.ai.cloudflare.com/v1/acct/gw/provider/embeddings",
+            ),
+            (
+                "CLOUD_RERANK_URL",
+                "https://gateway.ai.cloudflare.com/v1/acct/gw/provider/reranking",
+            ),
         ])
-        .expect_err("alternative embed family must be rejected");
-        assert!(replacement.to_string().contains(EMBED_MODEL_FAMILY));
-
-        let replacement = config_from(&[
-            ("CF_AI_GATEWAY_TOKEN", "secret"),
-            ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
-            ("NEMOTRON_RERANK_MODEL_ID", "vendor/arbitrary-reranker"),
-        ])
-        .expect_err("alternative rerank family must be rejected");
-        assert!(replacement.to_string().contains(RERANK_MODEL_FAMILY));
+        .expect("full provider routes should select capability models");
+        assert_eq!(configured.embed_model(), "vendor/custom-embedder");
+        assert_eq!(configured.rerank_model(), "vendor/custom-reranker");
     }
 
     #[test]
@@ -2179,15 +2114,15 @@ mod tests {
         .expect("gateway-derived config");
         assert_eq!(
             config.chat_endpoint().as_str(),
-            "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-build/v1/chat/completions"
+            "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-build/chat/completions"
         );
         assert_eq!(
             config.embed_endpoint().as_str(),
-            "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-build/v1/embeddings"
+            "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-build/embeddings"
         );
         assert_eq!(
             config.rerank_endpoint().as_str(),
-            "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-ai/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking"
+            "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-ai/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking"
         );
 
         let missing_base = config_from(&[
@@ -2207,11 +2142,11 @@ mod tests {
             ),
             (
                 "CLOUD_EMBED_URL",
-                "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-build/v1/embeddings",
+                "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-build/embeddings",
             ),
             (
                 "CLOUD_RERANK_URL",
-                "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-ai/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking",
+                "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-ai/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking",
             ),
         ])
         .expect("three full gateway routes do not need the shared base");
@@ -2388,17 +2323,17 @@ mod tests {
             request.body["model"] == DEFAULT_EMBED_MODEL_ID
                 && request.body["embedding_type"] == "float"
                 && request.body["encoding_format"] == "float"
-                && request.body["truncate"] == "END"
+                && request.body["truncate"] == "NONE"
                 && request.body.get("dimensions").is_none()
         }));
         assert_eq!(embeds[0].body["input_type"], "query");
-        assert_eq!(embeds[0].body["modality"], "text");
+        assert_eq!(embeds[0].body["modality"], serde_json::json!(["text"]));
         assert_eq!(embeds[0].body["input"][0], "query");
         assert_eq!(embeds[1].body["input_type"], "passage");
-        assert_eq!(embeds[1].body["modality"], "text");
+        assert_eq!(embeds[1].body["modality"], serde_json::json!(["text"]));
         assert_eq!(embeds[1].body["input"][0], "passage");
         assert_eq!(embeds[2].body["input_type"], "passage");
-        assert_eq!(embeds[2].body["modality"], "image");
+        assert_eq!(embeds[2].body["modality"], serde_json::json!(["image"]));
         let image_input = embeds[2].body["input"][0]
             .as_str()
             .expect("image input string");
@@ -2406,7 +2341,10 @@ mod tests {
         assert!(!image_input.contains("/tmp/"));
         assert!(!image_input.contains("pages/"));
         assert_eq!(embeds[3].body["input_type"], "passage");
-        assert_eq!(embeds[3].body["modality"], "text_image");
+        assert_eq!(
+            embeds[3].body["modality"],
+            serde_json::json!(["text_image"])
+        );
         let mixed_input = embeds[3].body["input"][0]
             .as_str()
             .expect("text_image input string");
@@ -2419,7 +2357,7 @@ mod tests {
             .expect("rerank request");
         assert_eq!(rerank.body["model"], DEFAULT_RERANK_MODEL_ID);
         assert_eq!(rerank.body["query"], serde_json::json!({ "text": "query" }));
-        assert_eq!(rerank.body["truncate"], "END");
+        assert_eq!(rerank.body["truncate"], "NONE");
         let passages = rerank.body["passages"]
             .as_array()
             .expect("rerank passages array");
@@ -2448,7 +2386,7 @@ mod tests {
                     text: "private query".to_string(),
                 },
                 passages: vec![RerankPassage::image(&image).expect("debug passage")],
-                truncate: "END".to_string(),
+                truncate: "NONE".to_string(),
             }
         );
         assert!(!rerank_debug.contains("private query"));

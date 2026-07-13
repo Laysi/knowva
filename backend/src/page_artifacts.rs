@@ -91,6 +91,7 @@ pub enum SourceKind {
     Image,
     Office,
     Text,
+    Binary,
 }
 
 impl SourceKind {
@@ -100,6 +101,8 @@ impl SourceKind {
             "png" | "jpg" | "jpeg" | "webp" => Some(Self::Image),
             "docx" | "pptx" | "xlsx" => Some(Self::Office),
             "md" | "markdown" | "txt" => Some(Self::Text),
+            "stp" | "step" | "eml" => Some(Self::Text),
+            "msg" => Some(Self::Binary),
             _ => None,
         }
     }
@@ -110,6 +113,7 @@ impl SourceKind {
             Self::Image => "image",
             Self::Office => "office",
             Self::Text => "text",
+            Self::Binary => "binary",
         }
     }
 }
@@ -648,6 +652,11 @@ mod tests {
         assert_eq!(SourceKind::from_extension("webp"), Some(SourceKind::Image));
         assert_eq!(SourceKind::from_extension("pptx"), Some(SourceKind::Office));
         assert_eq!(SourceKind::from_extension("md"), Some(SourceKind::Text));
+        assert_eq!(SourceKind::from_extension("stp"), Some(SourceKind::Text));
+        assert_eq!(SourceKind::from_extension("eml"), Some(SourceKind::Text));
+        assert_eq!(SourceKind::from_extension("mp4"), None);
+        assert_eq!(SourceKind::from_extension("avi"), None);
+        assert_eq!(SourceKind::from_extension("msg"), Some(SourceKind::Binary));
         assert_eq!(SourceKind::from_extension("csv"), None);
         assert_eq!(SourceKind::from_extension("html"), None);
         assert_eq!(SourceKind::from_extension("ppt"), None);

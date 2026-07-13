@@ -119,7 +119,7 @@ fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/documents/{id}", delete(ingest::delete_document))
         .route("/api/chat", post(chat))
-        .layer(DefaultBodyLimit::max(ingest::MULTIPART_BODY_LIMIT_BYTES))
+        .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
 
