@@ -1303,9 +1303,8 @@ dependencies = [
 
 [[package]]
 name = "pdfium-render"
-version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e06f0df3ca17554c1b8f31eb17bc77eedbbafa120d35b90b3096fa46b2fdc94c"
+version = "0.9.3"
+source = "git+https://github.com/ajrcarey/pdfium-render.git?rev=4250dbd2bb97dabc0bd25fd4d678925f7845cc32#4250dbd2bb97dabc0bd25fd4d678925f7845cc32"
 dependencies = [
  "bitflags",
  "bytemuck",
