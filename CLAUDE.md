@@ -59,6 +59,16 @@ The backend requires `CF_AI_GATEWAY_TOKEN`, a confirmed `GEMMA_4_MODEL_ID`, and 
 
 Preserve unrelated user changes. Use focused patches, run the backend checks above, and do not push or create a PR unless explicitly requested.
 
+## Project management (GitHub issues)
+
+Keeping the tracking issue in sync is part of done: when issue-tracked work gets blocked, lands a PR/commit, or completes, update the issue in the same session. Operational details (MCP payloads, issue format, gh fallback) live in `.claude/skills/project-board/SKILL.md`, executed through `github-loop-engineering-skill`; this section only sets policy.
+
+- No Projects board is linked to this repo. State is open/closed plus comments, and tracker #1's checklist is the progress overview. Do not attach issues to any board.
+- Agent-discovered follow-ups or tech debt are proposals; create an issue only after the user approves. Do not assign anyone unless asked. Reuse existing labels only; ask before adding a new one.
+- Issue titles and bodies are zh-TW and cold-start readable, following the existing format (#8 for `[MVP-NN]` work, #15 for small issues). Acceptance criteria must be independently verifiable and map to the check commands above.
+- Re-read after every write: a 200 response only proves GitHub accepted the request. Close an issue only with a completion comment carrying validation evidence, and tick its #1 checklist entry when it has one.
+- Before handing back or committing a nontrivial change, run the `codex-review` skill. It is review-only; never auto-apply its findings.
+
 ## Agent routing
 
 Use `deep-reasoner` for architecture, unclear bugs, security, database/API/deployment decisions, design review, and high-risk tradeoffs. It is read-only and should return a decision memo plus implementation plan.
