@@ -25,6 +25,7 @@ use crate::search::{
     ObservedModeRetrieval, ObservedRetrievalFailure, ObservedRetrievalStage, RRF_K,
     RetrievalCandidate, retrieve_ab_observed,
 };
+use crate::storage::{Storage, StorageConfig, ensure_initialization_lock};
 use crate::{AppState, DEFAULT_DATABASE_URL, DEFAULT_FILES_DIR};
 use anyhow::{Context, bail};
 use chrono::{SecondsFormat, Utc};
@@ -645,6 +646,12 @@ impl RunFilesRoot {
         PathBuf::from(format!("/proc/self/fd/{}", self.run_directory.as_raw_fd()))
     }
 
+    // Keeps non-Linux builds compiling; prepare_run_files_root refuses there.
+    #[cfg(not(target_os = "linux"))]
+    fn path(&self) -> PathBuf {
+        unreachable!("evaluation run roots are only created on Linux")
+    }
+
     fn run_id(&self) -> &str {
         &self.run_id
     }
@@ -1222,7 +1229,7 @@ async fn answer_mode(
     query: &str,
     candidates: &[RetrievalCandidate],
 ) -> ModeAnswer {
-    let context = match build_rag_context(candidates, Path::new(&state.files_dir)).await {
+    let context = match build_rag_context(candidates, &state.storage).await {
         Ok(context) => context,
         Err(error) => return failed_answer("rag_context_failed", error.client_message(), false),
     };
@@ -1664,11 +1671,21 @@ async fn bootstrap_and_ingest(
     if document_count != 0 {
         bail!("evaluation database must contain zero documents before a run");
     }
+    // Evaluation always stores files locally under EVAL_FILES_DIR, whatever
+    // STORAGE_BACKEND says, and locks its own isolated database accordingly.
+    let storage_config = StorageConfig::Local {
+        files_dir: run_files_path.clone(),
+    };
+    ensure_initialization_lock(&pool, &storage_config)
+        .await
+        .map_err(|_| anyhow::anyhow!("evaluation storage initialization lock failed"))?;
+    let storage = Storage::local(&run_files_path)
+        .map_err(|_| anyhow::anyhow!("evaluation run file storage could not be opened"))?;
 
     let state = Arc::new(AppState {
         pool,
         models,
-        files_dir: display_path(&run_files_path),
+        storage,
         artifact_config,
         document_locks: DocumentLocks::default(),
     });

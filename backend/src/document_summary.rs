@@ -1,9 +1,9 @@
 use crate::cloud_models::CloudModelClient;
 use crate::page_artifacts::{PageArtifact, TextArtifact};
 use crate::search::RetrievalCandidate;
+use crate::storage::Storage;
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 use uuid::Uuid;
@@ -74,7 +74,7 @@ pub(crate) async fn generate_best_effort(
     document_id: Uuid,
     pages: &[PageArtifact],
     text_units: &[TextArtifact],
-    files_root: &Path,
+    storage: &Storage,
 ) -> Option<DocumentSummary> {
     let started = Instant::now();
     let candidates = summary_candidates(document_id, pages, text_units);
@@ -88,7 +88,7 @@ pub(crate) async fn generate_best_effort(
         return None;
     }
 
-    let context = match crate::rag_context::build_rag_context(&candidates, files_root).await {
+    let context = match crate::rag_context::build_rag_context(&candidates, storage).await {
         Ok(context) => context,
         Err(error) => {
             tracing::warn!(
@@ -484,20 +484,23 @@ mod tests {
 
     #[tokio::test]
     async fn page_summary_prefix_contains_images_for_exactly_first_three_pages() {
-        let root = std::env::temp_dir().join(format!("km-summary-pages-{}", Uuid::new_v4()));
+        let storage = Storage::memory();
         let document_id = Uuid::new_v4();
-        let pages_dir = root.join(document_id.to_string()).join("pages");
-        std::fs::create_dir_all(&pages_dir).expect("create summary pages directory");
         let mut pages = Vec::new();
         for page_number in 1..=4 {
-            let image_path = pages_dir.join(format!("{page_number:04}.png"));
+            let image_path = format!("{document_id}/artifacts-run/pages/{page_number:04}.png");
+            let mut png = Vec::new();
             image::RgbImage::from_pixel(8, 8, image::Rgb([page_number as u8, 20, 40]))
-                .save(&image_path)
-                .expect("write summary page fixture");
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .expect("encode summary page fixture");
+            storage
+                .put(&image_path, png)
+                .await
+                .expect("store summary page fixture");
             pages.push(PageArtifact {
                 document_id,
                 page_number,
-                image_path: image_path.to_string_lossy().into_owned(),
+                image_path,
                 width: 8,
                 height: 8,
                 extracted_text: Some(format!("page {page_number}")),
@@ -506,7 +509,7 @@ mod tests {
 
         let candidates = summary_candidates(document_id, &pages, &[]);
         assert_eq!(candidates.len(), MAX_SUMMARY_SOURCE_UNITS);
-        let context = crate::rag_context::build_rag_context(&candidates, &root)
+        let context = crate::rag_context::build_rag_context(&candidates, &storage)
             .await
             .expect("build bounded page summary context");
         assert_eq!(context.sources.len(), MAX_SUMMARY_SOURCE_UNITS);
@@ -532,7 +535,5 @@ mod tests {
                 .count(),
             MAX_SUMMARY_SOURCE_UNITS
         );
-
-        std::fs::remove_dir_all(root).expect("remove summary page fixtures");
     }
 }

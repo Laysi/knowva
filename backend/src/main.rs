@@ -6,6 +6,7 @@ mod ingest;
 mod page_artifacts;
 mod rag_context;
 mod search;
+mod storage;
 
 #[cfg(test)]
 mod database_tests;
@@ -36,7 +37,7 @@ pub(crate) const DEFAULT_FILES_DIR: &str = "./data/files";
 pub struct AppState {
     pool: PgPool,
     models: CloudModelClient,
-    files_dir: String,
+    storage: storage::Storage,
     artifact_config: page_artifacts::ArtifactConfig,
     document_locks: ingest::DocumentLocks,
 }
@@ -53,7 +54,6 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
-    let files_dir = std::env::var("FILES_DIR").unwrap_or_else(|_| DEFAULT_FILES_DIR.to_string());
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -61,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
 
     let model_config = CloudModelConfig::from_env()?;
     let artifact_config = page_artifacts::ArtifactConfig::from_env()?;
+    let storage_config = storage::StorageConfig::from_env()?;
     tracing::info!(
         chat_model = model_config.chat_model(),
         embed_model = model_config.embed_model(),
@@ -81,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         "document artifact converter configured"
     );
     let models = CloudModelClient::new(model_config)?;
+    let storage = storage_config.open().await?;
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -88,11 +90,12 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     sqlx::migrate!().run(&pool).await?;
+    storage::ensure_initialization_lock(&pool, &storage_config).await?;
 
     let state = Arc::new(AppState {
         pool,
         models,
-        files_dir,
+        storage,
         artifact_config,
         document_locks: ingest::DocumentLocks::default(),
     });
@@ -362,7 +365,7 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
         tokio::select! {
             biased;
             _ = tx.closed() => return,
-            result = rag_context::build_rag_context(&candidates, Path::new(&state.files_dir)) => result,
+            result = rag_context::build_rag_context(&candidates, &state.storage) => result,
         }
     };
     let context = match context {

@@ -3,6 +3,7 @@ use crate::cloud_models::{CloudModelClient, CloudModelError, MAX_EMBED_IMAGE_BYT
 use crate::page_artifacts::{
     ArtifactError, ArtifactManifest, PageArtifact, SourceKind, TextArtifact,
 };
+use crate::storage::{IO_CONCURRENCY, Storage};
 use axum::Json;
 use axum::extract::{Multipart, Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -10,7 +11,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use pgvector::HalfVector;
 use serde::Serialize;
 use sqlx::{Postgres, Transaction};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
@@ -107,18 +108,46 @@ impl ProcessOptions {
 
 struct CreatedDocument {
     id: Uuid,
-    storage_path: PathBuf,
+    storage_key: String,
     source_kind: SourceKind,
 }
 
+/// A converted run in local scratch space plus the object keys it will be
+/// published under. Nothing here is visible until `persist_artifact_set` commits.
 #[derive(Debug)]
 struct PreparedArtifactSet {
     source_kind: SourceKind,
-    artifact_dir: PathBuf,
-    manifest_path: PathBuf,
-    converted_pdf_path: Option<PathBuf>,
+    artifact_dir: String,
+    manifest_path: String,
+    converted_pdf_path: Option<String>,
     pages: Vec<PageArtifact>,
     text_units: Vec<TextArtifact>,
+    files: Vec<(PathBuf, String)>,
+    manifest: Vec<u8>,
+}
+
+/// Private local directory for Pdfium/LibreOffice, removed on every exit path.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn create(run_id: Uuid) -> std::io::Result<Self> {
+        let path = std::env::temp_dir().join(format!("km-ingest-{run_id}"));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&path)?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -223,7 +252,7 @@ pub async fn upload_document(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        process_document(state_clone, id, created.storage_path, created.source_kind).await;
+        process_document(state_clone, id, created.storage_key, created.source_kind).await;
     });
 
     Ok((
@@ -258,11 +287,12 @@ async fn create_document(
     ))?;
     let mime_type = mime_type_for(&extension);
     let id = Uuid::new_v4();
-    let files_dir = PathBuf::from(&state.files_dir);
-    let storage_path = publish_original(&files_dir, id, &extension, file_bytes)
+    let storage_key = format!("{id}/original.{extension}");
+    state
+        .storage
+        .put(&storage_key, file_bytes.to_vec())
         .await
-        .map_err(internal_error)?;
-    let storage_path_string = path_string(&storage_path);
+        .map_err(|error| internal_error(format!("original-storage: 原檔寫入失敗: {error}")))?;
 
     let insert_result = sqlx::query(
         "INSERT INTO documents \
@@ -271,18 +301,21 @@ async fn create_document(
     )
     .bind(id)
     .bind(original_filename)
-    .bind(&storage_path_string)
+    .bind(&storage_key)
     .bind(mime_type)
     .execute(&state.pool)
     .await;
     if let Err(error) = insert_result {
-        let _ = remove_document_tree(&files_dir, id).await;
+        // A lost reply can hide a committed INSERT whose row references the original.
+        if !document_exists(state, id).await {
+            let _ = state.storage.delete_prefix(&id.to_string()).await;
+        }
         return Err(internal_error(error));
     }
 
     Ok(CreatedDocument {
         id,
-        storage_path,
+        storage_key,
         source_kind,
     })
 }
@@ -322,7 +355,7 @@ pub async fn ingest_evaluation_bytes(
     process_document_with_options(
         state.clone(),
         created.id,
-        created.storage_path,
+        created.storage_key,
         created.source_kind,
         ProcessOptions::evaluation(),
     )
@@ -394,43 +427,6 @@ fn mime_type_for(extension: &str) -> &'static str {
     }
 }
 
-async fn publish_original(
-    files_dir: &Path,
-    document_id: Uuid,
-    extension: &str,
-    bytes: &[u8],
-) -> Result<PathBuf, ArtifactError> {
-    tokio::fs::create_dir_all(files_dir)
-        .await
-        .map_err(|error| {
-            ArtifactError::new("original-storage", format!("無法建立檔案目錄: {error}"))
-        })?;
-    let document_dir = files_dir.join(document_id.to_string());
-    if tokio::fs::try_exists(&document_dir).await.unwrap_or(false) {
-        return Err(ArtifactError::new(
-            "original-storage",
-            "文件儲存目錄已存在，請重試",
-        ));
-    }
-
-    let staging_dir = files_dir.join(format!(".{document_id}.upload-{}.tmp", Uuid::new_v4()));
-    let original_path = staging_dir.join(format!("original.{extension}"));
-    let result = async {
-        tokio::fs::create_dir(&staging_dir).await?;
-        tokio::fs::write(&original_path, bytes).await?;
-        tokio::fs::rename(&staging_dir, &document_dir).await
-    }
-    .await;
-    if let Err(error) = result {
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        return Err(ArtifactError::new(
-            "original-storage",
-            format!("原檔寫入失敗: {error}"),
-        ));
-    }
-    Ok(document_dir.join(format!("original.{extension}")))
-}
-
 async fn set_failed(state: &AppState, id: Uuid, error: &str) {
     let snippet = bounded_error(error);
     if let Err(db_error) = sqlx::query(
@@ -484,13 +480,13 @@ fn bounded_error(error: &str) -> String {
 pub(crate) async fn process_document(
     state: Arc<AppState>,
     id: Uuid,
-    storage_path: PathBuf,
+    storage_key: String,
     source_kind: SourceKind,
 ) {
     process_document_with_options(
         state,
         id,
-        storage_path,
+        storage_key,
         source_kind,
         ProcessOptions::production(),
     )
@@ -500,18 +496,12 @@ pub(crate) async fn process_document(
 async fn process_document_with_options(
     state: Arc<AppState>,
     id: Uuid,
-    storage_path: PathBuf,
+    storage_key: String,
     source_kind: SourceKind,
     options: ProcessOptions,
 ) {
     let _guard = state.document_locks.lock(id).await;
-    let document_dir = match storage_path.parent() {
-        Some(path) => path.to_owned(),
-        None => {
-            set_failed(&state, id, "original-storage: 原檔路徑缺少文件目錄").await;
-            return;
-        }
-    };
+    let document_prefix = id.to_string();
 
     let marked_processing = sqlx::query(
         "UPDATE documents \
@@ -524,7 +514,7 @@ async fn process_document_with_options(
     .await;
     match marked_processing {
         Ok(result) if result.rows_affected() == 0 => {
-            let _ = tokio::fs::remove_dir_all(&document_dir).await;
+            let _ = state.storage.delete_prefix(&document_prefix).await;
             return;
         }
         Ok(_) => {}
@@ -540,80 +530,105 @@ async fn process_document_with_options(
     }
 
     let run_id = Uuid::new_v4();
-    let temporary_dir = document_dir.join(format!(".artifacts-{run_id}.tmp"));
-    let artifact_dir = document_dir.join(format!("artifacts-{run_id}"));
-    if let Err(error) = tokio::fs::create_dir(&temporary_dir).await {
-        set_failed(
-            &state,
-            id,
-            &format!("artifact-stage: 無法建立暫存目錄: {error}"),
-        )
-        .await;
-        return;
-    }
+    let run_name = format!("artifacts-{run_id}");
+    let run_prefix = format!("{id}/{run_name}");
+    // Pdfium and LibreOffice only read local files, so conversion always runs in
+    // a scratch directory; dropping the guard deletes it on every exit path.
+    let scratch = match ScratchDir::create(run_id) {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            set_failed(
+                &state,
+                id,
+                &format!("artifact-stage: 無法建立暫存目錄: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
 
     let prepared = prepare_artifact_set(
         &state,
         id,
         source_kind,
-        &storage_path,
-        &temporary_dir,
-        &artifact_dir,
+        &storage_key,
+        scratch.path(),
+        &run_prefix,
     )
     .await;
-    let mut prepared = match prepared {
+    let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            let _ = tokio::fs::remove_dir_all(&temporary_dir).await;
             set_failed(&state, id, &error.to_string()).await;
             return;
         }
     };
 
     if !document_exists(&state, id).await {
-        let _ = tokio::fs::remove_dir_all(&temporary_dir).await;
-        let _ = tokio::fs::remove_dir_all(&document_dir).await;
+        let _ = state.storage.delete_prefix(&document_prefix).await;
         return;
     }
-    if let Err(error) = tokio::fs::rename(&temporary_dir, &artifact_dir).await {
-        let _ = tokio::fs::remove_dir_all(&temporary_dir).await;
-        set_failed(
-            &state,
-            id,
-            &format!("artifact-publish: 無法發布完整 artifact set: {error}"),
-        )
-        .await;
+    // Objects under the fresh run prefix stay unreferenced until the DB commit in
+    // persist_artifact_set, the only publication switch. Any failure before that
+    // commit removes this run again, so no DB row can point at a partial set.
+    if let Err(error) = upload_artifact_set(&state.storage, &prepared).await {
+        let _ = state.storage.delete_prefix(&run_prefix).await;
+        set_failed(&state, id, &error.to_string()).await;
         return;
     }
-    prepared.artifact_dir = artifact_dir.clone();
+    drop(scratch);
 
     if let Err(error) = persist_artifact_set(&state, id, &prepared).await {
-        let _ = tokio::fs::remove_dir_all(&artifact_dir).await;
-        if document_exists(&state, id).await {
-            set_failed(&state, id, &error.to_string()).await;
-        } else {
-            let _ = tokio::fs::remove_dir_all(&document_dir).await;
+        // A lost COMMIT reply can hide a successful publish, so re-read what the DB
+        // references before deleting. When the DB cannot answer, keep the objects:
+        // an unreferenced run is harmless, a row pointing at deleted objects is not.
+        let published: Result<Option<Option<String>>, sqlx::Error> = sqlx::query_scalar(
+            "SELECT a.artifact_dir FROM documents d \
+             LEFT JOIN document_artifact_sets a ON a.document_id = d.id \
+             WHERE d.id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await;
+        match published {
+            Ok(None) => {
+                let _ = state.storage.delete_prefix(&document_prefix).await;
+                return;
+            }
+            Ok(Some(artifact_dir)) if artifact_dir.as_deref() != Some(run_prefix.as_str()) => {
+                let _ = state.storage.delete_prefix(&run_prefix).await;
+            }
+            Ok(Some(_)) => {}
+            Err(db_error) => tracing::warn!(
+                document_id = %id,
+                "cannot confirm artifact publication; keeping run objects: {db_error}"
+            ),
         }
+        set_failed(&state, id, &error.to_string()).await;
         return;
     }
 
-    cleanup_obsolete_artifact_runs(&document_dir, &artifact_dir).await;
-
-    let embedded_units =
-        match embed_artifact_units(&state.models, &prepared.pages, &prepared.text_units).await {
-            Ok(units) => units,
-            Err(error) => {
-                set_embedding_failed(&state, id, &error).await;
-                return;
-            }
-        };
+    let embedded_units = match embed_artifact_units(
+        &state.models,
+        &state.storage,
+        &prepared.pages,
+        &prepared.text_units,
+    )
+    .await
+    {
+        Ok(units) => units,
+        Err(error) => {
+            set_embedding_failed(&state, id, &error).await;
+            return;
+        }
+    };
     let metadata = if options.generate_summary {
         crate::document_summary::generate_best_effort(
             &state.models,
             id,
             &prepared.pages,
             &prepared.text_units,
-            Path::new(&state.files_dir),
+            &state.storage,
         )
         .await
     } else {
@@ -622,61 +637,82 @@ async fn process_document_with_options(
     if let Err(error) = persist_embedded_units(&state, id, &embedded_units, metadata.as_ref()).await
     {
         set_embedding_failed(&state, id, &error).await;
+        return;
     }
+    // Superseded runs can still back the previous document_units until the
+    // promotion above commits, so they are removed only after it.
+    cleanup_obsolete_artifact_runs(&state.storage, id, &run_name).await;
 }
 
 async fn prepare_artifact_set(
     state: &AppState,
     document_id: Uuid,
     source_kind: SourceKind,
-    original_path: &Path,
-    temporary_dir: &Path,
-    final_dir: &Path,
+    storage_key: &str,
+    scratch: &Path,
+    run_prefix: &str,
 ) -> Result<PreparedArtifactSet, ArtifactError> {
+    let original = state
+        .storage
+        .get(document_id, storage_key, MAX_UPLOAD_BYTES)
+        .await
+        .map_err(|error| ArtifactError::new("original-read", format!("無法讀取原檔: {error}")))?;
+    let original_path = scratch.join(storage_key.rsplit('/').next().unwrap_or("original"));
+    let original_path = original_path.as_path();
+    let run_dir = scratch.join("run");
+    let staged = async {
+        tokio::fs::write(original_path, original).await?;
+        tokio::fs::create_dir(&run_dir).await
+    };
+    staged.await.map_err(|error| {
+        ArtifactError::new("artifact-stage", format!("無法寫入暫存區: {error}"))
+    })?;
+
+    let mut files = Vec::new();
     let mut converted_pdf_path = None;
     let rendered_pages = match source_kind {
         SourceKind::Pdf => {
-            crate::page_artifacts::render_pdf(&state.artifact_config, original_path, temporary_dir)
+            crate::page_artifacts::render_pdf(&state.artifact_config, original_path, &run_dir)
                 .await?
         }
         SourceKind::Image => {
-            crate::page_artifacts::normalize_image(
-                &state.artifact_config,
-                original_path,
-                temporary_dir,
-            )
-            .await?
+            crate::page_artifacts::normalize_image(&state.artifact_config, original_path, &run_dir)
+                .await?
         }
         SourceKind::Office => {
             let temporary_pdf = crate::page_artifacts::convert_office_to_pdf(
                 &state.artifact_config,
                 original_path,
-                temporary_dir,
+                &run_dir,
             )
             .await?;
-            let pages = crate::page_artifacts::render_pdf(
-                &state.artifact_config,
-                &temporary_pdf,
-                temporary_dir,
-            )
-            .await?;
-            converted_pdf_path = Some(final_dir.join("converted.pdf"));
+            let pages =
+                crate::page_artifacts::render_pdf(&state.artifact_config, &temporary_pdf, &run_dir)
+                    .await?;
+            let key = format!("{run_prefix}/converted.pdf");
+            files.push((temporary_pdf, key.clone()));
+            converted_pdf_path = Some(key);
             pages
         }
         SourceKind::Text | SourceKind::Binary => Vec::new(),
     };
 
-    let pages = rendered_pages
-        .into_iter()
-        .map(|page| PageArtifact {
+    let mut pages = Vec::with_capacity(rendered_pages.len());
+    for page in rendered_pages {
+        let key = format!(
+            "{run_prefix}/{}",
+            page.relative_image_path.to_string_lossy()
+        );
+        files.push((run_dir.join(&page.relative_image_path), key.clone()));
+        pages.push(PageArtifact {
             document_id,
             page_number: page.page_number,
-            image_path: path_string(&final_dir.join(page.relative_image_path)),
+            image_path: key,
             width: page.width,
             height: page.height,
             extracted_text: page.extracted_text,
-        })
-        .collect::<Vec<_>>();
+        });
+    }
 
     let text_units = if source_kind == SourceKind::Text {
         let text = tokio::fs::read_to_string(original_path)
@@ -711,7 +747,10 @@ async fn prepare_artifact_set(
             unit_index: 0,
             content: format!(
                 "工業物聯網媒體檔案：{}。檔案格式：{}。原始檔案已保存，可供後續影音或郵件解析流程使用。",
-                original_path.file_name().and_then(|value| value.to_str()).unwrap_or("unknown"),
+                original_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("unknown"),
                 extension.to_ascii_uppercase()
             ),
         }]
@@ -727,38 +766,61 @@ async fn prepare_artifact_set(
     }
     validate_page_sequence(&pages)?;
 
-    let manifest_path = final_dir.join("manifest.json");
     let manifest = ArtifactManifest {
         document_id,
         source_kind,
-        original_path: path_string(original_path),
-        converted_pdf_path: converted_pdf_path.as_ref().map(|path| path_string(path)),
+        original_path: storage_key.to_owned(),
+        converted_pdf_path: converted_pdf_path.clone(),
         pages: pages.clone(),
         text_units: text_units.clone(),
     };
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+    let manifest = serde_json::to_vec_pretty(&manifest).map_err(|error| {
         ArtifactError::new(
             "artifact-manifest",
             format!("無法序列化 artifact manifest: {error}"),
         )
     })?;
-    tokio::fs::write(temporary_dir.join("manifest.json"), manifest_bytes)
-        .await
-        .map_err(|error| {
-            ArtifactError::new(
-                "artifact-manifest",
-                format!("無法寫入 artifact manifest: {error}"),
-            )
-        })?;
 
     Ok(PreparedArtifactSet {
         source_kind,
-        artifact_dir: final_dir.to_owned(),
-        manifest_path,
+        artifact_dir: run_prefix.to_owned(),
+        manifest_path: format!("{run_prefix}/manifest.json"),
         converted_pdf_path,
         pages,
         text_units,
+        files,
+        manifest,
     })
+}
+
+async fn upload_artifact_set(
+    storage: &Storage,
+    prepared: &PreparedArtifactSet,
+) -> Result<(), ArtifactError> {
+    fn publish_error(error: impl fmt::Display) -> ArtifactError {
+        ArtifactError::new(
+            "artifact-publish",
+            format!("無法上傳完整 artifact set: {error}"),
+        )
+    }
+
+    let uploads = prepared
+        .files
+        .iter()
+        .map(|(local_path, key)| async move {
+            let bytes = tokio::fs::read(local_path).await.map_err(publish_error)?;
+            storage.put(key, bytes).await.map_err(publish_error)
+        })
+        .collect::<Vec<_>>();
+    stream::iter(uploads)
+        .buffer_unordered(IO_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
+    // Uploaded last, so an existing manifest always describes a complete run.
+    storage
+        .put(&prepared.manifest_path, prepared.manifest.clone())
+        .await
+        .map_err(publish_error)
 }
 
 fn validate_page_sequence(pages: &[PageArtifact]) -> Result<(), ArtifactError> {
@@ -815,14 +877,9 @@ async fn persist_artifact_set(
     )
     .bind(document_id)
     .bind(prepared.source_kind.as_str())
-    .bind(path_string(&prepared.artifact_dir))
-    .bind(path_string(&prepared.manifest_path))
-    .bind(
-        prepared
-            .converted_pdf_path
-            .as_ref()
-            .map(|path| path_string(path)),
-    )
+    .bind(&prepared.artifact_dir)
+    .bind(&prepared.manifest_path)
+    .bind(&prepared.converted_pdf_path)
     .execute(&mut *transaction)
     .await
     .map_err(artifact_db_error)?;
@@ -839,6 +896,7 @@ async fn persist_artifact_set(
 
 async fn embed_artifact_units(
     models: &CloudModelClient,
+    storage: &Storage,
     pages: &[PageArtifact],
     text_units: &[TextArtifact],
 ) -> Result<Vec<EmbeddedUnit>, EmbeddingStageError> {
@@ -856,7 +914,7 @@ async fn embed_artifact_units(
     }
 
     let mut embedded = stream::iter(pending)
-        .map(|unit| embed_artifact_unit(models, unit))
+        .map(|unit| embed_artifact_unit(models, storage, unit))
         .buffer_unordered(EMBEDDING_CONCURRENCY)
         .try_collect::<Vec<_>>()
         .await?;
@@ -866,6 +924,7 @@ async fn embed_artifact_units(
 
 async fn embed_artifact_unit(
     models: &CloudModelClient,
+    storage: &Storage,
     unit: PendingEmbeddingUnit,
 ) -> Result<EmbeddedUnit, EmbeddingStageError> {
     match unit {
@@ -903,7 +962,8 @@ async fn embed_artifact_unit(
                 )
             })?;
             validate_embed_image_dimensions(&page, unit_index)?;
-            let metadata = tokio::fs::metadata(&page.image_path)
+            let image = storage
+                .get(page.document_id, &page.image_path, MAX_EMBED_IMAGE_BYTES)
                 .await
                 .map_err(|error| {
                     EmbeddingStageError::unit(
@@ -911,39 +971,9 @@ async fn embed_artifact_unit(
                         "page",
                         unit_index,
                         Some(page.page_number),
-                        format!("cannot inspect page image artifact: {error}"),
+                        format!("cannot read page image artifact: {error}"),
                     )
                 })?;
-            if !metadata.is_file() {
-                return Err(EmbeddingStageError::unit(
-                    "embedding-image-read",
-                    "page",
-                    unit_index,
-                    Some(page.page_number),
-                    "page image artifact is not a regular file",
-                ));
-            }
-            if metadata.len() > MAX_EMBED_IMAGE_BYTES as u64 {
-                return Err(EmbeddingStageError::unit(
-                    "embedding-image-read",
-                    "page",
-                    unit_index,
-                    Some(page.page_number),
-                    format!(
-                        "page image is {} bytes; maximum is {MAX_EMBED_IMAGE_BYTES} bytes",
-                        metadata.len()
-                    ),
-                ));
-            }
-            let image = tokio::fs::read(&page.image_path).await.map_err(|error| {
-                EmbeddingStageError::unit(
-                    "embedding-image-read",
-                    "page",
-                    unit_index,
-                    Some(page.page_number),
-                    format!("cannot read page image artifact: {error}"),
-                )
-            })?;
             let embedding = match page
                 .extracted_text
                 .as_deref()
@@ -1138,7 +1168,7 @@ pub(crate) async fn embed_published_artifacts_for_test(
     pages: &[PageArtifact],
     text_units: &[TextArtifact],
 ) -> Result<(), String> {
-    let units = embed_artifact_units(&state.models, pages, text_units)
+    let units = embed_artifact_units(&state.models, &state.storage, pages, text_units)
         .await
         .map_err(|error| error.to_string())?;
     persist_embedded_units(state, document_id, &units, None)
@@ -1195,31 +1225,34 @@ fn artifact_db_error(error: sqlx::Error) -> ArtifactError {
     ArtifactError::new("artifact-db", format!("artifact 寫入失敗: {error}"))
 }
 
+/// `false` only when the row is confirmed gone: callers delete every object of the
+/// document on `false`, so an unanswerable database must never read as deleted.
 async fn document_exists(state: &AppState, document_id: Uuid) -> bool {
     sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM documents WHERE id = $1)")
         .bind(document_id)
         .fetch_one(&state.pool)
         .await
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
-async fn cleanup_obsolete_artifact_runs(document_dir: &Path, active_dir: &Path) {
-    let active_name = active_dir.file_name();
-    let Ok(mut entries) = tokio::fs::read_dir(document_dir).await else {
-        return;
+/// Runs after the publishing commit only: removes superseded runs and runs left
+/// by an interrupted process. Failures are logged; DELETE retries them later.
+async fn cleanup_obsolete_artifact_runs(storage: &Storage, document_id: Uuid, active_run: &str) {
+    let keys = match storage.list(&document_id.to_string()).await {
+        Ok(keys) => keys,
+        Err(error) => {
+            tracing::warn!(%document_id, "failed to list stale artifact runs: {error}");
+            return;
+        }
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let Some(name_text) = name.to_str() else {
-            continue;
-        };
-        let is_artifact_run = name_text.starts_with("artifacts-")
-            || (name_text.starts_with(".artifacts-") && name_text.ends_with(".tmp"));
-        if is_artifact_run
-            && Some(name.as_os_str()) != active_name
-            && let Err(error) = tokio::fs::remove_dir_all(entry.path()).await
-        {
-            tracing::warn!(path = %entry.path().display(), "failed to remove stale artifact run: {error}");
+    let stale = keys
+        .iter()
+        .filter_map(|key| key.split('/').nth(1))
+        .filter(|run| run.starts_with("artifacts-") && *run != active_run)
+        .collect::<BTreeSet<_>>();
+    for run in stale {
+        if let Err(error) = storage.delete_prefix(&format!("{document_id}/{run}")).await {
+            tracing::warn!(%document_id, run, "failed to remove stale artifact run: {error}");
         }
     }
 }
@@ -1321,28 +1354,25 @@ pub async fn delete_document(
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let _guard = state.document_locks.lock(id).await;
-    let storage_path: Option<String> =
-        sqlx::query_scalar("SELECT storage_path FROM documents WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(internal_error)?;
-    let Some(storage_path) = storage_path else {
-        return Err((StatusCode::NOT_FOUND, "document not found".to_string()));
-    };
-
-    // Keep the DB row as the retry handle until every known filesystem path is
-    // gone. If cleanup fails, the client can safely repeat DELETE instead of
-    // receiving a permanent 404 while orphaned artifacts remain on disk.
-    remove_document_tree(Path::new(&state.files_dir), id)
+    // Withdraw the document from ready-only retrieval before any object goes, so a
+    // DELETE that fails after cleanup never leaves a searchable row without objects.
+    let withdrawn = sqlx::query("UPDATE documents SET status = 'failed' WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
         .await
         .map_err(internal_error)?;
-
-    // Compatibility cleanup for documents uploaded before the per-document layout.
-    let legacy_path = PathBuf::from(storage_path);
-    if legacy_path.parent() == Some(Path::new(&state.files_dir)) {
-        remove_legacy_files(Path::new(&state.files_dir), id).await?;
+    if withdrawn.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "document not found".to_string()));
     }
+
+    // Keep the DB row as the retry handle until every object under the document
+    // prefix is gone. If cleanup fails, the client can safely repeat DELETE
+    // instead of receiving a permanent 404 while orphaned objects remain.
+    state
+        .storage
+        .delete_prefix(&id.to_string())
+        .await
+        .map_err(internal_error)?;
 
     sqlx::query("DELETE FROM documents WHERE id = $1")
         .bind(id)
@@ -1352,43 +1382,6 @@ pub async fn delete_document(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn remove_document_tree(files_dir: &Path, id: Uuid) -> std::io::Result<()> {
-    let document_dir = files_dir.join(id.to_string());
-    match tokio::fs::remove_dir_all(document_dir).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-async fn remove_legacy_files(files_dir: &Path, id: Uuid) -> Result<(), (StatusCode, String)> {
-    let mut entries = match tokio::fs::read_dir(files_dir).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(internal_error(error)),
-    };
-    let file_prefix = format!("{id}.");
-    let upload_prefix = format!(".{id}.upload-");
-    while let Some(entry) = entries.next_entry().await.map_err(internal_error)? {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with(&file_prefix) {
-            tokio::fs::remove_file(entry.path())
-                .await
-                .map_err(internal_error)?;
-        } else if name.starts_with(&upload_prefix) && name.ends_with(".tmp") {
-            tokio::fs::remove_dir_all(entry.path())
-                .await
-                .map_err(internal_error)?;
-        }
-    }
-    Ok(())
-}
-
-fn path_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
-}
-
 fn internal_error(error: impl fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
@@ -1396,6 +1389,81 @@ fn internal_error(error: impl fmt::Display) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires Pdfium and LibreOffice"]
+    async fn native_conversion_runs_in_scratch_and_publishes_relative_keys() -> anyhow::Result<()> {
+        let fixtures_root =
+            std::env::temp_dir().join(format!("km-ingest-native-{}", Uuid::new_v4()));
+        let fixtures = crate::test_fixtures::write_all(&fixtures_root)?;
+        let storage = Storage::memory();
+        let state = AppState {
+            // Conversion and upload never touch the database; this pool never connects.
+            pool: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused@127.0.0.1:9/unused")?,
+            models: CloudModelClient::for_test(),
+            storage: storage.clone(),
+            artifact_config: crate::page_artifacts::ArtifactConfig::from_env()?,
+            document_locks: DocumentLocks::default(),
+        };
+
+        for (extension, source, kind, page_count) in [
+            ("pdf", &fixtures.native_pdf, SourceKind::Pdf, 2),
+            ("pdf", &fixtures.scanned_pdf, SourceKind::Pdf, 1),
+            ("docx", &fixtures.docx, SourceKind::Office, 2),
+            ("pptx", &fixtures.pptx, SourceKind::Office, 2),
+            ("xlsx", &fixtures.xlsx, SourceKind::Office, 1),
+        ] {
+            let document_id = Uuid::new_v4();
+            let storage_key = format!("{document_id}/original.{extension}");
+            storage.put(&storage_key, std::fs::read(source)?).await?;
+            let run_prefix = format!("{document_id}/artifacts-native");
+            let scratch = ScratchDir::create(Uuid::new_v4())?;
+            let scratch_path = scratch.path().to_owned();
+
+            let prepared = prepare_artifact_set(
+                &state,
+                document_id,
+                kind,
+                &storage_key,
+                scratch.path(),
+                &run_prefix,
+            )
+            .await?;
+            upload_artifact_set(&storage, &prepared).await?;
+            drop(scratch);
+            assert!(!scratch_path.exists(), "scratch must be removed");
+
+            assert_eq!(prepared.pages.len(), page_count, "{extension} page count");
+            let stored = storage.list(&run_prefix).await?;
+            for (index, page) in prepared.pages.iter().enumerate() {
+                assert_eq!(page.page_number, index as i32 + 1);
+                assert_eq!(
+                    page.image_path,
+                    format!("{run_prefix}/pages/{:04}.png", index + 1)
+                );
+                assert!(stored.contains(&page.image_path), "{stored:?}");
+            }
+            assert!(stored.contains(&prepared.manifest_path));
+            assert_eq!(
+                prepared.converted_pdf_path.is_some(),
+                kind == SourceKind::Office
+            );
+            if let Some(converted) = &prepared.converted_pdf_path {
+                assert!(stored.contains(converted), "{stored:?}");
+            }
+            let manifest: ArtifactManifest = serde_json::from_slice(
+                &storage
+                    .get(document_id, &prepared.manifest_path, usize::MAX)
+                    .await?,
+            )?;
+            assert_eq!(manifest.original_path, storage_key);
+            assert_eq!(manifest.pages, prepared.pages);
+        }
+
+        std::fs::remove_dir_all(fixtures_root)?;
+        Ok(())
+    }
 
     #[test]
     fn evaluation_ingest_disables_only_best_effort_summary() {

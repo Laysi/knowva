@@ -1,4 +1,5 @@
 use base64::Engine;
+use futures::{StreamExt, stream};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{ImageReader, Limits};
@@ -6,12 +7,15 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::cloud_models::{ApiChatContent, ApiChatContentPart, ApiImageUrl};
 use crate::search::RetrievalCandidate;
+use crate::storage::{IO_CONCURRENCY, Storage, StorageError};
+
+/// Page image bytes fetched ahead of the ordered pass, keyed by (document, key).
+type FetchedImages<'a> = HashMap<(Uuid, &'a str), Result<Vec<u8>, StorageError>>;
 
 /// Instructions applied to every answer that receives a knowledge-base context.
 ///
@@ -241,9 +245,9 @@ struct PreparedSource {
 /// metadata are therefore always retained or removed together.
 pub async fn build_rag_context(
     candidates: &[RetrievalCandidate],
-    files_root: &Path,
+    storage: &Storage,
 ) -> Result<RagContext, RagContextError> {
-    build_rag_context_with_limits(candidates, files_root, DEFAULT_LIMITS).await
+    build_rag_context_with_limits(candidates, storage, DEFAULT_LIMITS).await
 }
 
 /// Builds a text-only context for whole-knowledge-base catalog questions.
@@ -292,7 +296,7 @@ pub fn build_catalog_context(
 
 async fn build_rag_context_with_limits(
     candidates: &[RetrievalCandidate],
-    files_root: &Path,
+    storage: &Storage,
     limits: RagLimits,
 ) -> Result<RagContext, RagContextError> {
     let selected = &candidates[..candidates.len().min(MAX_RAG_SOURCES)];
@@ -300,29 +304,51 @@ async fn build_rag_context_with_limits(
         return Ok(build_context_prefix(&[]));
     }
 
-    let first_page_unit = selected
-        .iter()
-        .find(|candidate| candidate.kind == "page")
-        .map(|candidate| candidate.unit_id);
-    let canonical_root = match first_page_unit {
-        Some(unit_id) => Some(canonical_files_root(files_root, unit_id).await?),
-        None => None,
-    };
+    // Fetch every distinct page image with bounded concurrency first. A fetch
+    // failure stays attached to its key and surfaces only if the ordered pass
+    // below reaches that source, so ranking and tail-truncation are unchanged.
+    // ponytail: all six raw images (25 MiB cap each) are held at once; fetch
+    // lazily in windows if chat memory ever matters more than latency.
+    let mut image_keys = Vec::new();
+    for candidate in selected {
+        if candidate.kind == "page"
+            && let Some(key) = page_image_key(candidate)
+            && !image_keys.contains(&(candidate.document_id, key))
+        {
+            image_keys.push((candidate.document_id, key));
+        }
+    }
+    let fetches = image_keys
+        .into_iter()
+        .map(|(document_id, key)| async move {
+            let bytes = storage
+                .get(document_id, key, limits.max_image_file_bytes)
+                .await;
+            ((document_id, key), bytes)
+        })
+        .collect::<Vec<_>>();
+    let mut fetched: FetchedImages = stream::iter(fetches)
+        .buffered(IO_CONCURRENCY)
+        .collect()
+        .await;
 
-    let mut document_roots = HashMap::<Uuid, PathBuf>::new();
-    let mut image_cache = HashMap::<PathBuf, Arc<EncodedImage>>::new();
+    let mut image_cache = HashMap::<(Uuid, &str), Arc<EncodedImage>>::new();
     let mut prepared = Vec::with_capacity(selected.len());
     for (index, candidate) in selected.iter().enumerate() {
-        match prepare_source(
-            candidate,
-            canonical_root.as_deref(),
-            &mut document_roots,
-            &mut image_cache,
-            limits,
-        )
-        .await
-        {
-            Ok(source) => prepared.push(source),
+        match prepare_source(candidate, &mut fetched, &mut image_cache).await {
+            Ok(source) => {
+                let starts_tail = matches!(
+                    &source.kind,
+                    PreparedSourceKind::Page { image, .. }
+                        if image.serialized_part_bytes > limits.max_serialized_image_part_bytes
+                );
+                prepared.push(source);
+                // This source and every lower rank are discarded below, so a lower-ranked
+                // failure must not turn a valid higher-ranked prefix into an error.
+                if starts_tail {
+                    break;
+                }
+            }
             // A raw image that is too large is handled like any other payload cap: discard
             // that complete source and the lower-ranked tail. Only rank one is mandatory.
             Err(RagContextError::PayloadTooLarge { .. }) if index > 0 => break,
@@ -360,28 +386,18 @@ async fn build_rag_context_with_limits(
     })
 }
 
-async fn canonical_files_root(files_root: &Path, unit_id: i64) -> Result<PathBuf, RagContextError> {
-    let root = tokio::fs::canonicalize(files_root)
-        .await
-        .map_err(|error| artifact_error(unit_id, "root-resolve", error))?;
-    let metadata = tokio::fs::metadata(&root)
-        .await
-        .map_err(|error| artifact_error(unit_id, "root-metadata", error))?;
-    if !metadata.is_dir() {
-        return Err(RagContextError::InvalidCandidate {
-            unit_id,
-            reason: "FILES_DIR does not resolve to a directory",
-        });
-    }
-    Ok(root)
+fn page_image_key(candidate: &RetrievalCandidate) -> Option<&str> {
+    candidate
+        .image_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
 }
 
-async fn prepare_source(
-    candidate: &RetrievalCandidate,
-    canonical_root: Option<&Path>,
-    document_roots: &mut HashMap<Uuid, PathBuf>,
-    image_cache: &mut HashMap<PathBuf, Arc<EncodedImage>>,
-    limits: RagLimits,
+async fn prepare_source<'a>(
+    candidate: &'a RetrievalCandidate,
+    fetched: &mut FetchedImages<'a>,
+    image_cache: &mut HashMap<(Uuid, &'a str), Arc<EncodedImage>>,
 ) -> Result<PreparedSource, RagContextError> {
     if candidate.filename.trim().is_empty() {
         return Err(RagContextError::InvalidCandidate {
@@ -398,43 +414,30 @@ async fn prepare_source(
                     reason: "page source requires a positive page number",
                 },
             )?;
-            let image_path = candidate
-                .image_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .ok_or(RagContextError::InvalidCandidate {
-                    unit_id: candidate.unit_id,
-                    reason: "page source requires an image path",
-                })?;
-            let root = canonical_root.ok_or(RagContextError::InvalidCandidate {
+            let key = page_image_key(candidate).ok_or(RagContextError::InvalidCandidate {
                 unit_id: candidate.unit_id,
-                reason: "page source requires a canonical artifact root",
+                reason: "page source requires an image path",
             })?;
-            let document_root = canonical_document_root(
-                root,
-                candidate.document_id,
-                candidate.unit_id,
-                document_roots,
-            )
-            .await?;
-            let canonical_image = tokio::fs::canonicalize(Path::new(image_path))
-                .await
-                .map_err(|error| artifact_error(candidate.unit_id, "image-resolve", error))?;
-            if canonical_image == document_root || !canonical_image.starts_with(&document_root) {
-                return Err(RagContextError::InvalidCandidate {
-                    unit_id: candidate.unit_id,
-                    reason: "page image resolves outside its document directory",
-                });
-            }
-
-            let image = if let Some(image) = image_cache.get(&canonical_image) {
+            let cache_key = (candidate.document_id, key);
+            let image = if let Some(image) = image_cache.get(&cache_key) {
                 Arc::clone(image)
             } else {
-                let image = Arc::new(
-                    load_and_encode_image(&canonical_image, candidate.unit_id, limits).await?,
-                );
-                image_cache.insert(canonical_image, Arc::clone(&image));
+                let unit_id = candidate.unit_id;
+                let bytes = match fetched.remove(&cache_key) {
+                    Some(Ok(bytes)) => bytes,
+                    Some(Err(StorageError::InvalidKey(reason))) => {
+                        return Err(RagContextError::InvalidCandidate { unit_id, reason });
+                    }
+                    Some(Err(StorageError::TooLarge { .. })) => {
+                        return Err(RagContextError::PayloadTooLarge { unit_id });
+                    }
+                    Some(Err(error)) => return Err(artifact_error(unit_id, "image-read", error)),
+                    None => return Err(artifact_error(unit_id, "image-read", "not prefetched")),
+                };
+                // Decoding, resizing, JPEG and base64 encoding each happen once per
+                // unique image before any payload-size eviction loop begins.
+                let image = Arc::new(encode_image(bytes, unit_id).await?);
+                image_cache.insert(cache_key, Arc::clone(&image));
                 image
             };
             let extracted_text = candidate
@@ -485,61 +488,7 @@ async fn prepare_source(
     })
 }
 
-async fn canonical_document_root(
-    canonical_root: &Path,
-    document_id: Uuid,
-    unit_id: i64,
-    cache: &mut HashMap<Uuid, PathBuf>,
-) -> Result<PathBuf, RagContextError> {
-    if let Some(root) = cache.get(&document_id) {
-        return Ok(root.clone());
-    }
-
-    let expected = canonical_root.join(document_id.to_string());
-    let canonical = tokio::fs::canonicalize(&expected)
-        .await
-        .map_err(|error| artifact_error(unit_id, "document-resolve", error))?;
-    let metadata = tokio::fs::metadata(&canonical)
-        .await
-        .map_err(|error| artifact_error(unit_id, "document-metadata", error))?;
-    // Requiring identity with the canonical expected path rejects a UUID directory that is
-    // itself a symlink, even when that symlink happens to target another path below FILES_DIR.
-    if canonical != expected || !metadata.is_dir() {
-        return Err(RagContextError::InvalidCandidate {
-            unit_id,
-            reason: "document artifact directory is not a regular in-root directory",
-        });
-    }
-    cache.insert(document_id, canonical.clone());
-    Ok(canonical)
-}
-
-async fn load_and_encode_image(
-    path: &Path,
-    unit_id: i64,
-    limits: RagLimits,
-) -> Result<EncodedImage, RagContextError> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|error| artifact_error(unit_id, "image-metadata", error))?;
-    if !metadata.is_file() {
-        return Err(RagContextError::InvalidCandidate {
-            unit_id,
-            reason: "page image is not a regular file",
-        });
-    }
-    if metadata.len() > limits.max_image_file_bytes as u64 {
-        return Err(RagContextError::PayloadTooLarge { unit_id });
-    }
-
-    // Read each unique canonical page image exactly once. Decoding, resizing, JPEG encoding, and
-    // base64 encoding also each happen once before any payload-size eviction loop begins.
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|error| artifact_error(unit_id, "image-read", error))?;
-    if bytes.len() > limits.max_image_file_bytes {
-        return Err(RagContextError::PayloadTooLarge { unit_id });
-    }
+async fn encode_image(bytes: Vec<u8>, unit_id: i64) -> Result<EncodedImage, RagContextError> {
     let jpeg = tokio::task::spawn_blocking(move || deterministic_jpeg(&bytes))
         .await
         .map_err(|error| RagContextError::ImageProcessing {
@@ -709,31 +658,6 @@ fn serialization_error(error: serde_json::Error) -> RagContextError {
 mod tests {
     use super::*;
     use image::{ImageBuffer, ImageFormat, Rgb};
-    use std::fs;
-
-    struct TestDirectory {
-        path: PathBuf,
-    }
-
-    impl TestDirectory {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("km-rag-context-{}", Uuid::new_v4()));
-            fs::create_dir_all(&path).expect("create test directory");
-            Self { path }
-        }
-
-        fn files_root(&self) -> PathBuf {
-            let root = self.path.join("files");
-            fs::create_dir_all(&root).expect("create files root");
-            root
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
 
     fn candidate(
         unit_id: i64,
@@ -741,7 +665,7 @@ mod tests {
         filename: &str,
         kind: &str,
         page_number: Option<i32>,
-        image_path: Option<&Path>,
+        image_path: Option<&str>,
         content: Option<&str>,
     ) -> RetrievalCandidate {
         RetrievalCandidate {
@@ -751,7 +675,7 @@ mod tests {
             filename: filename.to_string(),
             kind: kind.to_string(),
             page_number,
-            image_path: image_path.map(|path| path.to_string_lossy().into_owned()),
+            image_path: image_path.map(str::to_owned),
             content: content.map(str::to_owned),
             dense_rank: Some(unit_id as usize),
             dense_score: Some(1.0 / unit_id as f64),
@@ -780,7 +704,7 @@ mod tests {
         )
     }
 
-    fn write_png(path: &Path, width: u32, height: u32, seed: u8) {
+    fn png(width: u32, height: u32, seed: u8) -> Vec<u8> {
         let image = ImageBuffer::from_fn(width, height, |x, y| {
             Rgb([
                 seed.wrapping_add(x as u8),
@@ -788,17 +712,25 @@ mod tests {
                 seed.wrapping_add((x ^ y) as u8),
             ])
         });
+        let mut bytes = Vec::new();
         image
-            .save_with_format(path, ImageFormat::Png)
-            .expect("write fixture image");
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("encode fixture image");
+        bytes
     }
 
-    fn page_fixture(root: &Path, document_id: Uuid, page_number: i32, seed: u8) -> PathBuf {
-        let pages = root.join(document_id.to_string()).join("pages");
-        fs::create_dir_all(&pages).expect("create page directory");
-        let path = pages.join(format!("{page_number:04}.png"));
-        write_png(&path, 32, 24, seed);
-        path
+    async fn page_fixture(
+        storage: &Storage,
+        document_id: Uuid,
+        page_number: i32,
+        seed: u8,
+    ) -> String {
+        let key = format!("{document_id}/artifacts-run/pages/{page_number:04}.png");
+        storage
+            .put(&key, png(32, 24, seed))
+            .await
+            .expect("store fixture image");
+        key
     }
 
     fn test_limits(max_serialized_content_bytes: usize) -> RagLimits {
@@ -822,7 +754,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let context = build_rag_context(&candidates, Path::new("unused"))
+        let context = build_rag_context(&candidates, &Storage::memory())
             .await
             .expect("build context");
 
@@ -836,11 +768,10 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_multiple_pages_from_one_document() {
-        let directory = TestDirectory::new();
-        let root = directory.files_root();
+        let storage = Storage::memory();
         let document_id = Uuid::new_v4();
-        let page_two = page_fixture(&root, document_id, 2, 10);
-        let page_five = page_fixture(&root, document_id, 5, 20);
+        let page_two = page_fixture(&storage, document_id, 2, 10).await;
+        let page_five = page_fixture(&storage, document_id, 5, 20).await;
         let candidates = vec![
             candidate(
                 11,
@@ -862,7 +793,7 @@ mod tests {
             ),
         ];
 
-        let context = build_rag_context(&candidates, &root)
+        let context = build_rag_context(&candidates, &storage)
             .await
             .expect("build page context");
 
@@ -884,7 +815,7 @@ mod tests {
             text_candidate(2, second_id, "notes.md", "beta"),
         ];
 
-        let context = build_rag_context(&candidates, Path::new("unused"))
+        let context = build_rag_context(&candidates, &Storage::memory())
             .await
             .expect("build context");
 
@@ -899,7 +830,7 @@ mod tests {
     #[tokio::test]
     async fn text_source_serializes_null_page_number_and_requires_content() {
         let valid = text_candidate(1, Uuid::new_v4(), "readme.md", "section text");
-        let context = build_rag_context(&[valid], Path::new("unused"))
+        let context = build_rag_context(&[valid], &Storage::memory())
             .await
             .expect("build text context");
         let context_debug = format!("{context:?}");
@@ -922,13 +853,13 @@ mod tests {
             Some("text"),
         );
         assert!(matches!(
-            build_rag_context(&[invalid_page], Path::new("unused")).await,
+            build_rag_context(&[invalid_page], &Storage::memory()).await,
             Err(RagContextError::InvalidCandidate { unit_id: 2, .. })
         ));
 
         let empty = text_candidate(3, Uuid::new_v4(), "empty.txt", "   \n");
         assert!(matches!(
-            build_rag_context(&[empty], Path::new("unused")).await,
+            build_rag_context(&[empty], &Storage::memory()).await,
             Err(RagContextError::InvalidCandidate { unit_id: 3, .. })
         ));
     }
@@ -962,12 +893,9 @@ mod tests {
 
     #[tokio::test]
     async fn missing_artifact_returns_path_safe_error() {
-        let directory = TestDirectory::new();
-        let root = directory.files_root();
+        let storage = Storage::memory();
         let document_id = Uuid::new_v4();
-        let document_root = root.join(document_id.to_string());
-        fs::create_dir_all(&document_root).expect("create document root");
-        let missing = document_root.join("secret-missing-page.png");
+        let missing = format!("{document_id}/artifacts-run/pages/secret-missing-page.png");
         let candidate = candidate(
             77,
             document_id,
@@ -978,7 +906,7 @@ mod tests {
             Some("secret extracted text"),
         );
 
-        let error = build_rag_context(&[candidate], &root)
+        let error = build_rag_context(&[candidate], &storage)
             .await
             .expect_err("missing image must fail");
         let message = error.client_message();
@@ -987,51 +915,44 @@ mod tests {
             RagContextError::ArtifactUnavailable { unit_id: 77, .. }
         ));
         assert!(!message.contains("secret"));
-        assert!(!message.contains(missing.to_string_lossy().as_ref()));
+        assert!(!message.contains(&missing));
+        assert!(!error.to_string().contains(&missing));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn rejects_out_of_root_and_symlink_escape_images() {
-        use std::os::unix::fs::symlink;
-
-        let directory = TestDirectory::new();
-        let root = directory.files_root();
+    async fn rejects_keys_outside_the_candidate_document_without_leaking_them() {
+        let storage = Storage::memory();
         let document_id = Uuid::new_v4();
-        let pages = root.join(document_id.to_string()).join("pages");
-        fs::create_dir_all(&pages).expect("create pages");
-        let outside = directory.path.join("outside.png");
-        write_png(&outside, 8, 8, 1);
+        let other_document = Uuid::new_v4();
+        let foreign_page = page_fixture(&storage, other_document, 1, 1).await;
 
-        let direct = candidate(
-            1,
-            document_id,
-            "direct.pdf",
-            "page",
-            Some(1),
-            Some(&outside),
-            None,
-        );
-        assert!(matches!(
-            build_rag_context(&[direct], &root).await,
-            Err(RagContextError::InvalidCandidate { unit_id: 1, .. })
-        ));
-
-        let escaped = pages.join("escaped.png");
-        symlink(&outside, &escaped).expect("create escape symlink");
-        let via_symlink = candidate(
-            2,
-            document_id,
-            "symlink.pdf",
-            "page",
-            Some(1),
-            Some(&escaped),
-            None,
-        );
-        assert!(matches!(
-            build_rag_context(&[via_symlink], &root).await,
-            Err(RagContextError::InvalidCandidate { unit_id: 2, .. })
-        ));
+        for (unit_id, key) in [
+            (1, foreign_page.clone()),
+            (2, format!("{document_id}/../{foreign_page}")),
+            (3, format!("/{document_id}/artifacts-run/pages/0001.png")),
+            (4, "/etc/secret-host-file.png".to_owned()),
+        ] {
+            let candidate = candidate(
+                unit_id,
+                document_id,
+                "escape.pdf",
+                "page",
+                Some(1),
+                Some(&key),
+                None,
+            );
+            let error = build_rag_context(&[candidate], &storage)
+                .await
+                .expect_err("key outside the document must be rejected");
+            assert!(
+                matches!(error, RagContextError::InvalidCandidate { unit_id: id, .. } if id == unit_id),
+                "{key}"
+            );
+            for message in [error.client_message(), error.to_string()] {
+                assert!(!message.contains(&other_document.to_string()), "{message}");
+                assert!(!message.contains("secret-host-file"), "{message}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1048,7 +969,7 @@ mod tests {
             .collect::<Vec<_>>();
         let two_source_context = build_rag_context_with_limits(
             &candidates[..2],
-            Path::new("unused"),
+            &Storage::memory(),
             test_limits(usize::MAX),
         )
         .await
@@ -1058,7 +979,7 @@ mod tests {
 
         let context = build_rag_context_with_limits(
             &candidates,
-            Path::new("unused"),
+            &Storage::memory(),
             test_limits(exact_two_source_bytes),
         )
         .await
@@ -1113,20 +1034,17 @@ mod tests {
         let candidate = text_candidate(9, Uuid::new_v4(), "private.md", "DO_NOT_LEAK_THIS_CONTENT");
         let reference = build_rag_context_with_limits(
             std::slice::from_ref(&candidate),
-            Path::new("unused"),
+            &Storage::memory(),
             test_limits(usize::MAX),
         )
         .await
         .expect("build reference");
         let bytes = serialized_content_bytes(&reference.content).expect("measure payload");
 
-        let error = build_rag_context_with_limits(
-            &[candidate],
-            Path::new("unused"),
-            test_limits(bytes - 1),
-        )
-        .await
-        .expect_err("highest source cannot fit");
+        let error =
+            build_rag_context_with_limits(&[candidate], &Storage::memory(), test_limits(bytes - 1))
+                .await
+                .expect_err("highest source cannot fit");
 
         assert!(matches!(
             &error,
@@ -1138,10 +1056,9 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_lower_ranked_raw_image_evicts_it_and_the_tail_atomically() {
-        let directory = TestDirectory::new();
-        let root = directory.files_root();
+        let storage = Storage::memory();
         let document_id = Uuid::new_v4();
-        let image_path = page_fixture(&root, document_id, 1, 9);
+        let image_path = page_fixture(&storage, document_id, 1, 9).await;
         let candidates = vec![
             text_candidate(1, Uuid::new_v4(), "first.md", "highest ranked"),
             candidate(
@@ -1161,7 +1078,7 @@ mod tests {
             max_serialized_content_bytes: usize::MAX,
         };
 
-        let context = build_rag_context_with_limits(&candidates, &root, limits)
+        let context = build_rag_context_with_limits(&candidates, &storage, limits)
             .await
             .expect("lower-ranked oversized image should evict the tail");
         assert_eq!(context.sources.len(), 1);
@@ -1169,7 +1086,7 @@ mod tests {
         let payload = serde_json::to_string(&context.content).expect("serialize context");
         assert!(!payload.contains("must also be removed"));
 
-        let error = build_rag_context_with_limits(&candidates[1..], &root, limits)
+        let error = build_rag_context_with_limits(&candidates[1..], &storage, limits)
             .await
             .expect_err("rank-one oversized image must remain an error");
         assert!(matches!(
@@ -1179,14 +1096,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_resize_and_compression_are_deterministic() {
-        let directory = TestDirectory::new();
-        let root = directory.files_root();
+    async fn oversized_serialized_image_truncates_before_a_broken_lower_rank() {
+        let storage = Storage::memory();
         let document_id = Uuid::new_v4();
-        let pages = root.join(document_id.to_string()).join("pages");
-        fs::create_dir_all(&pages).expect("create pages");
-        let image_path = pages.join("wide.png");
-        write_png(&image_path, MAX_OUTPUT_DIMENSION + 1, 48, 42);
+        let image_path = page_fixture(&storage, document_id, 1, 9).await;
+        let missing_id = Uuid::new_v4();
+        let missing_path = format!("{missing_id}/artifacts-run/pages/0001.png");
+        let candidates = vec![
+            text_candidate(1, Uuid::new_v4(), "first.md", "highest ranked"),
+            candidate(
+                2,
+                document_id,
+                "oversized.pdf",
+                "page",
+                Some(1),
+                Some(&image_path),
+                Some("second"),
+            ),
+            candidate(
+                3,
+                missing_id,
+                "missing.pdf",
+                "page",
+                Some(1),
+                Some(&missing_path),
+                Some("third"),
+            ),
+        ];
+        let limits = RagLimits {
+            max_image_file_bytes: usize::MAX,
+            max_serialized_image_part_bytes: 1,
+            max_serialized_content_bytes: usize::MAX,
+        };
+
+        let context = build_rag_context_with_limits(&candidates, &storage, limits)
+            .await
+            .expect("the missing source lies in the discarded tail");
+        assert_eq!(context.sources.len(), 1);
+        assert_eq!(context.sources[0].unit_id, 1);
+    }
+
+    #[tokio::test]
+    async fn image_resize_and_compression_are_deterministic() {
+        let storage = Storage::memory();
+        let document_id = Uuid::new_v4();
+        let image_path = format!("{document_id}/artifacts-run/pages/wide.png");
+        storage
+            .put(&image_path, png(MAX_OUTPUT_DIMENSION + 1, 48, 42))
+            .await
+            .expect("store wide fixture");
         let candidate = candidate(
             1,
             document_id,
@@ -1197,10 +1155,10 @@ mod tests {
             None,
         );
 
-        let first = build_rag_context(std::slice::from_ref(&candidate), &root)
+        let first = build_rag_context(std::slice::from_ref(&candidate), &storage)
             .await
             .expect("first build");
-        let second = build_rag_context(&[candidate], &root)
+        let second = build_rag_context(&[candidate], &storage)
             .await
             .expect("second build");
         assert_eq!(

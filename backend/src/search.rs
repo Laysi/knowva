@@ -3,12 +3,13 @@ use crate::cloud_models::{
     CloudModelClient, CloudModelError, CloudModelResult, MAX_EMBED_IMAGE_BYTES, RerankPassage,
     RerankResponse,
 };
+use crate::storage::{IO_CONCURRENCY, Storage, StorageError};
 use futures::future::BoxFuture;
+use futures::{StreamExt, TryStreamExt, stream};
 use pgvector::HalfVector;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use uuid::Uuid;
@@ -765,7 +766,7 @@ pub async fn retrieve_ab_with_backends<
     candidate_backend: &C,
     rerank_backend: &R,
     query: &str,
-    artifact_root: &Path,
+    storage: &Storage,
     retrieval_config: RetrievalConfig,
     rerank_config: RerankConfig,
 ) -> Result<ObservedAbRetrieval, RetrieveError> {
@@ -869,41 +870,36 @@ pub async fn retrieve_ab_with_backends<
 
     let rerank_started = Instant::now();
     let counted_reranker = CountingRerankBackend::new(rerank_backend);
-    let reranked = match rerank_candidates_observed(
-        &counted_reranker,
-        query,
-        &fused,
-        artifact_root,
-        rerank_config,
-    )
-    .await
-    {
-        Ok(reranked) => reranked,
-        Err(error) => {
-            return Ok(ObservedAbRetrieval {
-                mode_a,
-                mode_b: ObservedModeRetrieval {
-                    dense: mode_b_dense,
-                    bm25: mode_b_bm25,
-                    rrf: mode_b_rrf,
-                    rerank: ObservedRetrievalStage {
-                        candidates: Vec::new(),
-                        latency_ms: rerank_started.elapsed().as_millis() as u64,
-                        request_count: counted_reranker.request_count(),
-                        reused: false,
-                        fallback: false,
+    let reranked =
+        match rerank_candidates_observed(&counted_reranker, query, &fused, storage, rerank_config)
+            .await
+        {
+            Ok(reranked) => reranked,
+            Err(error) => {
+                return Ok(ObservedAbRetrieval {
+                    mode_a,
+                    mode_b: ObservedModeRetrieval {
+                        dense: mode_b_dense,
+                        bm25: mode_b_bm25,
+                        rrf: mode_b_rrf,
+                        rerank: ObservedRetrievalStage {
+                            candidates: Vec::new(),
+                            latency_ms: rerank_started.elapsed().as_millis() as u64,
+                            request_count: counted_reranker.request_count(),
+                            reused: false,
+                            fallback: false,
+                        },
+                        final_candidates: Vec::new(),
+                        failure: Some(ObservedRetrievalFailure {
+                            stage: ObservedFailureStage::Rerank,
+                            code: "rerank_failed",
+                            safe_message: error.client_message(),
+                            retryable: error.is_transient(),
+                        }),
                     },
-                    final_candidates: Vec::new(),
-                    failure: Some(ObservedRetrievalFailure {
-                        stage: ObservedFailureStage::Rerank,
-                        code: "rerank_failed",
-                        safe_message: error.client_message(),
-                        retryable: error.is_transient(),
-                    }),
-                },
-            });
-        }
-    };
+                });
+            }
+        };
     let mode_b_rerank = ObservedRetrievalStage {
         candidates: reranked.candidates.clone(),
         latency_ms: rerank_started.elapsed().as_millis() as u64,
@@ -946,7 +942,7 @@ pub async fn retrieve_ab_observed(
         &backend,
         &state.models,
         query,
-        Path::new(&state.files_dir),
+        &state.storage,
         retrieval_config,
         rerank_config,
     )
@@ -976,7 +972,7 @@ pub async fn retrieve(
         &state.models,
         query,
         &debug.fused,
-        Path::new(&state.files_dir),
+        &state.storage,
         rerank_config,
     )
     .await
@@ -998,10 +994,10 @@ pub async fn rerank_candidates<B: RerankBackend + ?Sized>(
     backend: &B,
     query: &str,
     rrf_candidates: &[RetrievalCandidate],
-    artifact_root: &Path,
+    storage: &Storage,
     config: RerankConfig,
 ) -> Result<Vec<RetrievalCandidate>, RerankStageError> {
-    rerank_candidates_observed(backend, query, rrf_candidates, artifact_root, config)
+    rerank_candidates_observed(backend, query, rrf_candidates, storage, config)
         .await
         .map(|outcome| outcome.candidates)
 }
@@ -1010,13 +1006,12 @@ pub async fn rerank_candidates_observed<B: RerankBackend + ?Sized>(
     backend: &B,
     query: &str,
     rrf_candidates: &[RetrievalCandidate],
-    artifact_root: &Path,
+    storage: &Storage,
     config: RerankConfig,
 ) -> Result<ObservedRerankOutcome, RerankStageError> {
     let started = Instant::now();
     let candidate_count = rrf_candidates.len().min(config.candidate_top_k);
-    let result =
-        rerank_candidates_inner(backend, query, rrf_candidates, artifact_root, config).await;
+    let result = rerank_candidates_inner(backend, query, rrf_candidates, storage, config).await;
     if let Err(error) = &result {
         tracing::error!(
             stage = "rerank",
@@ -1037,7 +1032,7 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
     backend: &B,
     query: &str,
     rrf_candidates: &[RetrievalCandidate],
-    artifact_root: &Path,
+    storage: &Storage,
     config: RerankConfig,
 ) -> Result<ObservedRerankOutcome, RerankStageError> {
     let config = RerankConfig::new(config.candidate_top_k, config.top_n, config.batch_size)
@@ -1063,23 +1058,12 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
 
     let started = Instant::now();
     let batch_count = candidates.len().div_ceil(config.batch_size);
-    let canonical_root = if let Some(page) =
-        candidates.iter().find(|candidate| candidate.kind == "page")
-    {
-        Some(
-            tokio::fs::canonicalize(artifact_root)
-                .await
-                .map_err(|error| RerankStageError::artifact(page.unit_id, "root-resolve", error))?,
-        )
-    } else {
-        None
-    };
     let mut scores = vec![None; candidates.len()];
     let mut request_count = 0_u32;
 
     for (batch_index, batch) in candidates.chunks(config.batch_size).enumerate() {
         let batch_started = Instant::now();
-        let passages = prepare_rerank_passages(batch, canonical_root.as_deref()).await?;
+        let passages = prepare_rerank_passages(batch, storage).await?;
         request_count = request_count.saturating_add(1);
         let response = match backend.rerank(query, &passages).await {
             Ok(response) => response,
@@ -1232,108 +1216,67 @@ fn validate_batch_rankings(
     Ok(())
 }
 
+/// Prepares one batch with bounded concurrent page reads. `buffered` keeps the
+/// original candidate order and reports the first failure in that order.
 async fn prepare_rerank_passages(
     candidates: &[RetrievalCandidate],
-    canonical_root: Option<&Path>,
+    storage: &Storage,
 ) -> Result<Vec<RerankPassage>, RerankStageError> {
-    let mut passages = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        match candidate.kind.as_str() {
-            "page" => {
-                let root = canonical_root.ok_or_else(|| RerankStageError::InvalidCandidate {
-                    unit_id: candidate.unit_id,
-                    message: "page candidate requires an artifact root".to_string(),
-                })?;
-                let image_path = candidate.image_path.as_deref().ok_or_else(|| {
-                    RerankStageError::InvalidCandidate {
-                        unit_id: candidate.unit_id,
-                        message: "page candidate is missing image_path".to_string(),
+    // Futures are built eagerly (they stay lazy until polled) so the stream type
+    // carries no borrowing closure; otherwise spawned callers fail the Send check.
+    let passages = candidates
+        .iter()
+        .map(|candidate| prepare_rerank_passage(candidate, storage))
+        .collect::<Vec<_>>();
+    stream::iter(passages)
+        .buffered(IO_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
+async fn prepare_rerank_passage(
+    candidate: &RetrievalCandidate,
+    storage: &Storage,
+) -> Result<RerankPassage, RerankStageError> {
+    let invalid = |message: String| RerankStageError::InvalidCandidate {
+        unit_id: candidate.unit_id,
+        message,
+    };
+    match candidate.kind.as_str() {
+        "page" => {
+            let key = candidate
+                .image_path
+                .as_deref()
+                .ok_or_else(|| invalid("page candidate is missing image_path".to_string()))?;
+            let image = storage
+                .get(candidate.document_id, key, MAX_EMBED_IMAGE_BYTES)
+                .await
+                .map_err(|error| match error {
+                    StorageError::InvalidKey(_) | StorageError::TooLarge { .. } => {
+                        invalid(error.to_string())
                     }
+                    error => RerankStageError::artifact(candidate.unit_id, "read", error),
                 })?;
-                let canonical_path = tokio::fs::canonicalize(PathBuf::from(image_path))
-                    .await
-                    .map_err(|error| {
-                        RerankStageError::artifact(candidate.unit_id, "path-resolve", error)
-                    })?;
-                if !canonical_path.starts_with(root) {
-                    return Err(RerankStageError::InvalidCandidate {
-                        unit_id: candidate.unit_id,
-                        message: "page image resolves outside FILES_DIR".to_string(),
-                    });
-                }
-                let expected_document_root = root.join(candidate.document_id.to_string());
-                if !canonical_path.starts_with(&expected_document_root) {
-                    return Err(RerankStageError::InvalidCandidate {
-                        unit_id: candidate.unit_id,
-                        message: "page image resolves outside the candidate document directory"
-                            .to_string(),
-                    });
-                }
-                let metadata = tokio::fs::metadata(&canonical_path)
-                    .await
-                    .map_err(|error| {
-                        RerankStageError::artifact(candidate.unit_id, "metadata", error)
-                    })?;
-                if !metadata.is_file() {
-                    return Err(RerankStageError::InvalidCandidate {
-                        unit_id: candidate.unit_id,
-                        message: "page image is not a regular file".to_string(),
-                    });
-                }
-                if metadata.len() > MAX_EMBED_IMAGE_BYTES as u64 {
-                    return Err(RerankStageError::InvalidCandidate {
-                        unit_id: candidate.unit_id,
-                        message: format!(
-                            "page image is {} bytes; maximum is {MAX_EMBED_IMAGE_BYTES} bytes",
-                            metadata.len()
-                        ),
-                    });
-                }
-                let image = tokio::fs::read(&canonical_path).await.map_err(|error| {
-                    RerankStageError::artifact(candidate.unit_id, "read", error)
-                })?;
-                if image.len() > MAX_EMBED_IMAGE_BYTES {
-                    return Err(RerankStageError::InvalidCandidate {
-                        unit_id: candidate.unit_id,
-                        message: format!(
-                            "page image changed to {} bytes while reading; maximum is {MAX_EMBED_IMAGE_BYTES} bytes",
-                            image.len()
-                        ),
-                    });
-                }
-                let passage = match candidate
-                    .content
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                {
-                    Some(text) => RerankPassage::image_text(text, &image),
-                    None => RerankPassage::image(&image),
-                }
-                .map_err(RerankStageError::Model)?;
-                passages.push(passage);
+            match candidate
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                Some(text) => RerankPassage::image_text(text, &image),
+                None => RerankPassage::image(&image),
             }
-            "text" => {
-                let text = candidate
-                    .content
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .ok_or_else(|| RerankStageError::InvalidCandidate {
-                        unit_id: candidate.unit_id,
-                        message: "text candidate is missing non-empty content".to_string(),
-                    })?;
-                passages.push(RerankPassage::text(text));
-            }
-            kind => {
-                return Err(RerankStageError::InvalidCandidate {
-                    unit_id: candidate.unit_id,
-                    message: format!("unsupported candidate kind {kind:?}"),
-                });
-            }
+            .map_err(RerankStageError::Model)
         }
+        "text" => candidate
+            .content
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(RerankPassage::text)
+            .ok_or_else(|| invalid("text candidate is missing non-empty content".to_string())),
+        kind => Err(invalid(format!("unsupported candidate kind {kind:?}"))),
     }
-    Ok(passages)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1700,37 +1643,21 @@ mod tests {
 
     #[tokio::test]
     async fn rerank_payload_covers_image_text_image_only_and_text_only() {
-        let root = std::env::temp_dir().join(format!("km-rerank-modalities-{}", Uuid::new_v4()));
-        let mixed_pages = root.join(Uuid::from_u128(101).to_string()).join("pages");
-        let image_only_pages = root.join(Uuid::from_u128(102).to_string()).join("pages");
-        tokio::fs::create_dir_all(&mixed_pages)
-            .await
-            .expect("create mixed artifact fixture");
-        tokio::fs::create_dir_all(&image_only_pages)
-            .await
-            .expect("create image-only artifact fixture");
-        let mixed_image = mixed_pages.join("0001.png");
-        let image_only = image_only_pages.join("0002.png");
+        let storage = Storage::memory();
+        let mixed_image = format!("{}/artifacts-run/pages/0001.png", Uuid::from_u128(101));
+        let image_only = format!("{}/artifacts-run/pages/0002.png", Uuid::from_u128(102));
         let png = b"\x89PNG\r\n\x1a\nmock-rerank-page";
-        tokio::fs::write(&mixed_image, png)
+        storage
+            .put(&mixed_image, png.to_vec())
             .await
-            .expect("write mixed image");
-        tokio::fs::write(&image_only, png)
+            .expect("store mixed image");
+        storage
+            .put(&image_only, png.to_vec())
             .await
-            .expect("write image-only image");
+            .expect("store image-only image");
         let candidates = vec![
-            retrieval_candidate(
-                1,
-                "page",
-                Some(mixed_image.to_string_lossy().into_owned()),
-                Some("same-page text"),
-            ),
-            retrieval_candidate(
-                2,
-                "page",
-                Some(image_only.to_string_lossy().into_owned()),
-                None,
-            ),
+            retrieval_candidate(1, "page", Some(mixed_image.clone()), Some("same-page text")),
+            retrieval_candidate(2, "page", Some(image_only.clone()), None),
             retrieval_candidate(3, "text", None, Some("markdown chunk")),
         ];
         let reranker = FakeReranker::new(Vec::new());
@@ -1738,7 +1665,7 @@ mod tests {
             &reranker,
             "query",
             &candidates,
-            &root,
+            &storage,
             RerankConfig::new(3, 3, 3).expect("config"),
         )
         .await
@@ -1777,12 +1704,11 @@ mod tests {
                 !passage
                     .get("image")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|image| image.contains(root.to_string_lossy().as_ref()))
+                    .is_some_and(|image| {
+                        image.contains(&mixed_image) || image.contains(&image_only)
+                    })
             }));
         }
-        tokio::fs::remove_dir_all(root)
-            .await
-            .expect("remove artifact fixture");
     }
 
     #[tokio::test]
@@ -1829,7 +1755,7 @@ mod tests {
             &reranker,
             "query",
             &candidates,
-            Path::new("unused-for-text"),
+            &Storage::memory(),
             RerankConfig::new(5, 3, 2).expect("config"),
         )
         .await
@@ -1905,7 +1831,7 @@ mod tests {
             &reranker,
             "query",
             &candidates,
-            Path::new("unused-for-text"),
+            &Storage::memory(),
             RerankConfig::new(4, 3, 2).expect("config"),
         )
         .await
@@ -1938,7 +1864,7 @@ mod tests {
                 &reranker,
                 "query",
                 &candidates,
-                Path::new("unused-for-text"),
+                &Storage::memory(),
                 RerankConfig::new(10, top_n, 4).expect("config"),
             )
             .await
@@ -1954,7 +1880,7 @@ mod tests {
             &reranker,
             "query",
             &candidates[..2],
-            Path::new("unused-for-text"),
+            &Storage::memory(),
             RerankConfig::new(8, 8, 4).expect("config"),
         )
         .await
@@ -1991,7 +1917,7 @@ mod tests {
             &reranker,
             "query",
             &candidates,
-            Path::new("unused-for-text"),
+            &Storage::memory(),
             RerankConfig::new(6, 3, 2).expect("config"),
         )
         .await
@@ -2058,7 +1984,7 @@ mod tests {
                 &reranker,
                 "query",
                 &candidates,
-                Path::new("unused-for-text"),
+                &Storage::memory(),
                 RerankConfig::new(3, 3, 2).expect("config"),
             )
             .await
@@ -2074,7 +2000,7 @@ mod tests {
             &reranker,
             "query",
             &candidates,
-            Path::new("unused-for-text"),
+            &Storage::memory(),
             RerankConfig::new(3, 3, 2).expect("config"),
         )
         .await
@@ -2113,14 +2039,13 @@ mod tests {
 
     #[tokio::test]
     async fn page_artifact_failure_is_diagnostic_and_never_degrades_to_text_only() {
-        let root = std::env::temp_dir().join(format!("km-rerank-missing-{}", Uuid::new_v4()));
-        tokio::fs::create_dir_all(&root)
-            .await
-            .expect("create fixture root");
         let candidate = retrieval_candidate(
             1,
             "page",
-            Some(root.join("missing.png").to_string_lossy().into_owned()),
+            Some(format!(
+                "{}/artifacts-run/pages/missing.png",
+                Uuid::from_u128(101)
+            )),
             Some("text must not mask missing image"),
         );
         let reranker = FakeReranker::new(Vec::new());
@@ -2128,55 +2053,50 @@ mod tests {
             &reranker,
             "query",
             &[candidate],
-            &root,
+            &Storage::memory(),
             RerankConfig::new(3, 3, 2).expect("config"),
         )
         .await
         .expect_err("missing page artifact must fail");
         assert!(matches!(error, RerankStageError::Artifact { .. }));
         assert!(reranker.requests.lock().expect("requests lock").is_empty());
-        tokio::fs::remove_dir_all(root)
-            .await
-            .expect("remove fixture root");
     }
 
     #[tokio::test]
     async fn page_artifact_must_belong_to_the_candidate_document_directory() {
-        let root =
-            std::env::temp_dir().join(format!("km-rerank-cross-document-{}", Uuid::new_v4()));
-        let other_document_pages = root.join(Uuid::from_u128(102).to_string()).join("pages");
-        tokio::fs::create_dir_all(&other_document_pages)
+        let storage = Storage::memory();
+        let other_document_image = format!("{}/artifacts-run/pages/0001.png", Uuid::from_u128(102));
+        storage
+            .put(
+                &other_document_image,
+                b"\x89PNG\r\n\x1a\nother-document".to_vec(),
+            )
             .await
-            .expect("create other document fixture");
-        let other_document_image = other_document_pages.join("0001.png");
-        tokio::fs::write(&other_document_image, b"\x89PNG\r\n\x1a\nother-document")
-            .await
-            .expect("write other document image");
+            .expect("store other document image");
 
         // Unit 1 maps to document UUID 101 in the fixture helper, so UUID 102
-        // must never be accepted even though it remains inside FILES_DIR.
-        let candidate = retrieval_candidate(
-            1,
-            "page",
-            Some(other_document_image.to_string_lossy().into_owned()),
-            None,
-        );
-        let reranker = FakeReranker::new(Vec::new());
-        let error = rerank_candidates(
-            &reranker,
-            "query",
-            &[candidate],
-            &root,
-            RerankConfig::new(3, 3, 2).expect("config"),
-        )
-        .await
-        .expect_err("cross-document artifact mapping must fail");
-        assert!(matches!(error, RerankStageError::InvalidCandidate { .. }));
-        assert!(reranker.requests.lock().expect("requests lock").is_empty());
-
-        tokio::fs::remove_dir_all(root)
+        // must never be accepted even though it is a valid key in the same store.
+        for key in [
+            other_document_image.clone(),
+            format!("{}/../{other_document_image}", Uuid::from_u128(101)),
+            format!("/{other_document_image}"),
+        ] {
+            let candidate = retrieval_candidate(1, "page", Some(key.clone()), None);
+            let reranker = FakeReranker::new(Vec::new());
+            let error = rerank_candidates(
+                &reranker,
+                "query",
+                &[candidate],
+                &storage,
+                RerankConfig::new(3, 3, 2).expect("config"),
+            )
             .await
-            .expect("remove fixture root");
+            .expect_err("cross-document artifact mapping must fail");
+            assert!(matches!(error, RerankStageError::InvalidCandidate { .. }));
+            assert!(!error.to_string().contains(&key));
+            assert!(!error.client_message().contains(&other_document_image));
+            assert!(reranker.requests.lock().expect("requests lock").is_empty());
+        }
     }
 
     #[derive(Debug)]
@@ -2246,7 +2166,7 @@ mod tests {
             &TransientDenseFailureBackend,
             &FakeReranker::new(Vec::new()),
             "fixture query",
-            Path::new("."),
+            &Storage::memory(),
             RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
             RerankConfig::new(3, 3, 8).expect("rerank config"),
         )
@@ -2323,7 +2243,7 @@ mod tests {
             &backend,
             &reranker,
             "fixture query",
-            Path::new("."),
+            &Storage::memory(),
             RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
             RerankConfig::new(3, 3, 8).expect("rerank config"),
         )
@@ -2381,7 +2301,7 @@ mod tests {
             &backend,
             &reranker,
             "fixture query",
-            Path::new("."),
+            &Storage::memory(),
             RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
             RerankConfig::new(3, 3, 8).expect("rerank config"),
         )
@@ -2418,7 +2338,7 @@ mod tests {
             &backend,
             &reranker,
             "fixture query",
-            Path::new("."),
+            &Storage::memory(),
             RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
             RerankConfig::new(3, 3, 8).expect("rerank config"),
         )
@@ -2450,7 +2370,7 @@ mod tests {
             })]),
             "fixture query",
             &candidates,
-            Path::new("."),
+            &Storage::memory(),
             RerankConfig::new(3, 3, 8).expect("rerank config"),
         )
         .await
@@ -2459,7 +2379,7 @@ mod tests {
             &FakeReranker::new(vec![Ok(response)]),
             "fixture query",
             &candidates,
-            Path::new("."),
+            &Storage::memory(),
             RerankConfig::new(3, 3, 8).expect("rerank config"),
         )
         .await
