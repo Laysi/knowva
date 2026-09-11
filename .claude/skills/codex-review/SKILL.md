@@ -42,9 +42,11 @@ codex exec review --uncommitted
 # The changes introduced by a single commit:
 codex exec review --commit <sha>
 
-# Optional focus / custom instructions (append as a prompt):
-codex exec review --base main "Pay special attention to the auth and error-handling changes."
+# Custom focus: prompt only, and the prompt itself must name the scope:
+codex exec review "Review the changes in \`git diff main...HEAD\` only. Pay special attention to the auth and error-handling changes."
 ```
+
+A prompt **cannot be combined** with `--base`, `--uncommitted`, or `--commit` (verified on codex-cli 0.153.4: `the argument '--base <BRANCH>' cannot be used with '[PROMPT]'`). Without a scope in the prompt, Codex picks its own files and can wander outside the repo, so always spell out the exact `git diff` range (`main...HEAD`, `HEAD`, or `<sha>^!`).
 
 Run the command with a long timeout (up to ~10 minutes for a large diff). `codex exec review` runs read-only — it reviews, it does not edit — and prints its findings to stdout.
 
@@ -61,7 +63,7 @@ Default-scope guidance when the user is vague ("review my changes"): use `--unco
 
 ## Suggested focus for this repo
 
-When the diff touches these areas, append a focus prompt so Codex checks the repo's hard contracts (see CLAUDE.md):
+When the diff touches these areas, run the prompt-only form above instead of a scope flag, naming the diff range and the relevant contracts below (see CLAUDE.md):
 
 - `backend/src/cloud_models.rs` or any model call: no gateway token, auth header, data URL, or long base64 in logs/errors; error snippets ≤ 500 chars; no upstream `Authorization` header; no alternative or local inference path.
 - `backend/src/ingest.rs`: a document becomes `ready` only after every artifact has exactly one validated 2048-dim embedding; `document_units` replacement stays transactional and idempotent; delete/retry cleanup leaves no orphans.
