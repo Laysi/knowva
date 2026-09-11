@@ -63,9 +63,9 @@ ENV PDFIUM_LIBRARY_PATH=/usr/local/lib/libpdfium.so \
     DOCUMENT_CONVERSION_TIMEOUT_SECS=120
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/backend/target \
-    cargo test --locked \
+    cargo test --locked -- --ignored --exact --nocapture --test-threads=1 \
       page_artifacts::tests::generated_pdf_and_office_fixtures_preserve_page_order \
-      -- --ignored --exact --nocapture
+      ingest::tests::native_conversion_runs_in_scratch_and_publishes_relative_keys
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

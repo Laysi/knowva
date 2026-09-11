@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::{Storage, StorageConfig, ensure_initialization_lock};
 use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -22,6 +23,7 @@ struct EmbeddingMockState {
     summary_status: Arc<AtomicU16>,
     summary_delay_ms: Arc<AtomicU64>,
     summary_response: Arc<Mutex<String>>,
+    rerank_requests: Arc<Mutex<Vec<Value>>>,
 }
 
 async fn embedding_mock(
@@ -50,11 +52,21 @@ async fn summary_mock(
     State(state): State<EmbeddingMockState>,
     Json(body): Json<Value>,
 ) -> Response {
+    let streamed_answer = body["stream"] == true;
     state
         .summary_requests
         .lock()
         .expect("summary request lock")
         .push(body);
+    if streamed_answer {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"藍色頁面 [S1]\"}}]}\n\n\
+                   data: [DONE]\n\n";
+        return (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            sse,
+        )
+            .into_response();
+    }
     let delay_ms = state.summary_delay_ms.load(Ordering::SeqCst);
     if delay_ms > 0 {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -73,6 +85,70 @@ async fn summary_mock(
         "choices": [{ "message": { "content": content } }]
     }))
     .into_response()
+}
+
+async fn rerank_mock(State(state): State<EmbeddingMockState>, Json(body): Json<Value>) -> Response {
+    let passage_count = body["passages"].as_array().map(Vec::len).unwrap_or(0);
+    state
+        .rerank_requests
+        .lock()
+        .expect("rerank request lock")
+        .push(body);
+    Json(serde_json::json!({
+        "rankings": (0..passage_count)
+            .map(|index| serde_json::json!({ "index": index, "logit": 1.0 - index as f64 }))
+            .collect::<Vec<_>>()
+    }))
+    .into_response()
+}
+
+fn test_state(pool: &PgPool, models: CloudModelClient, storage: Storage) -> Arc<AppState> {
+    Arc::new(AppState {
+        pool: pool.clone(),
+        models,
+        storage,
+        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
+        document_locks: crate::ingest::DocumentLocks::default(),
+    })
+}
+
+fn png_bytes(width: u32, height: u32, pixel: [u8; 4]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    image::RgbaImage::from_pixel(width, height, image::Rgba(pixel))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("encode PNG fixture");
+    bytes
+}
+
+/// Stores an original under its relative key and registers the document row,
+/// mirroring what upload does before background processing starts.
+async fn store_original(
+    pool: &PgPool,
+    storage: &Storage,
+    filename: &str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<(Uuid, String)> {
+    let document_id = Uuid::new_v4();
+    let extension = std::path::Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .expect("fixture filename has an extension");
+    let key = format!("{document_id}/original.{extension}");
+    storage.put(&key, bytes).await?;
+    sqlx::query(
+        "INSERT INTO documents \
+         (id, filename, storage_path, mime_type, status, artifact_status) \
+         VALUES ($1, $2, $3, 'application/octet-stream', 'processing', 'pending')",
+    )
+    .bind(document_id)
+    .bind(filename)
+    .bind(&key)
+    .execute(pool)
+    .await?;
+    Ok((document_id, key))
 }
 
 async fn spawn_embedding_mock(
@@ -102,10 +178,12 @@ async fn spawn_embedding_mock_with_timeout(
         summary_response: Arc::new(Mutex::new(
             r#"{"summary":"測試文件摘要","tags":["測試","文件","知識庫"]}"#.to_string(),
         )),
+        rerank_requests: Arc::new(Mutex::new(Vec::new())),
     };
     let app = Router::new()
         .route("/embeddings", post(embedding_mock))
         .route("/chat/completions", post(summary_mock))
+        .route("/ranking", post(rerank_mock))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -118,7 +196,8 @@ async fn spawn_embedding_mock_with_timeout(
     });
     let embed_endpoint = format!("http://{address}/embeddings");
     let chat_endpoint = format!("http://{address}/chat/completions");
-    let client = CloudModelClient::for_test_endpoints(&chat_endpoint, &embed_endpoint, timeout);
+    let client = CloudModelClient::for_test_endpoints(&chat_endpoint, &embed_endpoint, timeout)
+        .with_test_rerank_endpoint(&format!("http://{address}/ranking"));
     (client, state, handle)
 }
 
@@ -993,18 +1072,21 @@ async fn production_candidate_predicates_use_hnsw_and_gin_indexes(
 async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow::Result<()> {
     let document_id = Uuid::new_v4();
     let files_dir = std::env::temp_dir().join(format!("km-server-{document_id}"));
-    let document_dir = files_dir.join(document_id.to_string());
-    let artifact_dir = document_dir.join("artifacts-fixture");
-    let stale_temp_dir = document_dir.join(".artifacts-stale.tmp");
-    tokio::fs::create_dir_all(artifact_dir.join("pages")).await?;
-    tokio::fs::create_dir_all(&stale_temp_dir).await?;
-    let storage_path = document_dir.join("original.pdf");
-    let manifest_path = artifact_dir.join("manifest.json");
-    let page_path = artifact_dir.join("pages/0001.png");
-    tokio::fs::write(&storage_path, b"test document").await?;
-    tokio::fs::write(&manifest_path, b"{}").await?;
-    tokio::fs::write(&page_path, b"fixture").await?;
-    tokio::fs::write(stale_temp_dir.join("partial.png"), b"partial").await?;
+    let storage = Storage::local(&files_dir)?;
+    let storage_key = format!("{document_id}/original.pdf");
+    let artifact_dir = format!("{document_id}/artifacts-fixture");
+    let manifest_path = format!("{artifact_dir}/manifest.json");
+    let page_path = format!("{artifact_dir}/pages/0001.png");
+    // A run uploaded by an interrupted process is still below the prefix.
+    let stale_run_object = format!("{document_id}/artifacts-stale/pages/0001.png");
+    for (key, bytes) in [
+        (&storage_key, b"test document".to_vec()),
+        (&manifest_path, b"{}".to_vec()),
+        (&page_path, b"fixture".to_vec()),
+        (&stale_run_object, b"partial".to_vec()),
+    ] {
+        storage.put(key, bytes).await?;
+    }
 
     sqlx::query(
         "INSERT INTO documents \
@@ -1013,7 +1095,7 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
                  'provider-secret Authorization: Bearer should-never-leak')",
     )
     .bind(document_id)
-    .bind(storage_path.to_string_lossy().as_ref())
+    .bind(&storage_key)
     .execute(&pool)
     .await?;
     sqlx::query(
@@ -1022,8 +1104,8 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
          VALUES ($1, 'pdf', $2, $3)",
     )
     .bind(document_id)
-    .bind(artifact_dir.to_string_lossy().as_ref())
-    .bind(manifest_path.to_string_lossy().as_ref())
+    .bind(&artifact_dir)
+    .bind(&manifest_path)
     .execute(&pool)
     .await?;
     sqlx::query(
@@ -1032,7 +1114,7 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
          VALUES ($1, 1, $2, 640, 480, 'native text')",
     )
     .bind(document_id)
-    .bind(page_path.to_string_lossy().as_ref())
+    .bind(&page_path)
     .execute(&pool)
     .await?;
 
@@ -1040,21 +1122,16 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
     sqlx::query(
         "INSERT INTO document_units \
          (document_id, kind, unit_index, page_number, image_path, embedding) \
-         VALUES ($1, 'page', 0, 1, '/pages/1.png', $2)",
+         VALUES ($1, 'page', 0, 1, $2, $3)",
     )
     .bind(document_id)
+    .bind(&page_path)
     .bind(&embedding)
     .execute(&pool)
     .await?;
     insert_text_unit(&pool, document_id, 0, "api text", &embedding).await?;
 
-    let state = Arc::new(AppState {
-        pool: pool.clone(),
-        models: CloudModelClient::for_test(),
-        files_dir: files_dir.to_string_lossy().into_owned(),
-        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
-        document_locks: crate::ingest::DocumentLocks::default(),
-    });
+    let state = test_state(&pool, CloudModelClient::for_test(), storage.clone());
     let app = api_router(state.clone());
 
     let response = app
@@ -1116,7 +1193,11 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
     assert_eq!(document_count, 0);
     assert_eq!(unit_count, 0);
     assert_eq!(artifact_count, 0);
-    assert!(!document_dir.exists());
+    assert!(storage.list(&document_id.to_string()).await?.is_empty());
+    assert!(
+        !files_dir.join(document_id.to_string()).exists(),
+        "no empty document directory may remain"
+    );
 
     tokio::fs::remove_dir_all(files_dir).await?;
     Ok(())
@@ -1126,36 +1207,22 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
 async fn image_embedding_publish_is_idempotent_and_never_duplicates_units(
     pool: PgPool,
 ) -> anyhow::Result<()> {
-    let document_id = Uuid::new_v4();
-    let files_dir = std::env::temp_dir().join(format!("km-artifact-retry-{document_id}"));
-    let document_dir = files_dir.join(document_id.to_string());
-    let storage_path = document_dir.join("original.png");
-    tokio::fs::create_dir_all(&document_dir).await?;
-    image::RgbaImage::from_pixel(11, 7, image::Rgba([20, 40, 60, 255]))
-        .save_with_format(&storage_path, image::ImageFormat::Png)?;
-
-    sqlx::query(
-        "INSERT INTO documents \
-         (id, filename, storage_path, mime_type, status, artifact_status) \
-         VALUES ($1, 'retry.png', $2, 'image/png', 'processing', 'processing')",
+    let files_dir = std::env::temp_dir().join(format!("km-artifact-retry-{}", Uuid::new_v4()));
+    let storage = Storage::local(&files_dir)?;
+    let (document_id, storage_key) = store_original(
+        &pool,
+        &storage,
+        "retry.png",
+        png_bytes(11, 7, [20, 40, 60, 255]),
     )
-    .bind(document_id)
-    .bind(storage_path.to_string_lossy().as_ref())
-    .execute(&pool)
     .await?;
 
     let (models, mock, server) = spawn_embedding_mock(false).await;
-    let state = Arc::new(AppState {
-        pool: pool.clone(),
-        models,
-        files_dir: files_dir.to_string_lossy().into_owned(),
-        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
-        document_locks: crate::ingest::DocumentLocks::default(),
-    });
+    let state = test_state(&pool, models, storage.clone());
     crate::ingest::process_document(
         state.clone(),
         document_id,
-        storage_path.clone(),
+        storage_key.clone(),
         crate::page_artifacts::SourceKind::Image,
     )
     .await;
@@ -1172,20 +1239,27 @@ async fn image_embedding_publish_is_idempotent_and_never_duplicates_units(
             .fetch_one(&pool)
             .await?;
     assert_eq!(state_row, ("ready".to_string(), "ready".to_string()));
-    assert!(std::path::Path::new(&first_artifact_dir).is_dir());
-    assert!(
-        std::path::Path::new(&first_artifact_dir)
-            .join("manifest.json")
-            .is_file()
+    assert!(first_artifact_dir.starts_with(&format!("{document_id}/artifacts-")));
+    let first_objects = storage.list(&first_artifact_dir).await?;
+    let manifest_key = format!("{first_artifact_dir}/manifest.json");
+    assert!(first_objects.contains(&manifest_key), "{first_objects:?}");
+    assert!(first_objects.contains(&format!("{first_artifact_dir}/pages/0001.png")));
+    // The manifest records relative keys, never absolute local paths.
+    let manifest: crate::page_artifacts::ArtifactManifest =
+        serde_json::from_slice(&storage.get(document_id, &manifest_key, usize::MAX).await?)?;
+    assert_eq!(manifest.original_path, storage_key);
+    assert_eq!(
+        manifest.pages[0].image_path,
+        format!("{first_artifact_dir}/pages/0001.png")
     );
 
-    let stale_temp_dir = document_dir.join(".artifacts-interrupted.tmp");
-    tokio::fs::create_dir_all(&stale_temp_dir).await?;
-    tokio::fs::write(stale_temp_dir.join("partial.png"), b"partial").await?;
+    // A run uploaded by a process that died before its publishing commit.
+    let interrupted = format!("{document_id}/artifacts-interrupted/pages/0001.png");
+    storage.put(&interrupted, b"partial".to_vec()).await?;
     crate::ingest::process_document(
         state,
         document_id,
-        storage_path,
+        storage_key.clone(),
         crate::page_artifacts::SourceKind::Image,
     )
     .await;
@@ -1197,8 +1271,14 @@ async fn image_embedding_publish_is_idempotent_and_never_duplicates_units(
     .fetch_one(&pool)
     .await?;
     assert_ne!(first_artifact_dir, second_artifact_dir);
-    assert!(!std::path::Path::new(&first_artifact_dir).exists());
-    assert!(!stale_temp_dir.exists());
+    let objects = storage.list(&document_id.to_string()).await?;
+    assert!(
+        objects
+            .iter()
+            .all(|key| key == &storage_key || key.starts_with(&format!("{second_artifact_dir}/"))),
+        "superseded and interrupted runs must be removed: {objects:?}"
+    );
+    assert!(!files_dir.join(&first_artifact_dir).exists());
     let page_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM page_artifacts WHERE document_id = $1")
             .bind(document_id)
@@ -1237,35 +1317,21 @@ async fn image_embedding_publish_is_idempotent_and_never_duplicates_units(
 async fn embedding_failure_keeps_artifacts_ready_but_document_not_ready_and_retry_is_atomic(
     pool: PgPool,
 ) -> anyhow::Result<()> {
-    let document_id = Uuid::new_v4();
-    let files_dir = std::env::temp_dir().join(format!("km-embedding-failure-{document_id}"));
-    let document_dir = files_dir.join(document_id.to_string());
-    let storage_path = document_dir.join("original.png");
-    tokio::fs::create_dir_all(&document_dir).await?;
-    image::RgbaImage::from_pixel(12, 8, image::Rgba([80, 40, 20, 255]))
-        .save_with_format(&storage_path, image::ImageFormat::Png)?;
-    sqlx::query(
-        "INSERT INTO documents \
-         (id, filename, storage_path, mime_type, status, artifact_status) \
-         VALUES ($1, 'failure.png', $2, 'image/png', 'processing', 'processing')",
+    let storage = Storage::memory();
+    let (document_id, storage_key) = store_original(
+        &pool,
+        &storage,
+        "failure.png",
+        png_bytes(12, 8, [80, 40, 20, 255]),
     )
-    .bind(document_id)
-    .bind(storage_path.to_string_lossy().as_ref())
-    .execute(&pool)
     .await?;
 
     let (models, mock, server) = spawn_embedding_mock(true).await;
-    let state = Arc::new(AppState {
-        pool: pool.clone(),
-        models,
-        files_dir: files_dir.to_string_lossy().into_owned(),
-        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
-        document_locks: crate::ingest::DocumentLocks::default(),
-    });
+    let state = test_state(&pool, models, storage);
     crate::ingest::process_document(
         state.clone(),
         document_id,
-        storage_path.clone(),
+        storage_key.clone(),
         crate::page_artifacts::SourceKind::Image,
     )
     .await;
@@ -1284,7 +1350,7 @@ async fn embedding_failure_keeps_artifacts_ready_but_document_not_ready_and_retr
     assert!(error.contains("embedding-request"));
     assert!(error.contains("unit=0"));
     assert!(error.contains("page=1"));
-    assert!(!error.contains(storage_path.to_string_lossy().as_ref()));
+    assert!(!error.contains(&storage_key));
     assert!(!error.contains("base64"));
     let failed_counts: (i64, i64) = sqlx::query_as(
         "SELECT \
@@ -1299,9 +1365,9 @@ async fn embedding_failure_keeps_artifacts_ready_but_document_not_ready_and_retr
 
     mock.fail.store(false, Ordering::SeqCst);
     crate::ingest::process_document(
-        state,
+        state.clone(),
         document_id,
-        storage_path,
+        storage_key.clone(),
         crate::page_artifacts::SourceKind::Image,
     )
     .await;
@@ -1320,8 +1386,33 @@ async fn embedding_failure_keeps_artifacts_ready_but_document_not_ready_and_retr
     assert_eq!(ready_count, 1);
     assert_eq!(mock.requests.lock().expect("request lock").len(), 2);
 
+    // A failed re-run of a ready document keeps the run behind its current units,
+    // because superseded runs are removed only after the new units are promoted.
+    mock.fail.store(true, Ordering::SeqCst);
+    crate::ingest::process_document(
+        state.clone(),
+        document_id,
+        storage_key,
+        crate::page_artifacts::SourceKind::Image,
+    )
+    .await;
+    let unit_keys: Vec<String> = sqlx::query_scalar(
+        "SELECT image_path FROM document_units \
+         WHERE document_id = $1 AND image_path IS NOT NULL",
+    )
+    .bind(document_id)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(unit_keys.len(), 1);
+    for key in unit_keys {
+        state
+            .storage
+            .get(document_id, &key, usize::MAX)
+            .await
+            .expect("unit image must survive a failed re-run");
+    }
+
     server.abort();
-    tokio::fs::remove_dir_all(files_dir).await?;
     Ok(())
 }
 
@@ -1332,32 +1423,21 @@ async fn summary_success_and_permanent_failures_publish_ready_without_reembeddin
     async fn process_text_fixture(
         pool: &PgPool,
         state: Arc<AppState>,
-        root: &std::path::Path,
         filename: &str,
     ) -> anyhow::Result<Uuid> {
-        let document_id = Uuid::new_v4();
-        let document_dir = root.join(document_id.to_string());
-        tokio::fs::create_dir_all(&document_dir).await?;
-        let storage_path = document_dir.join("original.md");
-        tokio::fs::write(
-            &storage_path,
-            "# 測試文件\n\n這是供摘要與索引測試使用的繁體中文內容。",
+        let (document_id, storage_key) = store_original(
+            pool,
+            &state.storage,
+            filename,
+            "# 測試文件\n\n這是供摘要與索引測試使用的繁體中文內容。"
+                .as_bytes()
+                .to_vec(),
         )
-        .await?;
-        sqlx::query(
-            "INSERT INTO documents \
-             (id, filename, storage_path, mime_type, status, artifact_status) \
-             VALUES ($1, $2, $3, 'text/markdown', 'processing', 'pending')",
-        )
-        .bind(document_id)
-        .bind(filename)
-        .bind(storage_path.to_string_lossy().as_ref())
-        .execute(pool)
         .await?;
         crate::ingest::process_document(
             state,
             document_id,
-            storage_path,
+            storage_key,
             crate::page_artifacts::SourceKind::Text,
         )
         .await;
@@ -1385,19 +1465,11 @@ async fn summary_success_and_permanent_failures_publish_ready_without_reembeddin
         .await?)
     }
 
-    let root = std::env::temp_dir().join(format!("km-summary-{}", Uuid::new_v4()));
-    tokio::fs::create_dir_all(&root).await?;
     let (models, mock, server) =
         spawn_embedding_mock_with_timeout(false, Duration::from_millis(20)).await;
-    let state = Arc::new(AppState {
-        pool: pool.clone(),
-        models,
-        files_dir: root.to_string_lossy().into_owned(),
-        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
-        document_locks: crate::ingest::DocumentLocks::default(),
-    });
+    let state = test_state(&pool, models, Storage::memory());
 
-    let success = process_text_fixture(&pool, state.clone(), &root, "success.md").await?;
+    let success = process_text_fixture(&pool, state.clone(), "success.md").await?;
     let success_row = metadata_row(&pool, success).await?;
     assert_eq!(success_row.0, "ready");
     assert_eq!(success_row.1, "ready");
@@ -1415,7 +1487,7 @@ async fn summary_success_and_permanent_failures_publish_ready_without_reembeddin
 
     mock.summary_status
         .store(StatusCode::TOO_MANY_REQUESTS.as_u16(), Ordering::SeqCst);
-    let rate_limited = process_text_fixture(&pool, state.clone(), &root, "rate-limit.md").await?;
+    let rate_limited = process_text_fixture(&pool, state.clone(), "rate-limit.md").await?;
     let rate_limited_row = metadata_row(&pool, rate_limited).await?;
     assert_eq!(
         rate_limited_row,
@@ -1432,7 +1504,7 @@ async fn summary_success_and_permanent_failures_publish_ready_without_reembeddin
     mock.summary_status
         .store(StatusCode::OK.as_u16(), Ordering::SeqCst);
     *mock.summary_response.lock().expect("summary response lock") = "not-json".to_string();
-    let malformed = process_text_fixture(&pool, state.clone(), &root, "malformed.md").await?;
+    let malformed = process_text_fixture(&pool, state.clone(), "malformed.md").await?;
     let malformed_row = metadata_row(&pool, malformed).await?;
     assert_eq!(malformed_row.0, "ready");
     assert_eq!(malformed_row.1, "ready");
@@ -1444,7 +1516,7 @@ async fn summary_success_and_permanent_failures_publish_ready_without_reembeddin
     *mock.summary_response.lock().expect("summary response lock") =
         r#"{"summary":"不應抵達","tags":["一","二","三"]}"#.to_string();
     mock.summary_delay_ms.store(100, Ordering::SeqCst);
-    let timed_out = process_text_fixture(&pool, state, &root, "timeout.md").await?;
+    let timed_out = process_text_fixture(&pool, state, "timeout.md").await?;
     let timed_out_row = metadata_row(&pool, timed_out).await?;
     assert_eq!(timed_out_row.0, "ready");
     assert_eq!(timed_out_row.1, "ready");
@@ -1468,7 +1540,6 @@ async fn summary_success_and_permanent_failures_publish_ready_without_reembeddin
     );
 
     server.abort();
-    tokio::fs::remove_dir_all(root).await?;
     Ok(())
 }
 
@@ -1476,22 +1547,22 @@ async fn summary_success_and_permanent_failures_publish_ready_without_reembeddin
 async fn page_image_and_text_are_promoted_to_one_matching_halfvec_unit(
     pool: PgPool,
 ) -> anyhow::Result<()> {
+    let storage = Storage::memory();
     let document_id = Uuid::new_v4();
-    let root = std::env::temp_dir().join(format!("km-mixed-page-{document_id}"));
-    let artifact_dir = root.join("artifacts-fixture");
-    let page_path = artifact_dir.join("pages/0001.png");
-    tokio::fs::create_dir_all(page_path.parent().expect("page parent")).await?;
-    image::RgbaImage::from_pixel(16, 9, image::Rgba([10, 30, 50, 255]))
-        .save_with_format(&page_path, image::ImageFormat::Png)?;
-    let original_path = root.join("original.pdf");
-    tokio::fs::write(&original_path, b"fixture").await?;
+    let artifact_dir = format!("{document_id}/artifacts-fixture");
+    let page_path = format!("{artifact_dir}/pages/0001.png");
+    storage
+        .put(&page_path, png_bytes(16, 9, [10, 30, 50, 255]))
+        .await?;
+    let original_key = format!("{document_id}/original.pdf");
+    storage.put(&original_key, b"fixture".to_vec()).await?;
     sqlx::query(
         "INSERT INTO documents \
          (id, filename, storage_path, mime_type, status, artifact_status) \
          VALUES ($1, 'mixed.pdf', $2, 'application/pdf', 'processing', 'ready')",
     )
     .bind(document_id)
-    .bind(original_path.to_string_lossy().as_ref())
+    .bind(&original_key)
     .execute(&pool)
     .await?;
     sqlx::query(
@@ -1500,19 +1571,14 @@ async fn page_image_and_text_are_promoted_to_one_matching_halfvec_unit(
          VALUES ($1, 'pdf', $2, $3)",
     )
     .bind(document_id)
-    .bind(artifact_dir.to_string_lossy().as_ref())
-    .bind(
-        artifact_dir
-            .join("manifest.json")
-            .to_string_lossy()
-            .as_ref(),
-    )
+    .bind(&artifact_dir)
+    .bind(format!("{artifact_dir}/manifest.json"))
     .execute(&pool)
     .await?;
     let page = crate::page_artifacts::PageArtifact {
         document_id,
         page_number: 1,
-        image_path: page_path.to_string_lossy().into_owned(),
+        image_path: page_path.clone(),
         width: 16,
         height: 9,
         extracted_text: Some("native same-page text".to_string()),
@@ -1532,13 +1598,7 @@ async fn page_image_and_text_are_promoted_to_one_matching_halfvec_unit(
     .await?;
 
     let (models, mock, server) = spawn_embedding_mock(false).await;
-    let state = AppState {
-        pool: pool.clone(),
-        models,
-        files_dir: root.to_string_lossy().into_owned(),
-        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
-        document_locks: crate::ingest::DocumentLocks::default(),
-    };
+    let state = test_state(&pool, models, storage);
     crate::ingest::embed_published_artifacts_for_test(&state, document_id, &[page], &[])
         .await
         .map_err(anyhow::Error::msg)?;
@@ -1559,7 +1619,7 @@ async fn page_image_and_text_are_promoted_to_one_matching_halfvec_unit(
     assert_eq!(unit.0, "page");
     assert_eq!((unit.1, unit.2), (0, 1));
     assert_eq!(unit.3.as_deref(), Some("native same-page text"));
-    assert_eq!(unit.4, page_path.to_string_lossy());
+    assert_eq!(unit.4, page_path);
     assert_eq!(
         unit.5.as_slice().len(),
         crate::embedding::EMBEDDING_DIMENSIONS
@@ -1575,50 +1635,35 @@ async fn page_image_and_text_are_promoted_to_one_matching_halfvec_unit(
         let requests = mock.requests.lock().expect("request lock");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["input_type"], "passage");
-        assert_eq!(requests[0]["modality"], "text_image");
+        assert_eq!(requests[0]["modality"], serde_json::json!(["text_image"]));
         let input = requests[0]["input"][0]
             .as_str()
             .expect("mixed input string");
         assert!(input.starts_with("native same-page text\n<img src=\"data:image/png;base64,"));
-        assert!(!input.contains(page_path.to_string_lossy().as_ref()));
+        assert!(!input.contains(&page_path));
     }
 
     server.abort();
-    tokio::fs::remove_dir_all(root).await?;
     Ok(())
 }
 
 #[sqlx::test]
 async fn failed_conversion_can_retry_without_partial_artifacts(pool: PgPool) -> anyhow::Result<()> {
-    let document_id = Uuid::new_v4();
-    let files_dir = std::env::temp_dir().join(format!("km-artifact-failure-{document_id}"));
-    let document_dir = files_dir.join(document_id.to_string());
-    let storage_path = document_dir.join("original.png");
-    tokio::fs::create_dir_all(&document_dir).await?;
-    tokio::fs::write(&storage_path, b"not an image").await?;
-
-    sqlx::query(
-        "INSERT INTO documents \
-         (id, filename, storage_path, mime_type, status, artifact_status) \
-         VALUES ($1, 'retry-after-failure.png', $2, 'image/png', 'processing', 'processing')",
+    let storage = Storage::memory();
+    let (document_id, storage_key) = store_original(
+        &pool,
+        &storage,
+        "retry-after-failure.png",
+        b"not an image".to_vec(),
     )
-    .bind(document_id)
-    .bind(storage_path.to_string_lossy().as_ref())
-    .execute(&pool)
     .await?;
 
     let (models, mock, server) = spawn_embedding_mock(false).await;
-    let state = Arc::new(AppState {
-        pool: pool.clone(),
-        models,
-        files_dir: files_dir.to_string_lossy().into_owned(),
-        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
-        document_locks: crate::ingest::DocumentLocks::default(),
-    });
+    let state = test_state(&pool, models, storage.clone());
     crate::ingest::process_document(
         state.clone(),
         document_id,
-        storage_path.clone(),
+        storage_key.clone(),
         crate::page_artifacts::SourceKind::Image,
     )
     .await;
@@ -1638,21 +1683,19 @@ async fn failed_conversion_can_retry_without_partial_artifacts(pool: PgPool) -> 
             .fetch_one(&pool)
             .await?;
     assert_eq!(failed_artifact_count, 0);
-    let mut entries = tokio::fs::read_dir(&document_dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        assert!(
-            !name.starts_with(".artifacts-") && !name.starts_with("artifacts-"),
-            "failed run left a partial artifact directory: {name}"
-        );
-    }
+    assert_eq!(
+        storage.list(&document_id.to_string()).await?,
+        vec![storage_key.clone()],
+        "failed run left partial artifacts"
+    );
 
-    image::RgbaImage::from_pixel(9, 5, image::Rgba([30, 60, 90, 255]))
-        .save_with_format(&storage_path, image::ImageFormat::Png)?;
+    storage
+        .put(&storage_key, png_bytes(9, 5, [30, 60, 90, 255]))
+        .await?;
     crate::ingest::process_document(
         state,
         document_id,
-        storage_path,
+        storage_key,
         crate::page_artifacts::SourceKind::Image,
     )
     .await;
@@ -1676,47 +1719,184 @@ async fn failed_conversion_can_retry_without_partial_artifacts(pool: PgPool) -> 
     assert_eq!(mock.requests.lock().expect("request lock").len(), 1);
 
     server.abort();
-    tokio::fs::remove_dir_all(files_dir).await?;
     Ok(())
 }
 
 #[sqlx::test]
-async fn delete_keeps_a_retry_handle_when_filesystem_cleanup_fails(
+async fn partial_artifact_upload_is_removed_and_never_referenced(
     pool: PgPool,
 ) -> anyhow::Result<()> {
-    let document_id = Uuid::new_v4();
-    let files_dir = std::env::temp_dir().join(format!("km-delete-retry-{document_id}"));
-    tokio::fs::create_dir_all(&files_dir).await?;
-    let document_path = files_dir.join(document_id.to_string());
-    // A regular file at the expected directory path makes remove_dir_all fail
-    // deterministically without relying on platform-specific permissions.
-    tokio::fs::write(&document_path, b"not a directory").await?;
-    let storage_path = document_path.join("original.pdf");
+    // Pages upload before the manifest, so failing the manifest leaves a
+    // partial run in storage that must be removed before anything references it.
+    let storage = Storage::memory().failing_puts_containing("/manifest.json");
+    let (document_id, storage_key) = store_original(
+        &pool,
+        &storage,
+        "partial.png",
+        png_bytes(9, 5, [1, 2, 3, 255]),
+    )
+    .await?;
+    let (models, mock, server) = spawn_embedding_mock(false).await;
+    crate::ingest::process_document(
+        test_state(&pool, models, storage.clone()),
+        document_id,
+        storage_key.clone(),
+        crate::page_artifacts::SourceKind::Image,
+    )
+    .await;
 
-    sqlx::query(
-        "INSERT INTO documents \
-         (id, filename, storage_path, mime_type, status, artifact_status) \
-         VALUES ($1, 'cleanup.pdf', $2, 'application/pdf', 'failed', 'failed')",
+    let (status, artifact_status, error): (String, String, Option<String>) =
+        sqlx::query_as("SELECT status, artifact_status, error FROM documents WHERE id = $1")
+            .bind(document_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        (status.as_str(), artifact_status.as_str()),
+        ("failed", "failed")
+    );
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("artifact-publish")),
+        "{error:?}"
+    );
+    let artifact_rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM document_artifact_sets WHERE document_id = $1) \
+              + (SELECT count(*) FROM page_artifacts WHERE document_id = $1)",
     )
     .bind(document_id)
-    .bind(storage_path.to_string_lossy().as_ref())
-    .execute(&pool)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(artifact_rows, 0);
+    assert_eq!(
+        storage.list(&document_id.to_string()).await?,
+        vec![storage_key]
+    );
+    assert!(mock.requests.lock().expect("request lock").is_empty());
+
+    server.abort();
+    Ok(())
+}
+
+#[sqlx::test]
+async fn failed_publication_commit_keeps_the_previous_artifact_set_complete(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let storage = Storage::memory();
+    let (document_id, storage_key) = store_original(
+        &pool,
+        &storage,
+        "commit.png",
+        png_bytes(10, 6, [5, 6, 7, 255]),
+    )
+    .await?;
+    let (models, _mock, server) = spawn_embedding_mock(false).await;
+    let state = test_state(&pool, models, storage.clone());
+    crate::ingest::process_document(
+        state.clone(),
+        document_id,
+        storage_key.clone(),
+        crate::page_artifacts::SourceKind::Image,
+    )
+    .await;
+    let published: String = sqlx::query_scalar(
+        "SELECT artifact_dir FROM document_artifact_sets WHERE document_id = $1",
+    )
+    .bind(document_id)
+    .fetch_one(&pool)
     .await?;
 
-    let state = Arc::new(AppState {
-        pool: pool.clone(),
-        models: CloudModelClient::for_test(),
-        files_dir: files_dir.to_string_lossy().into_owned(),
-        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
-        document_locks: crate::ingest::DocumentLocks::default(),
-    });
-    let app = api_router(state);
+    // A deferred constraint trigger makes the next publication fail inside COMMIT.
+    sqlx::raw_sql(
+        "CREATE FUNCTION km_test_fail_commit() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected commit failure'; END $$; \
+         CREATE CONSTRAINT TRIGGER km_test_fail_commit \
+         AFTER INSERT ON document_artifact_sets \
+         DEFERRABLE INITIALLY DEFERRED \
+         FOR EACH ROW EXECUTE FUNCTION km_test_fail_commit();",
+    )
+    .execute(&pool)
+    .await?;
+    crate::ingest::process_document(
+        state,
+        document_id,
+        storage_key.clone(),
+        crate::page_artifacts::SourceKind::Image,
+    )
+    .await;
+
+    let error: Option<String> = sqlx::query_scalar("SELECT error FROM documents WHERE id = $1")
+        .bind(document_id)
+        .fetch_one(&pool)
+        .await?;
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected commit failure")),
+        "{error:?}"
+    );
+    let artifact_dir: String = sqlx::query_scalar(
+        "SELECT artifact_dir FROM document_artifact_sets WHERE document_id = $1",
+    )
+    .bind(document_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        artifact_dir, published,
+        "the rolled-back run must not replace it"
+    );
+    let referenced: Vec<String> = sqlx::query_scalar(
+        "SELECT manifest_path FROM document_artifact_sets WHERE document_id = $1 \
+         UNION ALL SELECT image_path FROM page_artifacts WHERE document_id = $1 \
+         UNION ALL SELECT image_path FROM document_units \
+                   WHERE document_id = $1 AND image_path IS NOT NULL",
+    )
+    .bind(document_id)
+    .fetch_all(&pool)
+    .await?;
+    let stored = storage.list(&document_id.to_string()).await?;
+    assert_eq!(referenced.len(), 3);
+    for key in &referenced {
+        assert!(
+            stored.contains(key),
+            "DB references a missing object: {key}"
+        );
+    }
+    assert!(
+        stored
+            .iter()
+            .all(|key| key == &storage_key || key.starts_with(&format!("{published}/"))),
+        "the failed run must leave no objects: {stored:?}"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[sqlx::test]
+async fn delete_keeps_a_retry_handle_when_storage_cleanup_fails(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let files_dir = std::env::temp_dir().join(format!("km-delete-retry-{}", Uuid::new_v4()));
+    let storage = Storage::local(&files_dir)?;
+    let (document_id, _) =
+        store_original(&pool, &storage, "cleanup.pdf", b"fixture".to_vec()).await?;
+    // A regular file at the document directory path makes the local prefix
+    // delete fail deterministically without relying on platform permissions.
+    let document_dir = files_dir.join(document_id.to_string());
+    std::fs::remove_dir_all(&document_dir)?;
+    std::fs::write(&document_dir, b"not a directory")?;
+
+    let app = api_router(test_state(&pool, CloudModelClient::for_test(), storage));
     let request = Request::builder()
         .method("DELETE")
         .uri(format!("/api/documents/{document_id}"))
         .body(Body::empty())?;
     let response = app.clone().oneshot(request).await?;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    assert!(!String::from_utf8_lossy(&body).contains(files_dir.to_string_lossy().as_ref()));
 
     let document_count: i64 = sqlx::query_scalar("SELECT count(*) FROM documents WHERE id = $1")
         .bind(document_id)
@@ -1724,7 +1904,16 @@ async fn delete_keeps_a_retry_handle_when_filesystem_cleanup_fails(
         .await?;
     assert_eq!(document_count, 1, "failed cleanup must remain retryable");
 
-    tokio::fs::remove_file(&document_path).await?;
+    let status: String = sqlx::query_scalar("SELECT status FROM documents WHERE id = $1")
+        .bind(document_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        status, "failed",
+        "a half-deleted document must leave retrieval"
+    );
+
+    std::fs::remove_file(&document_dir)?;
     let retry = Request::builder()
         .method("DELETE")
         .uri(format!("/api/documents/{document_id}"))
@@ -1736,6 +1925,7 @@ async fn delete_keeps_a_retry_handle_when_filesystem_cleanup_fails(
         .fetch_one(&pool)
         .await?;
     assert_eq!(document_count, 0);
+    assert!(!document_dir.exists());
 
     tokio::fs::remove_dir_all(files_dir).await?;
     Ok(())
@@ -1744,48 +1934,27 @@ async fn delete_keeps_a_retry_handle_when_filesystem_cleanup_fails(
 #[sqlx::test]
 async fn markdown_and_text_fixtures_keep_heading_aware_staging(pool: PgPool) -> anyhow::Result<()> {
     let root = std::env::temp_dir().join(format!("km-text-fixtures-{}", Uuid::new_v4()));
-    let fixture_source_dir = root.join("sources");
-    let fixtures = crate::test_fixtures::write_all(&fixture_source_dir)?;
+    let fixtures = crate::test_fixtures::write_all(&root)?;
     let (models, mock, server) = spawn_embedding_mock(false).await;
-    let state = Arc::new(AppState {
-        pool: pool.clone(),
-        models,
-        files_dir: root.to_string_lossy().into_owned(),
-        artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
-        document_locks: crate::ingest::DocumentLocks::default(),
-    });
+    let state = test_state(&pool, models, Storage::memory());
 
     for (filename, fixture) in [
         ("headings.md", fixtures.markdown),
         ("plain.txt", fixtures.text),
         ("hybrid-retrieval.md", fixtures.hybrid_retrieval),
     ] {
-        let document_id = Uuid::new_v4();
-        let document_dir = root.join(document_id.to_string());
-        tokio::fs::create_dir(&document_dir).await?;
-        let storage_path = document_dir.join(format!(
-            "original.{}",
-            std::path::Path::new(filename)
-                .extension()
-                .unwrap()
-                .to_string_lossy()
-        ));
-        tokio::fs::copy(fixture, &storage_path).await?;
-        sqlx::query(
-            "INSERT INTO documents \
-             (id, filename, storage_path, mime_type, status, artifact_status) \
-             VALUES ($1, $2, $3, 'text/plain', 'processing', 'processing')",
+        let (document_id, storage_key) = store_original(
+            &pool,
+            &state.storage,
+            filename,
+            tokio::fs::read(fixture).await?,
         )
-        .bind(document_id)
-        .bind(filename)
-        .bind(storage_path.to_string_lossy().as_ref())
-        .execute(&pool)
         .await?;
 
         crate::ingest::process_document(
             state.clone(),
             document_id,
-            storage_path,
+            storage_key,
             crate::page_artifacts::SourceKind::Text,
         )
         .await;
@@ -1820,7 +1989,7 @@ async fn markdown_and_text_fixtures_keep_heading_aware_staging(pool: PgPool) -> 
         assert!(requests.len() >= 2);
         assert!(requests.iter().all(|request| {
             request["input_type"] == "passage"
-                && request["modality"] == "text"
+                && request["modality"] == serde_json::json!(["text"])
                 && request["input"][0]
                     .as_str()
                     .is_some_and(|input| !input.trim().is_empty())
@@ -1829,5 +1998,273 @@ async fn markdown_and_text_fixtures_keep_heading_aware_staging(pool: PgPool) -> 
 
     server.abort();
     tokio::fs::remove_dir_all(root).await?;
+    Ok(())
+}
+
+/// Upload -> ready -> answer (dense retrieval, VL rerank and RAG all read the
+/// page image through storage) -> delete, for any storage backend.
+async fn upload_answer_delete_flow(pool: &PgPool, storage: Storage) -> anyhow::Result<()> {
+    let (models, mock, server) = spawn_embedding_mock(false).await;
+    let app = api_router(test_state(pool, models, storage.clone()));
+
+    let boundary = "km-storage-flow";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+         filename=\"blue-page.png\"\r\nContent-Type: image/png\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend(png_bytes(24, 16, [40, 80, 160, 255]));
+    body.extend(format!("\r\n--{boundary}--\r\n").into_bytes());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/documents")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let uploaded: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+    let document_id: Uuid = uploaded["id"].as_str().expect("upload id").parse()?;
+
+    // Processing runs in the background; wait for its atomic ready publication.
+    let mut status = String::from("processing");
+    for _ in 0..400 {
+        status = sqlx::query_scalar("SELECT status FROM documents WHERE id = $1")
+            .bind(document_id)
+            .fetch_one(pool)
+            .await?;
+        if status != "processing" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(status, "ready");
+    let (storage_path, image_path): (String, String) = sqlx::query_as(
+        "SELECT d.storage_path, u.image_path \
+         FROM documents d JOIN document_units u ON u.document_id = d.id \
+         WHERE d.id = $1",
+    )
+    .bind(document_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(storage_path, format!("{document_id}/original.png"));
+    assert!(
+        image_path.starts_with(&format!("{document_id}/artifacts-"))
+            && image_path.ends_with("/pages/0001.png"),
+        "{image_path}"
+    );
+    let stored = storage.list(&document_id.to_string()).await?;
+    assert!(
+        stored.contains(&storage_path) && stored.contains(&image_path),
+        "{stored:?}"
+    );
+
+    let question = serde_json::json!({
+        "messages": [{ "role": "user", "content": "這一頁是什麼顏色？" }]
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(question.to_string()))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
+    let events = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let kinds = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["text-delta", "sources", "done"], "{body}");
+    assert_eq!(
+        events[1]["sources"][0]["documentId"],
+        document_id.to_string()
+    );
+    assert_eq!(events[1]["sources"][0]["pageNumber"], 1);
+    {
+        let reranks = mock.rerank_requests.lock().expect("rerank request lock");
+        assert_eq!(reranks.len(), 1);
+        assert!(
+            reranks[0]["passages"][0]["image"]
+                .as_str()
+                .is_some_and(|image| image.starts_with("data:image/png;base64,"))
+        );
+        let chats = mock.summary_requests.lock().expect("chat request lock");
+        let answer = chats
+            .iter()
+            .find(|request| request["stream"] == true)
+            .expect("streamed answer request")
+            .to_string();
+        assert!(answer.contains("data:image/jpeg;base64,"));
+        assert!(
+            !answer.contains(&image_path),
+            "keys must never reach the model"
+        );
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/documents/{document_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(storage.list(&document_id.to_string()).await?.is_empty());
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM documents WHERE id = $1")
+        .bind(document_id)
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(remaining, 0);
+
+    server.abort();
+    Ok(())
+}
+
+#[sqlx::test]
+async fn upload_answer_delete_flow_with_local_storage(pool: PgPool) -> anyhow::Result<()> {
+    let files_dir = std::env::temp_dir().join(format!("km-flow-local-{}", Uuid::new_v4()));
+    upload_answer_delete_flow(&pool, Storage::local(&files_dir)?).await?;
+    assert_eq!(
+        std::fs::read_dir(&files_dir)?.count(),
+        0,
+        "delete must not leave an empty document directory"
+    );
+    std::fs::remove_dir_all(files_dir)?;
+    Ok(())
+}
+
+#[sqlx::test]
+async fn upload_answer_delete_flow_with_in_memory_storage(pool: PgPool) -> anyhow::Result<()> {
+    upload_answer_delete_flow(&pool, Storage::memory()).await
+}
+
+/// Opt-in smoke against a real S3-compatible endpoint; the command is in README.
+#[sqlx::test]
+#[ignore = "requires MinIO/S3 via STORAGE_BACKEND=s3, S3_BUCKET and AWS_*"]
+async fn minio_smoke_upload_answer_delete(pool: PgPool) -> anyhow::Result<()> {
+    let config = StorageConfig::from_env()?;
+    anyhow::ensure!(
+        matches!(config, StorageConfig::S3 { .. }),
+        "set STORAGE_BACKEND=s3 for the MinIO smoke test"
+    );
+    let storage = config.open().await?;
+    ensure_initialization_lock(&pool, &config).await?;
+    upload_answer_delete_flow(&pool, storage).await
+}
+
+#[sqlx::test]
+async fn first_start_records_the_backend_and_only_files_dir_may_change(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    ensure_initialization_lock(
+        &pool,
+        &StorageConfig::Local {
+            files_dir: "/srv/km/files".into(),
+        },
+    )
+    .await?;
+    let recorded: (String, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT backend, s3_bucket, s3_prefix FROM storage_settings")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(recorded, ("local".to_owned(), None, None));
+
+    // FILES_DIR is a mount point, not part of the stored keys.
+    ensure_initialization_lock(
+        &pool,
+        &StorageConfig::Local {
+            files_dir: "/mnt/other-volume".into(),
+        },
+    )
+    .await?;
+
+    let error = ensure_initialization_lock(
+        &pool,
+        &StorageConfig::S3 {
+            bucket: "km-files".to_owned(),
+            prefix: None,
+        },
+    )
+    .await
+    .expect_err("backend change must fail")
+    .to_string();
+    assert!(error.contains("儲存後端已於初始化時鎖定，變更需重新初始化 DB 與儲存空間"));
+    assert!(error.contains("已鎖定：backend=local"), "{error}");
+    assert!(
+        error.contains("目前設定：backend=s3, bucket=km-files"),
+        "{error}"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM storage_settings")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(rows, 1);
+    Ok(())
+}
+
+#[sqlx::test]
+async fn s3_lock_covers_bucket_and_prefix_but_not_the_endpoint(pool: PgPool) -> anyhow::Result<()> {
+    let s3 = |bucket: &str, prefix: Option<&str>| StorageConfig::S3 {
+        bucket: bucket.to_owned(),
+        prefix: prefix.map(str::to_owned),
+    };
+    ensure_initialization_lock(&pool, &s3("km-files", Some("tenant-a"))).await?;
+    // The endpoint only lives in AWS_*, so moving endpoints restarts with the
+    // identical recorded identity.
+    ensure_initialization_lock(&pool, &s3("km-files", Some("tenant-a"))).await?;
+    for changed in [
+        s3("km-other", Some("tenant-a")),
+        s3("km-files", Some("tenant-b")),
+        s3("km-files", None),
+        StorageConfig::Local {
+            files_dir: "./data/files".into(),
+        },
+    ] {
+        let error = ensure_initialization_lock(&pool, &changed)
+            .await
+            .expect_err("changed storage identity must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("儲存後端已於初始化時鎖定，變更需重新初始化 DB 與儲存空間")
+        );
+    }
+    Ok(())
+}
+
+#[sqlx::test]
+async fn unlocked_database_with_documents_requires_reinitialization(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    insert_document(&pool, "ready").await?;
+    let error = ensure_initialization_lock(
+        &pool,
+        &StorageConfig::Local {
+            files_dir: "./data/files".into(),
+        },
+    )
+    .await
+    .expect_err("pre-upgrade data must not be adopted");
+    assert!(error.to_string().contains("需清空 DB 與檔案後重新初始化"));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM storage_settings")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(rows, 0);
     Ok(())
 }

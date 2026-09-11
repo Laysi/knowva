@@ -22,7 +22,7 @@
 | 後端 | Rust（axum + tokio + sqlx），單一 binary |
 | 資料庫 | PostgreSQL 17 + pgvector |
 | 模型呼叫 | 單一 cloud-model HTTP client；Gemma 4 + Nemotron Embed/Rerank VL |
-| 檔案儲存 | `backend/data/files/{document_id}/`；原檔與每次完整 artifact run 分開保存 |
+| 檔案儲存 | 初始化時選定本機 `FILES_DIR` 或 S3 相容物件儲存（`object_store`）；DB 只存 `{document_id}/...` 相對 key，原檔與每次完整 artifact run 分開保存 |
 
 ## 前置需求
 
@@ -74,13 +74,51 @@ Gateway token、chat model、endpoint 或 rerank 設定無效時，後端會在�
 
 | 環境變數 | 預設值 | 說明 |
 |---|---|---|
-| `FILES_DIR` | `./data/files` | 原檔、頁圖、轉出 PDF 與 manifest 的根目錄 |
+| `FILES_DIR` | `./data/files` | `STORAGE_BACKEND=local` 時原檔、頁圖、轉出 PDF 與 manifest 的根目錄 |
 | `PDF_RENDER_DPI` | `180` | Pdfium rasterize DPI；允許 72–600 |
 | `DOCUMENT_CONVERSION_TIMEOUT_SECS` | `120` | 每次 Pdfium 圖片處理或 LibreOffice 轉檔 timeout，必須為正整數 |
 | `PDFIUM_LIBRARY_PATH` | 空 | 完整 library 路徑或所在目錄；空值時依序搜尋執行檔旁與系統 library path |
 | `LIBREOFFICE_BIN` | `libreoffice` | LibreOffice executable 路徑或命令名 |
 
 支援 PDF、PNG/JPEG/WebP、DOCX/PPTX/XLSX、MD/Markdown/TXT、STP/STEP 與 EML/MSG。STP/STEP 與 EML 會以文字內容建立檢索單元；MSG 保存原檔並建立檔案描述單元。MP4/AVI 目前不接受上傳，待 VLM 支援影片後再開放。CSV/HTML 與舊版 Office 格式目前不在支援清單。
+
+### 檔案儲存後端（初始化時鎖定）
+
+原檔、頁圖、轉出 PDF 與 manifest 可存放在本機檔案系統或 S3 相容物件儲存（AWS S3、Cloudflare R2、地端 MinIO），兩者走同一條程式路徑；未設定時與過去一樣使用本機 `FILES_DIR`。
+
+| 環境變數 | 預設值 | 說明 |
+|---|---|---|
+| `STORAGE_BACKEND` | `local` | `local` 或 `s3`；其他值啟動即失敗 |
+| `FILES_DIR` | `./data/files` | `local` 的根目錄 |
+| `S3_BUCKET` | 空 | `s3` 必填 |
+| `S3_PREFIX` | 空 | `s3` 選填的 key 前綴，例如 `tenant-a/prod` |
+| `AWS_*` | 標準 AWS 變數 | `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`AWS_REGION`、`AWS_ENDPOINT`（R2／MinIO）、`AWS_ALLOW_HTTP`（僅限 HTTP endpoint）、`AWS_TIMEOUT`（單次請求逾時，預設 `30s`，上行慢時可調高）；不設帳密時使用 IAM role／instance／container credentials |
+
+```dotenv
+# 本機（預設）
+STORAGE_BACKEND=local
+FILES_DIR=./data/files
+
+# AWS S3（IAM role 時省略 AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY）
+STORAGE_BACKEND=s3
+S3_BUCKET=km-files
+S3_PREFIX=prod
+AWS_REGION=ap-northeast-1
+
+# Cloudflare R2
+STORAGE_BACKEND=s3
+S3_BUCKET=km-files
+AWS_REGION=auto
+AWS_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com
+AWS_ACCESS_KEY_ID=<r2-access-key-id>
+AWS_SECRET_ACCESS_KEY=<r2-secret-access-key>
+```
+
+- 設定在連資料庫前解析；`s3` 會先列出一次 bucket／prefix 驗證可存取，失敗即停止啟動。log 只記錄 backend、bucket、prefix 與 endpoint，不含 secret、簽章或 S3 錯誤內文。
+- **初始化鎖定**：第一次對空資料庫啟動時，會把 backend（`s3` 另含 bucket 與 prefix）寫進 `storage_settings`。之後每次啟動都會比對，不一致即停止並顯示「儲存後端已於初始化時鎖定，變更需重新初始化 DB 與儲存空間」與已鎖定／目前設定。`FILES_DIR` 與 S3 endpoint 不列入鎖定，可更換掛載點或 endpoint。
+- **已部署環境升級到此版需清空 DB 與檔案重新初始化**：DB 改存相對 key，不提供舊路徑資料轉換；資料庫已有文件但沒有鎖定紀錄時會拒絕啟動。
+- Pdfium／LibreOffice 仍只能讀本機檔，每次轉檔都在系統暫存區（`TMPDIR`）下獨立的 `km-ingest-<run_id>` 目錄進行，不論成功或失敗都會刪除。
+- evaluation 固定使用本機 `EVAL_FILES_DIR`，不受 `STORAGE_BACKEND` 影響；它的獨立 `EVAL_DATABASE_URL` 有自己的鎖定紀錄，與 production 互不影響。
 
 ## 使用 Docker Compose
 
@@ -99,6 +137,12 @@ curl http://localhost:8080/api/health
 ```bash
 docker compose logs -f app
 docker compose down
+```
+
+若要以本機 MinIO 驗證 S3 模式，先在 `.env` 設定 `STORAGE_BACKEND=s3`、`S3_BUCKET=km-files`、`AWS_ENDPOINT=http://minio:9000`、`AWS_ALLOW_HTTP=true`、`AWS_ACCESS_KEY_ID=kmminio`、`AWS_SECRET_ACCESS_KEY=kmminio-secret`，再加上 `minio` profile 啟動（`minio-init` 會建立 bucket；app 若早於 bucket 建立會自動重啟重試）。預設的 `docker compose up` 不會啟動 MinIO。既有資料庫已鎖定為 local 時，必須先清空 DB 與檔案（例如 `docker compose down -v`，會刪除所有資料）才能改用 s3：
+
+```bash
+docker compose --profile minio up -d --build
 ```
 
 若要在 build 階段實際驗證 Pdfium 與 LibreOffice 對 PDF、掃描 PDF、DOCX、PPTX、XLSX 的分頁與頁序：
@@ -141,7 +185,7 @@ proto run npm -- run build
 | GET | `/api/health` | 健康檢查 |
 | GET | `/api/documents` | 文件列表（含文件／artifact 狀態、頁數與檢索單元數） |
 | POST | `/api/documents` | multipart 上傳（單一 `file` 欄位），立即回 id，背景處理 |
-| DELETE | `/api/documents/{id}` | 刪除 DB row、原檔、轉出 PDF、頁圖、manifest 與暫存物 |
+| DELETE | `/api/documents/{id}` | 刪除 `{id}/` 前綴下所有物件（原檔、轉出 PDF、頁圖、manifest）後才刪 DB row；清除失敗時保留 row，可重送 DELETE |
 | POST | `/api/chat` | SSE 串流問答（`text-delta` / `sources` / `done` / `error`） |
 
 `GET /api/documents` 的 canonical response 使用 camelCase；下列範例同時省略了過渡期保留的 `artifact_status`、`page_count`、`unit_count`、`chunk_count`、`created_at` 與安全字串 `error` aliases：
@@ -179,10 +223,10 @@ data: {"type":"done"}
 
 ## Artifact 契約
 
-分頁文件的典型布局如下；每次重試會先建立同檔案系統的暫存 run，全部成功後才以 rename 發布，DB 也在單一 transaction 內切換 current artifact set：
+分頁文件的典型布局如下（根目錄為 `FILES_DIR`，或 `s3://S3_BUCKET/S3_PREFIX`）。每次處理都在本機暫存區轉檔，完成後把整組 artifact 上傳到新的 `artifacts-{run_id}/` 前綴（manifest 最後上傳）；DB transaction commit 是唯一的發布切換點，commit 後才清除舊 run。上傳或 commit 失敗會清掉本次前綴，DB 不會引用殘缺的 artifact set：
 
 ```text
-FILES_DIR/{document_id}/
+{document_id}/
 ├── original.ext
 └── artifacts-{run_id}/
     ├── converted.pdf       # 僅 Office
@@ -192,7 +236,9 @@ FILES_DIR/{document_id}/
         └── 0002.png
 ```
 
-`page_artifacts` 保存 1-based `page_number`、圖片路徑、尺寸與可空的 PDF 文字層；掃描頁沒有文字仍是有效頁面。極端 PDF MediaBox 仍依設定 DPI 縮放，但輸出單邊上限為 8192 px，避免 native bitmap 無界配置。MD/TXT 不製造假頁碼，改存 `text_artifacts`。artifact 發布完成後，每份文件最多同時處理四個 embedding unit；只有所有回應都恰為 2048 維 finite float、artifact 與 unit 計數一致，才在單一 transaction 內替換 `document_units` 並把文件設為 `ready`。任一 unit 失敗時已完成的 artifact 保持 `artifact_status=ready`，文件則為 `failed`，不會留下可搜尋的部分新結果。
+DB 欄位（`documents.storage_path`、`document_artifact_sets.*_path`／`artifact_dir`、`page_artifacts.image_path`、`document_units.image_path`）與 manifest 內容都存上述相對 key。讀取頁圖時 key 必須位於該文件的 `{document_id}/` 之下、不得含 `..` 或為絕對路徑，且在讀取內文前先檢查大小上限；錯誤訊息不含 key 或路徑。
+
+`page_artifacts` 保存 1-based `page_number`、圖片 key、尺寸與可空的 PDF 文字層；掃描頁沒有文字仍是有效頁面。極端 PDF MediaBox 仍依設定 DPI 縮放，但輸出單邊上限為 8192 px，避免 native bitmap 無界配置。MD/TXT 不製造假頁碼，改存 `text_artifacts`。artifact 發布完成後，每份文件最多同時處理四個 embedding unit；只有所有回應都恰為 2048 維 finite float、artifact 與 unit 計數一致，才在單一 transaction 內替換 `document_units` 並把文件設為 `ready`。任一 unit 失敗時已完成的 artifact 保持 `artifact_status=ready`，文件則為 `failed`，不會留下可搜尋的部分新結果。
 
 頁圖只以記憶體中的 PNG/JPEG data URL 送出，不會傳送本機 artifact path；decoded image 上限 25 MiB、整體 embedding request 上限 36 MiB。Embedding 對 408、429、5xx、transport error 與 timeout 最多嘗試三次並使用 exponential backoff + jitter，其他 4xx 立即失敗。HTTP error snippet、API key、Authorization 與 base64 圖片資料都會在記錄前限長或遮蔽。
 
@@ -204,7 +250,7 @@ FILES_DIR/{document_id}/
 - Lexical 是標準 Okapi BM25，不使用 `ILIKE`、`ts_rank` 或 `ts_rank_cd`。公式參數固定 `k1=1.2`、`b=0.75`；migration `0004_hybrid_retrieval.sql` 以 trigger 維護 ready-only corpus 的文件數、總 token 數與每詞 DF，query 在 PostgreSQL 內計算 TF/IDF/長度正規化，不會把 corpus 載入 Rust。
 - Lexical candidate index 是 non-empty `content` 上的 ready-only partial GIN token-array index。tokenizer 先做 Unicode NFKC、lowercase 與 dash normalization；繁中採 character unigram + adjacent bigram，原因是不用可變字典也能重現、可涵蓋未知企業詞；英文、數字與產品代號保留完整 token，hyphenated code 另產 compact 與 component variants，讓全形／半形或常見標點差異不會讓基本詞失效。
 - RRF 固定 `k=60`，`rrf_score(d) = Σ 1 / (60 + rank_i(d))`。以 `unit_id` 去重；同分依最佳 route rank、`unit_id` 排序。兩路預設各 50，融合預設保留 50，再以固定 `llama-nemotron-rerank-vl-1b-v2` 精排成 top 6（可設 3–8）。
-- Page passage 只讀已發布 artifact：有文字層時送 image+text，掃描頁送 image-only（完全省略 `text`），MD/TXT chunk 送 text-only。本機路徑不進 payload，圖片只以記憶體 data URL 傳送；預設每批 8 筆，API 回應即使重排順序也依每批 local index 映回原 unit。
+- Page passage 只讀已發布 artifact：有文字層時送 image+text，掃描頁送 image-only（完全省略 `text`），MD/TXT chunk 送 text-only。物件 key 與本機路徑都不進 payload，圖片以有上限的並行讀取後只以記憶體 data URL 傳送；預設每批 8 筆，API 回應即使重排順序也依每批 local index 映回原 unit。
 - 每筆 `RetrievalCandidate` 直接帶 `unit_id`、0-based `unit_index`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、兩路 rank/score、`rrf_score` 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
 - Rerank 每批都嚴格驗證回應筆數、index 唯一且不越界、score finite，再驗證跨批映射。408、429、5xx、transport error 與 timeout 最多嘗試三次；耗盡後以原 RRF top_n 原序回退，且 rerank 欄位保持 null。設定、artifact 或 hosted response contract 錯誤不回退，會回傳可診斷錯誤。Structured log 僅記錄各階段筆數、延遲、fallback 與 model id，不含 query、文件內容、secret 或 base64。
 
@@ -303,11 +349,25 @@ proto run npm -- run build
 cd backend
 PDFIUM_LIBRARY_PATH=/path/to/libpdfium.so \
 LIBREOFFICE_BIN=libreoffice \
-proto exec rust -- cargo test page_artifacts::tests::generated_pdf_and_office_fixtures_preserve_page_order \
-  -- --ignored --exact --nocapture
+proto exec rust -- cargo test -- --ignored --exact --nocapture --test-threads=1 \
+  page_artifacts::tests::generated_pdf_and_office_fixtures_preserve_page_order \
+  ingest::tests::native_conversion_runs_in_scratch_and_publishes_relative_keys
 ```
 
 fixture 的來源、預期頁數與涵蓋範圍見 [backend/tests/fixtures/README.md](backend/tests/fixtures/README.md)。
+
+一般測試已用本機目錄與 in-memory store 跑完上傳 → ready → 問答（頁圖 rerank 與 RAG）→ 刪除。S3 模式另有 opt-in 的 MinIO smoke：它以真的 MinIO 跑同一條流程並確認刪除後文件前綴為空，同時驗證錯誤帳密與不存在的 bucket 會失敗且錯誤訊息不含 secret 或簽章；模型一律走本機 mock endpoint，不需雲端憑證，資料庫沿用 `.env` 的 `DATABASE_URL`（`sqlx::test` 會建立並刪除獨立的測試 DB）：
+
+```bash
+docker compose --profile minio run --rm minio-init   # 啟動 MinIO，建好 bucket 才返回
+cd backend
+STORAGE_BACKEND=s3 S3_BUCKET=km-files S3_PREFIX=smoke \
+AWS_ENDPOINT=http://localhost:9000 AWS_ALLOW_HTTP=true AWS_REGION=us-east-1 \
+AWS_ACCESS_KEY_ID=kmminio AWS_SECRET_ACCESS_KEY=kmminio-secret \
+proto exec rust -- cargo test minio_smoke -- --ignored --nocapture
+cd ..
+docker compose --profile minio rm -sfv minio
+```
 
 若要選擇性驗證經 Cloudflare AI Gateway 的真實 NVIDIA Build endpoint，先在 `.env` 填妥 `CF_AI_GATEWAY_BASE_URL`（或完整的 `CLOUD_EMBED_URL` gateway route）、`CF_AI_GATEWAY_TOKEN` 與 `GEMMA_4_MODEL_ID`，並確認 NVIDIA key 已以 BYOK 存於 gateway，再明確執行下列 ignored test。它會各送一次 text query、text passage、image passage 與 image+text passage（共四次雲端呼叫）；一般 `cargo test` 與 CI 不會執行：
 

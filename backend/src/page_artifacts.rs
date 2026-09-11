@@ -893,10 +893,10 @@ mod tests {
             assert!(requests[..2].iter().all(|request| {
                 request["model"] == crate::cloud_models::DEFAULT_EMBED_MODEL_ID
                     && request["input_type"] == "passage"
-                    && request["modality"] == "text_image"
+                    && request["modality"] == serde_json::json!(["text_image"])
             }));
             assert_eq!(requests[2]["input_type"], "passage");
-            assert_eq!(requests[2]["modality"], "image");
+            assert_eq!(requests[2]["modality"], serde_json::json!(["image"]));
             assert!(requests.iter().all(|request| {
                 request["input"][0]
                     .as_str()

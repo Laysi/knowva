@@ -947,6 +947,12 @@ impl CloudModelClient {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_test_rerank_endpoint(mut self, endpoint: &str) -> Self {
+        self.rerank_endpoint = Url::parse(endpoint).expect("test rerank endpoint must be valid");
+        self
+    }
+
+    #[cfg(test)]
     fn embedding_attempt_count(&self) -> usize {
         self.telemetry_snapshot().embedding_attempts as usize
     }
@@ -1067,7 +1073,10 @@ impl CloudModelClient {
         );
         let payload = serialize_chat_request(&request)?;
         if payload.len() > MAX_CHAT_REQUEST_BYTES {
-            return Err(chat_request_too_large(payload.len(), MAX_CHAT_REQUEST_BYTES));
+            return Err(chat_request_too_large(
+                payload.len(),
+                MAX_CHAT_REQUEST_BYTES,
+            ));
         }
         Ok(context)
     }
@@ -2883,16 +2892,17 @@ mod tests {
     #[tokio::test]
     async fn candidates_flow_to_matching_gemma_parts_and_structured_sources_without_inline_citation()
      {
-        let fixture_root =
-            std::env::temp_dir().join(format!("km-rag-integration-{}", uuid::Uuid::new_v4()));
-        let files_root = fixture_root.join("files");
+        let storage = crate::storage::Storage::memory();
         let page_document_id = uuid::Uuid::new_v4();
-        let page_dir = files_root.join(page_document_id.to_string()).join("pages");
-        std::fs::create_dir_all(&page_dir).expect("create integration page directory");
-        let page_path = page_dir.join("0005.png");
+        let page_path = format!("{page_document_id}/artifacts-run/pages/0005.png");
+        let mut png = Vec::new();
         image::RgbImage::from_pixel(8, 8, image::Rgb([20, 40, 60]))
-            .save(&page_path)
-            .expect("write valid integration PNG");
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode valid integration PNG");
+        storage
+            .put(&page_path, png)
+            .await
+            .expect("store integration PNG");
         let text_document_id = uuid::Uuid::new_v4();
         let candidates = vec![
             crate::search::RetrievalCandidate {
@@ -2902,7 +2912,7 @@ mod tests {
                 filename: "shared-name.pdf".to_string(),
                 kind: "page".to_string(),
                 page_number: Some(5),
-                image_path: Some(page_path.to_string_lossy().into_owned()),
+                image_path: Some(page_path.clone()),
                 content: Some("page fact".to_string()),
                 dense_rank: Some(1),
                 dense_score: Some(0.9),
@@ -2930,7 +2940,7 @@ mod tests {
                 rerank_rank: Some(2),
             },
         ];
-        let context = crate::rag_context::build_rag_context(&candidates, &files_root)
+        let context = crate::rag_context::build_rag_context(&candidates, &storage)
             .await
             .expect("build real RAG context");
         assert_eq!(context.sources.len(), 2);
@@ -3007,7 +3017,6 @@ mod tests {
         );
         drop(requests);
         server.abort();
-        std::fs::remove_dir_all(fixture_root).expect("remove integration fixture");
     }
 
     #[tokio::test]
