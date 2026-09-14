@@ -84,7 +84,7 @@ API／SSE／資料模型等必須遵守的介面，例如「API/SSE 契約」「
 
 - 後端（在 `backend/`）：`proto exec rust -- cargo fmt --check`、`proto exec rust -- cargo clippy --all-targets -- -D warnings`、`proto exec rust -- cargo test`
 - 前端（在 `frontend/`）：`proto run npm -- ci`、`proto run npm -- run lint`、`proto run npm -- run build`
-- 評測（CI `evaluation.yml`）：`proto exec rust -- cargo test evaluation::`、`proto exec rust -- cargo run -- eval --dry-run`
+- 評測（在 `backend/`）：`proto exec rust -- cargo run -- eval --dry-run`（評測模組的測試已含在上面的 `cargo test` 內）
 - 原生轉檔：`docker build --target native-test -t ai-km-demo:native-test .`
 
 ### blocker 段
