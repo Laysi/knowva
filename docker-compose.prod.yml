@@ -11,9 +11,15 @@
 # is deliberate: renaming the project would orphan app_pgdata and app_app_files
 # behind a new prefix.
 #
-# Nothing publishes a port. cloudflared shares the project network and reaches
-# the backend by its service name, so neither the application nor the database
-# is exposed on the host's LAN.
+# Nothing publishes a port. The Cloudflare tunnel runs as its own compose
+# project on the host and joins this project's default network, so it reaches
+# the backend by service name and neither the application nor the database is
+# exposed on the host's LAN.
+#
+# The tunnel is deliberately not defined here. It carries every site on that
+# machine, so tying its lifecycle to this stack takes them all down on a
+# deployment -- which is also why the service name and the project name are
+# fixed: the tunnel resolves the backend as `app` on `app_default`.
 #
 #   docker compose -p app -f docker-compose.prod.yml up -d
 
@@ -63,15 +69,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    restart: unless-stopped
-    command: tunnel --no-autoupdate run
-    environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN}
-    depends_on:
-      - app
 
 volumes:
   app_files:

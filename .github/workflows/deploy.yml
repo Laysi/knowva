@@ -87,7 +87,6 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
           CF_AI_GATEWAY_TOKEN: ${{ secrets.CF_AI_GATEWAY_TOKEN }}
           CF_AI_GATEWAY_BASE_URL: ${{ secrets.CF_AI_GATEWAY_BASE_URL }}
           GEMMA_4_MODEL_ID: ${{ secrets.GEMMA_4_MODEL_ID }}
@@ -97,14 +96,13 @@ jobs:
           # so release.yml can hand this workflow its own ref_name unchanged and
           # a person can type either form.
           KM_VERSION=${VERSION#v}
-          # The whole file is secret material, and it replaces the one the host
-          # was built with by hand -- TUNNEL_TOKEN included, or cloudflared comes
-          # back up with no tunnel to run.
+          # The whole file is secret material. The Cloudflare tunnel is not in
+          # it: that runs as its own project on the host, serves every site on
+          # the machine, and is not this deployment's to configure.
           umask 077
           cat > env.deploy <<EOF
           KM_VERSION=$KM_VERSION
           POSTGRES_PASSWORD=$POSTGRES_PASSWORD
-          TUNNEL_TOKEN=$TUNNEL_TOKEN
           CF_AI_GATEWAY_TOKEN=$CF_AI_GATEWAY_TOKEN
           CF_AI_GATEWAY_BASE_URL=$CF_AI_GATEWAY_BASE_URL
           GEMMA_4_MODEL_ID=$GEMMA_4_MODEL_ID
@@ -129,13 +127,16 @@ jobs:
             ssh "$DEPLOY_HOST" "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
           ssh "$DEPLOY_HOST" "cd $DEPLOY_DIR && \
             docker compose -p $PROJECT -f docker-compose.prod.yml pull"
-          # Detached: recreating the stack restarts the cloudflared container
-          # that this very connection may be riding on, which would kill the ssh
-          # session mid-command. The step below reconnects to find out how it
-          # went.
+          # Detached: the tunnel container joins this project's network, so
+          # recreating the stack can reset the connection this very command is
+          # riding on. The step below reconnects to find out how it went.
+          #
+          # No --remove-orphans: the tunnel belongs to another project and would
+          # not match it, but nothing gained here is worth any chance of
+          # deleting the container that serves every other site on the machine.
           ssh "$DEPLOY_HOST" "cd $DEPLOY_DIR && \
             setsid nohup docker compose -p $PROJECT -f docker-compose.prod.yml \
-            up -d --remove-orphans > deploy.log 2>&1 < /dev/null & sleep 2"
+            up -d > deploy.log 2>&1 < /dev/null & sleep 2"
 
       - name: Wait for the site
         run: |
