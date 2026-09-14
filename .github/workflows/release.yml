@@ -13,11 +13,15 @@
 # the binary, leaving only the runtime stage to be emulated -- and all that
 # stage does is unpack LibreOffice and the CJK fonts.
 #
+# Building is all this does. Putting an image on the host is a separate act:
+#
+#   gh workflow run deploy.yml -f version=0.1.0
+#
 # Nothing here waits for CI, and CI never runs on the tag: ci.yml triggers on
-# `push: branches: [main]`, which a tag push does not match. This workflow
-# builds and deploys whatever the tag points at, whether or not that commit
-# ever went green -- so checking CI on main is the tagger's job, before the tag
-# is pushed. Deliberate, but only safe while someone actually does it.
+# `push: branches: [main]`, which a tag push does not match. So this builds an
+# image from whatever the tag points at, green or not. An unreviewed tag now
+# costs a wasted build rather than a deployment, because reaching the host
+# takes a second, deliberate decision -- which is where the check belongs.
 
 name: Release
 
@@ -76,10 +80,3 @@ jobs:
           # this saves the base layers and the apt stages only.
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  deploy:
-    needs: image
-    uses: ./.github/workflows/deploy.yml
-    with:
-      version: ${{ github.ref_name }}
-    secrets: inherit

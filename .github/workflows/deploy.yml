@@ -2,8 +2,9 @@
 #
 #   gh workflow run deploy.yml -f version=0.1.0
 #
-# release.yml calls this with the tag it just built, so a tag is the whole
-# deployment gesture; the manual dispatch exists to redeploy or roll back to any
+# Only ever run by hand. release.yml builds an image on a version tag and stops
+# there, so nothing reaches the host until someone dispatches this with the
+# version to put on it -- the same gesture that redeploys, or rolls back to any
 # version already in ghcr.io.
 #
 # The host sits behind a Cloudflare tunnel and publishes no inbound port, so the
@@ -25,11 +26,6 @@ on:
     inputs:
       version:
         description: Image tag to deploy
-        default: latest
-  workflow_call:
-    inputs:
-      version:
-        type: string
         default: latest
 
 permissions:
