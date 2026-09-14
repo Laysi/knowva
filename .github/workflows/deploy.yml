@@ -48,7 +48,7 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -118,43 +118,69 @@ jobs:
           GHCR_USER: ${{ github.actor }}
         run: |
           set -eu
-          # Installed before the login so that every exit path removes the
-          # credential. Without it `set -e` skips any later logout whenever the
-          # pull or the restart fails, which is exactly the case that leaves a
-          # registry token sitting in the host's docker config.
-          trap 'ssh -o ConnectTimeout=15 "$DEPLOY_HOST" "docker logout ghcr.io" >/dev/null 2>&1 || true' EXIT
           printf '%s' "$GHCR_TOKEN" | \
             ssh "$DEPLOY_HOST" "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
-          ssh "$DEPLOY_HOST" "cd $DEPLOY_DIR && \
-            docker compose -p $PROJECT -f docker-compose.prod.yml pull"
-          # Detached: the tunnel container joins this project's network, so
-          # recreating the stack can reset the connection this very command is
-          # riding on. The step below reconnects to find out how it went.
+          # Pull and restart both run detached on the host, because neither
+          # survives being held over this ssh session. The image carries
+          # LibreOffice and the CJK fonts, and pulling it moves that much data
+          # through the very tunnel the session rides on, starving the
+          # connection until it breaks mid-download; recreating the stack then
+          # resets the network the tunnel container joins. So the host runs the
+          # whole thing alone and the step below finds out how it went.
+          #
+          # The script logs the host out as its last act rather than this job
+          # doing it on exit: this step returns while the pull is still running,
+          # and removing the credential then would break the very pull it is
+          # meant to clean up after. The next step runs on every path and logs
+          # out too, so a failed pull still leaves nothing behind.
           #
           # No --remove-orphans: the tunnel belongs to another project and would
           # not match it, but nothing gained here is worth any chance of
           # deleting the container that serves every other site on the machine.
-          ssh "$DEPLOY_HOST" "cd $DEPLOY_DIR && \
-            setsid nohup docker compose -p $PROJECT -f docker-compose.prod.yml \
-            up -d > deploy.log 2>&1 < /dev/null & sleep 2"
+          cat > deploy.sh <<EOF
+          #!/bin/sh
+          set -eu
+          cd "\$HOME/$DEPLOY_DIR"
+          docker compose -p $PROJECT -f docker-compose.prod.yml pull
+          docker compose -p $PROJECT -f docker-compose.prod.yml up -d
+          docker logout ghcr.io
+          EOF
+          scp deploy.sh "$DEPLOY_HOST:$DEPLOY_DIR/deploy.sh"
+          rm -f deploy.sh
+          ssh "$DEPLOY_HOST" "cd $DEPLOY_DIR && rm -f deploy.status && chmod +x deploy.sh && \
+            setsid nohup sh -c './deploy.sh; echo \$? > deploy.status' \
+            > deploy.log 2>&1 < /dev/null & sleep 2"
 
       - name: Wait for the site
+        # Runs even when the step above failed, so a deployment that never
+        # started still has its logs read and its credential removed.
+        if: always()
         run: |
           set -eu
           ok=
-          for _ in $(seq 60); do
-              code=$(curl -s -o /dev/null -w '%{http_code}' "$SITE/api/health" || echo 000)
-              echo "$SITE/api/health -> $code"
+          for _ in $(seq 120); do
+              status=$(ssh -o ConnectTimeout=15 "$DEPLOY_HOST" \
+                "cat $DEPLOY_DIR/deploy.status 2>/dev/null" 2>/dev/null || echo "")
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$SITE/api/health" || echo 000)
+              echo "host script: ${status:-running}   $SITE/api/health -> $code"
               if [ "$code" = 200 ]; then
                   ok=yes
                   break
               fi
-              sleep 5
+              # The script writes its exit code when it finishes. A non-zero one
+              # means the pull or the restart failed, and no further polling is
+              # going to produce a site.
+              if [ -n "$status" ] && [ "$status" != 0 ]; then
+                  echo "the host script exited $status"
+                  break
+              fi
+              sleep 10
           done
           # Runs whichever way the poll went: the logs are the only account of a
-          # deployment that never came up. The credential is already gone by
-          # here, removed by the previous step's trap.
+          # deployment that never came up, and the credential must not outlive
+          # the run even when the host script never reached its own logout.
           ssh -o ConnectTimeout=15 "$DEPLOY_HOST" "cd $DEPLOY_DIR && \
             docker compose -p $PROJECT -f docker-compose.prod.yml ps; \
-            tail -20 deploy.log 2>/dev/null" || true
+            tail -30 deploy.log 2>/dev/null; \
+            docker logout ghcr.io" || true
           [ "$ok" = yes ] || { echo "the site never returned 200"; exit 1; }
