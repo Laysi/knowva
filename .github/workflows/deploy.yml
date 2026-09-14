@@ -147,9 +147,16 @@ jobs:
           EOF
           scp deploy.sh "$DEPLOY_HOST:$DEPLOY_DIR/deploy.sh"
           rm -f deploy.sh
-          ssh "$DEPLOY_HOST" "cd $DEPLOY_DIR && rm -f deploy.status && chmod +x deploy.sh && \
-            setsid nohup sh -c './deploy.sh; echo \$? > deploy.status' \
-            > deploy.log 2>&1 < /dev/null & sleep 2"
+          # The launcher only has to start the script; its own exit status says
+          # nothing about how the deployment went. Holding the channel open for
+          # a backgrounded child -- which the trailing `sleep` did -- is what
+          # returned 255 on a deployment that had in fact succeeded. Braces keep
+          # the redirection with the child, `-n` keeps stdin off the channel,
+          # and the explicit `exit 0` makes the launcher's result deterministic.
+          # deploy.status, read by the step below, is the real verdict.
+          ssh -n "$DEPLOY_HOST" "cd $DEPLOY_DIR && rm -f deploy.status && chmod +x deploy.sh && \
+            { setsid nohup sh -c './deploy.sh; echo \$? > deploy.status' \
+              > deploy.log 2>&1 < /dev/null & } ; exit 0"
 
       - name: Wait for the site
         # Runs even when the step above failed, so a deployment that never
