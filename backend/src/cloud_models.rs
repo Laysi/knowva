@@ -2435,7 +2435,7 @@ mod tests {
             ("GEMMA_4_MODEL_ID", "google/gemma-4-31b-it"),
             (
                 "CLOUD_CHAT_URL",
-                "https://gateway.ai.cloudflare.com/v1/acct/gw/custom-nvidia-build/chat/completions",
+                "https://gateway.ai.cloudflare.com/v1/test-account/test-gateway/custom-nvidia-build/chat/completions",
             ),
             ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
         ])
@@ -2444,15 +2444,15 @@ mod tests {
 
         let explicit = config_from(&[
             ("CF_AI_GATEWAY_TOKEN", "secret"),
-            ("GEMMA_4_MODEL_ID", "provider/custom-chat-model"),
+            ("GEMMA_4_MODEL_ID", "provider/custom-gemma-4-chat"),
             ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
         ])
         .expect("explicit model id remains supported");
-        assert_eq!(explicit.chat_model(), "provider/custom-chat-model");
+        assert_eq!(explicit.chat_model(), "provider/custom-gemma-4-chat");
     }
 
     #[test]
-    fn config_uses_explicit_embed_and_rerank_models_with_full_urls() {
+    fn config_keeps_embed_and_rerank_models_locked_with_full_urls() {
         let config = config_from(&[
             ("CF_AI_GATEWAY_TOKEN", "gateway-secret"),
             ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
@@ -2468,8 +2468,8 @@ mod tests {
         let configured = config_from(&[
             ("CF_AI_GATEWAY_TOKEN", "secret"),
             ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
-            ("NEMOTRON_EMBED_MODEL_ID", "vendor/custom-embedder"),
-            ("NEMOTRON_RERANK_MODEL_ID", "vendor/custom-reranker"),
+            ("NEMOTRON_EMBED_MODEL_ID", DEFAULT_EMBED_MODEL_ID),
+            ("NEMOTRON_RERANK_MODEL_ID", DEFAULT_RERANK_MODEL_ID),
             (
                 "CLOUD_CHAT_URL",
                 "https://gateway.ai.cloudflare.com/v1/acct/gw/provider/chat/completions",
@@ -2484,8 +2484,17 @@ mod tests {
             ),
         ])
         .expect("full provider routes should select capability models");
-        assert_eq!(configured.embed_model(), "vendor/custom-embedder");
-        assert_eq!(configured.rerank_model(), "vendor/custom-reranker");
+        assert_eq!(configured.embed_model(), DEFAULT_EMBED_MODEL_ID);
+        assert_eq!(configured.rerank_model(), DEFAULT_RERANK_MODEL_ID);
+
+        let unlocked = config_from(&[
+            ("CF_AI_GATEWAY_TOKEN", "secret"),
+            ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+            ("NEMOTRON_EMBED_MODEL_ID", "vendor/custom-embedder"),
+            ("CF_AI_GATEWAY_BASE_URL", TEST_GATEWAY_BASE),
+        ])
+        .expect_err("embed model must stay locked to the Nemotron family");
+        assert!(unlocked.to_string().contains("NEMOTRON_EMBED_MODEL_ID"));
     }
 
     #[test]

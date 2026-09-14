@@ -1,0 +1,7 @@
+# Keeps cargo, clippy-driver and rustfmt on the version pinned in
+# ../.prototools. Without it rustup resolves clippy-driver from the host
+# default toolchain, which fails with E0514 against dependencies built by
+# the pinned compiler.
+[toolchain]
+channel = "1.96.1"
+components = ["clippy", "rustfmt"]

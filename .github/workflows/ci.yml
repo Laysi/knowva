@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: km
+          POSTGRES_PASSWORD: km
+          POSTGRES_DB: km
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U km"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # #[sqlx::test] creates a temporary database per test from this URL.
+      DATABASE_URL: postgres://km:km@localhost:5432/km
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pinned toolchain
+        uses: moonrepo/setup-toolchain@v0
+        with:
+          auto-install: true
+
+      - name: Check Rust formatting
+        run: proto exec rust -- cargo fmt --check
+
+      - name: Lint Rust targets
+        run: proto exec rust -- cargo clippy --all-targets -- -D warnings
+
+      # Ignored tests need Pdfium, LibreOffice or real cloud credentials and run
+      # in the native-conversion job or manually.
+      - name: Test backend
+        run: proto exec rust -- cargo test
+
+      - name: Validate evaluation fixtures
+        run: proto exec rust -- cargo run -- eval --dry-run
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pinned toolchain
+        uses: moonrepo/setup-toolchain@v0
+        with:
+          auto-install: true
+
+      - name: Install dependencies
+        run: proto run npm -- ci
+
+      - name: Lint frontend
+        run: proto run npm -- run lint
+
+      - name: Test frontend
+        run: proto run npm -- run test
+
+      - name: Build frontend
+        run: proto run npm -- run build
+
+  native-conversion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Builds the runtime image layers and runs the ignored Pdfium/LibreOffice
+      # fixture tests inside the image.
+      - name: Build native conversion test image
+        run: docker build --target native-test -t ai-km-demo:native-test .
