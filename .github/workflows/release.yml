@@ -13,8 +13,11 @@
 # the binary, leaving only the runtime stage to be emulated -- and all that
 # stage does is unpack LibreOffice and the CJK fonts.
 #
-# ci.yml still guards the code; this workflow only packages a tag that already
-# passed it, then hands the version to deploy.yml.
+# Nothing here waits for CI, and CI never runs on the tag: ci.yml triggers on
+# `push: branches: [main]`, which a tag push does not match. This workflow
+# builds and deploys whatever the tag points at, whether or not that commit
+# ever went green -- so checking CI on main is the tagger's job, before the tag
+# is pushed. Deliberate, but only safe while someone actually does it.
 
 name: Release
 
