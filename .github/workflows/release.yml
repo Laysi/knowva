@@ -1,0 +1,82 @@
+# Publishes the deployment image on a version tag.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# One image goes to ghcr.io, tagged with the version and with `latest`, and
+# built for linux/arm64 only: the deployment host is an aarch64 Raspberry Pi
+# and nothing else consumes this image. Adding amd64 would double the build for
+# an artefact with no reader.
+#
+# The organisation is on the free plan with a private repository, so no hosted
+# arm64 runner is available. The Dockerfile keeps the npm build, the Pdfium
+# download and the cargo build on the runner's own architecture and cross-links
+# the binary, leaving only the runtime stage to be emulated -- and all that
+# stage does is unpack LibreOffice and the CJK fonts.
+#
+# ci.yml still guards the code; this workflow only packages a tag that already
+# passed it, then hands the version to deploy.yml.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Lowercases the owner, which ghcr.io requires, and emits the
+      # org.opencontainers.image.* labels that link the package back here.
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # cargo keeps its target directory on a cache mount, which no registry
+          # cache carries, so the backend compiles from scratch on every run;
+          # this saves the base layers and the apt stages only.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    uses: ./.github/workflows/deploy.yml
+    with:
+      version: ${{ github.ref_name }}
+    secrets: inherit

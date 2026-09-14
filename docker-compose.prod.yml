@@ -1,0 +1,78 @@
+# Production deployment from pre-built images, published by
+# .github/workflows/release.yml on a version tag and deployed by
+# .github/workflows/deploy.yml.
+#
+# This replaces building on the host. The target is a Raspberry Pi with four
+# cores and 3.7 GB of RAM on an SD card, where a release build of the backend
+# is neither fast nor reliable, and a failed build leaves the service down.
+#
+# Deployed to ~/app under the project name `app`, which is what the existing
+# named volumes and the Cloudflare tunnel are already bound to. Keeping both
+# is deliberate: renaming the project would orphan app_pgdata and app_app_files
+# behind a new prefix.
+#
+# Nothing publishes a port. cloudflared shares the project network and reaches
+# the backend by its service name, so neither the application nor the database
+# is exposed on the host's LAN.
+#
+#   docker compose -p app -f docker-compose.prod.yml up -d
+
+services:
+  app:
+    image: ghcr.io/laysi/outsourcing-ai-km:${KM_VERSION:-latest}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://km:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/km
+      FILES_DIR: /app/backend/data/files
+      PORT: "8080"
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      # Fails the container before it accepts traffic rather than at the first
+      # chat request, which is what cloud_models.rs parses these for.
+      CF_AI_GATEWAY_BASE_URL: ${CF_AI_GATEWAY_BASE_URL:-}
+      CF_AI_GATEWAY_TOKEN: ${CF_AI_GATEWAY_TOKEN:?set CF_AI_GATEWAY_TOKEN}
+      GEMMA_4_MODEL_ID: ${GEMMA_4_MODEL_ID:?set GEMMA_4_MODEL_ID}
+      NEMOTRON_EMBED_MODEL_ID: ${NEMOTRON_EMBED_MODEL_ID:-nvidia/llama-nemotron-embed-vl-1b-v2}
+      NEMOTRON_RERANK_MODEL_ID: ${NEMOTRON_RERANK_MODEL_ID:-nvidia/llama-nemotron-rerank-vl-1b-v2}
+      RERANK_CANDIDATE_TOP_K: ${RERANK_CANDIDATE_TOP_K:-50}
+      RERANK_TOP_N: ${RERANK_TOP_N:-6}
+      RERANK_BATCH_SIZE: ${RERANK_BATCH_SIZE:-8}
+      CLOUD_CHAT_URL: ${CLOUD_CHAT_URL:-}
+      CLOUD_EMBED_URL: ${CLOUD_EMBED_URL:-}
+      CLOUD_RERANK_URL: ${CLOUD_RERANK_URL:-}
+      CLOUD_MODEL_REQUEST_TIMEOUT_SECS: ${CLOUD_MODEL_REQUEST_TIMEOUT_SECS:-120}
+      PDF_RENDER_DPI: ${PDF_RENDER_DPI:-180}
+      DOCUMENT_CONVERSION_TIMEOUT_SECS: ${DOCUMENT_CONVERSION_TIMEOUT_SECS:-120}
+    volumes:
+      - app_files:/app/backend/data/files
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: km
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: km
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U km"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN}
+    depends_on:
+      - app
+
+volumes:
+  app_files:
+  pgdata:

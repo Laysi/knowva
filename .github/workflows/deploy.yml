@@ -1,0 +1,159 @@
+# Deploys a published version onto ai-km-server.
+#
+#   gh workflow run deploy.yml -f version=0.1.0
+#
+# release.yml calls this with the tag it just built, so a tag is the whole
+# deployment gesture; the manual dispatch exists to redeploy or roll back to any
+# version already in ghcr.io.
+#
+# The host sits behind a Cloudflare tunnel and publishes no inbound port, so the
+# runner reaches it through `cloudflared access ssh`. The host key is pinned
+# rather than trusted on first use: the tunnel is reachable by anyone, and the
+# host key is what proves this is the right machine.
+#
+# The host keeps no long-lived registry credential. It is logged in to ghcr.io
+# with this run's own GITHUB_TOKEN for the length of the pull and logged out
+# afterwards, so rotating anything is a change here rather than on the Pi.
+# Pulling rather than streaming `docker save` over the tunnel matters at this
+# image size: it carries LibreOffice and the CJK fonts, and a pull moves only
+# the layers that changed, which is usually the binary and the frontend bundle.
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Image tag to deploy
+        default: latest
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        default: latest
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  DEPLOY_HOST: one-ssh.laysi.io
+  DEPLOY_USER: ai-km
+  # The existing install, whose named volumes and Cloudflare tunnel are already
+  # bound to this project name.
+  DEPLOY_DIR: app
+  PROJECT: app
+  SITE: https://ai-km.laysi.io
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cloudflared
+        run: |
+          set -eu
+          curl -fsSL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+
+      - name: Configure ssh
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -eu
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s ssh-ed25519 %s\n' "$DEPLOY_HOST" \
+            'AAAAC3NzaC1lZDI1NTE5AAAAIC604ENTjAQN0XSpM17AYa8XZUds/bMxrTTDIs1dIxsP' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host $DEPLOY_HOST
+              User $DEPLOY_USER
+              IdentityFile ~/.ssh/id_ed25519
+              IdentitiesOnly yes
+              ProxyCommand cloudflared access ssh --hostname %h
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Send the compose file and the environment
+        env:
+          VERSION: ${{ inputs.version }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+          CF_AI_GATEWAY_TOKEN: ${{ secrets.CF_AI_GATEWAY_TOKEN }}
+          CF_AI_GATEWAY_BASE_URL: ${{ secrets.CF_AI_GATEWAY_BASE_URL }}
+          GEMMA_4_MODEL_ID: ${{ secrets.GEMMA_4_MODEL_ID }}
+        run: |
+          set -eu
+          # metadata-action publishes `{{version}}`, which drops the tag's `v`,
+          # so release.yml can hand this workflow its own ref_name unchanged and
+          # a person can type either form.
+          KM_VERSION=${VERSION#v}
+          # The whole file is secret material, and it replaces the one the host
+          # was built with by hand -- TUNNEL_TOKEN included, or cloudflared comes
+          # back up with no tunnel to run.
+          umask 077
+          cat > env.deploy <<EOF
+          KM_VERSION=$KM_VERSION
+          POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+          TUNNEL_TOKEN=$TUNNEL_TOKEN
+          CF_AI_GATEWAY_TOKEN=$CF_AI_GATEWAY_TOKEN
+          CF_AI_GATEWAY_BASE_URL=$CF_AI_GATEWAY_BASE_URL
+          GEMMA_4_MODEL_ID=$GEMMA_4_MODEL_ID
+          EOF
+          ssh "$DEPLOY_HOST" "mkdir -p $DEPLOY_DIR"
+          scp docker-compose.prod.yml "$DEPLOY_HOST:$DEPLOY_DIR/"
+          scp env.deploy "$DEPLOY_HOST:$DEPLOY_DIR/.env"
+          rm -f env.deploy
+
+      - name: Pull the image and restart the stack
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          set -eu
+          # Installed before the login so that every exit path removes the
+          # credential. Without it `set -e` skips any later logout whenever the
+          # pull or the restart fails, which is exactly the case that leaves a
+          # registry token sitting in the host's docker config.
+          trap 'ssh -o ConnectTimeout=15 "$DEPLOY_HOST" "docker logout ghcr.io" >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GHCR_TOKEN" | \
+            ssh "$DEPLOY_HOST" "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+          ssh "$DEPLOY_HOST" "cd $DEPLOY_DIR && \
+            docker compose -p $PROJECT -f docker-compose.prod.yml pull"
+          # Detached: recreating the stack restarts the cloudflared container
+          # that this very connection may be riding on, which would kill the ssh
+          # session mid-command. The step below reconnects to find out how it
+          # went.
+          ssh "$DEPLOY_HOST" "cd $DEPLOY_DIR && \
+            setsid nohup docker compose -p $PROJECT -f docker-compose.prod.yml \
+            up -d --remove-orphans > deploy.log 2>&1 < /dev/null & sleep 2"
+
+      - name: Wait for the site
+        run: |
+          set -eu
+          ok=
+          for _ in $(seq 60); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' "$SITE/api/health" || echo 000)
+              echo "$SITE/api/health -> $code"
+              if [ "$code" = 200 ]; then
+                  ok=yes
+                  break
+              fi
+              sleep 5
+          done
+          # Runs whichever way the poll went: the logs are the only account of a
+          # deployment that never came up. The credential is already gone by
+          # here, removed by the previous step's trap.
+          ssh -o ConnectTimeout=15 "$DEPLOY_HOST" "cd $DEPLOY_DIR && \
+            docker compose -p $PROJECT -f docker-compose.prod.yml ps; \
+            tail -20 deploy.log 2>/dev/null" || true
+          [ "$ok" = yes ] || { echo "the site never returned 200"; exit 1; }
