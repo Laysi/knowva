@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # Branches are covered by pull_request; limiting push to main keeps a commit
+  # on a PR branch from triggering two full runs.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
