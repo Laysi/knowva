@@ -2157,7 +2157,7 @@ async fn upload_answer_delete_flow_with_in_memory_storage(pool: PgPool) -> anyho
 
 /// Opt-in smoke against a real S3-compatible endpoint; the command is in README.
 #[sqlx::test]
-#[ignore = "requires MinIO/S3 via STORAGE_BACKEND=s3, S3_BUCKET and AWS_*"]
+#[ignore = "requires MinIO/S3 via STORAGE_BACKEND=s3 and STORAGE_*"]
 async fn minio_smoke_upload_answer_delete(pool: PgPool) -> anyhow::Result<()> {
     let config = StorageConfig::from_env()?;
     anyhow::ensure!(
@@ -2225,8 +2225,8 @@ async fn s3_lock_covers_bucket_and_prefix_but_not_the_endpoint(pool: PgPool) -> 
         prefix: prefix.map(str::to_owned),
     };
     ensure_initialization_lock(&pool, &s3("km-files", Some("tenant-a"))).await?;
-    // The endpoint only lives in AWS_*, so moving endpoints restarts with the
-    // identical recorded identity.
+    // The endpoint is a client setting outside the lock, so moving endpoints
+    // restarts with the identical recorded identity.
     ensure_initialization_lock(&pool, &s3("km-files", Some("tenant-a"))).await?;
     for changed in [
         s3("km-other", Some("tenant-a")),

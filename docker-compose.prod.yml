@@ -36,6 +36,16 @@ services:
       FILES_DIR: /app/backend/data/files
       PORT: "8080"
       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-}
+      STORAGE_PREFIX: ${STORAGE_PREFIX:-}
+      STORAGE_ENDPOINT: ${STORAGE_ENDPOINT:-}
+      STORAGE_REGION: ${STORAGE_REGION:-}
+      STORAGE_ACCESS_KEY_ID: ${STORAGE_ACCESS_KEY_ID:-}
+      STORAGE_SECRET_ACCESS_KEY: ${STORAGE_SECRET_ACCESS_KEY:-}
+      STORAGE_ALLOW_HTTP: "false"
+      # Uploads leave the Pi over a home uplink; the 30s default cuts off a
+      # 50 MiB original.
+      STORAGE_TIMEOUT: 120s
       # Fails the container before it accepts traffic rather than at the first
       # chat request, which is what cloud_models.rs parses these for.
       CF_AI_GATEWAY_BASE_URL: ${CF_AI_GATEWAY_BASE_URL:-}

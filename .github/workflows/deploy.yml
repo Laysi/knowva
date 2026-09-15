@@ -86,8 +86,29 @@ jobs:
           CF_AI_GATEWAY_TOKEN: ${{ secrets.CF_AI_GATEWAY_TOKEN }}
           CF_AI_GATEWAY_BASE_URL: ${{ secrets.CF_AI_GATEWAY_BASE_URL }}
           GEMMA_4_MODEL_ID: ${{ secrets.GEMMA_4_MODEL_ID }}
+          # File storage is chosen once, by the first start against an empty
+          # database, and locked there. It lives in repository variables and
+          # secrets rather than in a dispatch input so every later deployment
+          # repeats the same choice: a mismatch makes the backend refuse to
+          # start, and changing it means re-initializing the database and the
+          # storage. Unset means local, which is what the existing host is
+          # locked to.
+          STORAGE_BACKEND: ${{ vars.STORAGE_BACKEND }}
+          STORAGE_BUCKET: ${{ vars.STORAGE_BUCKET }}
+          STORAGE_PREFIX: ${{ vars.STORAGE_PREFIX }}
+          STORAGE_ENDPOINT: ${{ vars.STORAGE_ENDPOINT }}
+          STORAGE_REGION: ${{ vars.STORAGE_REGION }}
+          STORAGE_ACCESS_KEY_ID: ${{ secrets.STORAGE_ACCESS_KEY_ID }}
+          STORAGE_SECRET_ACCESS_KEY: ${{ secrets.STORAGE_SECRET_ACCESS_KEY }}
         run: |
           set -eu
+          # Checked before the host is touched: a backend that refuses its
+          # storage settings takes the running site down with it.
+          case "${STORAGE_BACKEND:-local}" in
+              local) ;;
+              s3) [ -n "${STORAGE_BUCKET:-}" ] || { echo "STORAGE_BUCKET is required when STORAGE_BACKEND=s3"; exit 1; } ;;
+              *) echo "STORAGE_BACKEND must be local or s3"; exit 1 ;;
+          esac
           # metadata-action publishes `{{version}}`, which drops the tag's `v`,
           # so release.yml can hand this workflow its own ref_name unchanged and
           # a person can type either form.
@@ -102,6 +123,13 @@ jobs:
           CF_AI_GATEWAY_TOKEN=$CF_AI_GATEWAY_TOKEN
           CF_AI_GATEWAY_BASE_URL=$CF_AI_GATEWAY_BASE_URL
           GEMMA_4_MODEL_ID=$GEMMA_4_MODEL_ID
+          STORAGE_BACKEND=$STORAGE_BACKEND
+          STORAGE_BUCKET=$STORAGE_BUCKET
+          STORAGE_PREFIX=$STORAGE_PREFIX
+          STORAGE_ENDPOINT=$STORAGE_ENDPOINT
+          STORAGE_REGION=$STORAGE_REGION
+          STORAGE_ACCESS_KEY_ID=$STORAGE_ACCESS_KEY_ID
+          STORAGE_SECRET_ACCESS_KEY=$STORAGE_SECRET_ACCESS_KEY
           EOF
           ssh "$DEPLOY_HOST" "mkdir -p $DEPLOY_DIR"
           scp docker-compose.prod.yml "$DEPLOY_HOST:$DEPLOY_DIR/"

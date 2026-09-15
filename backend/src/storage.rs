@@ -9,7 +9,7 @@
 use anyhow::{Context, anyhow, bail};
 use futures::{StreamExt, TryStreamExt};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
-use object_store::client::{HttpError, HttpErrorKind};
+use object_store::client::{ClientConfigKey, HttpError, HttpErrorKind};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::prefix::PrefixStore;
@@ -25,6 +25,53 @@ pub(crate) const IO_CONCURRENCY: usize = 4;
 
 const LOCKED_MESSAGE: &str = "儲存後端已於初始化時鎖定，變更需重新初始化 DB 與儲存空間";
 
+/// Generic storage variables and the S3 client settings they fill in. The
+/// endpoint goes to the S3-specific key so it also wins over a stray
+/// `AWS_ENDPOINT_URL_S3`.
+const S3_CLIENT_SETTINGS: [(&str, AmazonS3ConfigKey); 6] = [
+    ("STORAGE_ENDPOINT", AmazonS3ConfigKey::S3Endpoint),
+    ("STORAGE_REGION", AmazonS3ConfigKey::Region),
+    ("STORAGE_ACCESS_KEY_ID", AmazonS3ConfigKey::AccessKeyId),
+    (
+        "STORAGE_SECRET_ACCESS_KEY",
+        AmazonS3ConfigKey::SecretAccessKey,
+    ),
+    (
+        "STORAGE_ALLOW_HTTP",
+        AmazonS3ConfigKey::Client(ClientConfigKey::AllowHttp),
+    ),
+    (
+        "STORAGE_TIMEOUT",
+        AmazonS3ConfigKey::Client(ClientConfigKey::Timeout),
+    ),
+];
+
+/// Trimmed value of a setting; empty counts as unset.
+fn setting(get: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+    get(name)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Applies the `STORAGE_*` client settings over `builder`.
+fn with_storage_settings(
+    mut builder: AmazonS3Builder,
+    get: impl Fn(&str) -> Option<String>,
+) -> AmazonS3Builder {
+    for (name, key) in S3_CLIENT_SETTINGS {
+        if let Some(value) = setting(&get, name) {
+            builder = builder.with_config(key, value);
+        }
+    }
+    builder
+}
+
+/// Standard `AWS_*` variables are still read so platform credentials such as
+/// an IAM role keep working; the `STORAGE_*` settings take precedence.
+fn s3_builder_from_env() -> AmazonS3Builder {
+    with_storage_settings(AmazonS3Builder::from_env(), |name| std::env::var(name).ok())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageConfig {
     Local {
@@ -37,18 +84,15 @@ pub enum StorageConfig {
 }
 
 impl StorageConfig {
-    /// Reads `STORAGE_BACKEND`, `FILES_DIR`, `S3_BUCKET` and `S3_PREFIX`.
-    /// Credentials, region and endpoint stay in the standard `AWS_*` variables.
+    /// Reads `STORAGE_BACKEND`, `FILES_DIR`, `STORAGE_BUCKET` and
+    /// `STORAGE_PREFIX`. Endpoint, region and credentials are client settings
+    /// applied when the store is opened and never enter the locked identity.
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
-        let value = |name: &str| {
-            get(name)
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-        };
+        let value = |name: &str| setting(&get, name);
         match value("STORAGE_BACKEND").as_deref().unwrap_or("local") {
             "local" => Ok(Self::Local {
                 files_dir: value("FILES_DIR")
@@ -56,14 +100,14 @@ impl StorageConfig {
                     .into(),
             }),
             "s3" => {
-                let bucket =
-                    value("S3_BUCKET").context("S3_BUCKET is required when STORAGE_BACKEND=s3")?;
-                let prefix = value("S3_PREFIX")
+                let bucket = value("STORAGE_BUCKET")
+                    .context("STORAGE_BUCKET is required when STORAGE_BACKEND=s3")?;
+                let prefix = value("STORAGE_PREFIX")
                     .map(|prefix| prefix.trim_matches('/').to_owned())
                     .filter(|prefix| !prefix.is_empty());
                 if let Some(prefix) = &prefix {
                     ObjectPath::parse(prefix).map_err(|_| {
-                        anyhow!("S3_PREFIX must be a relative key prefix without empty, `.` or `..` segments")
+                        anyhow!("STORAGE_PREFIX must be a relative key prefix without empty, `.` or `..` segments")
                     })?;
                 }
                 Ok(Self::S3 { bucket, prefix })
@@ -86,7 +130,7 @@ impl StorageConfig {
             }
             Self::S3 { bucket, prefix } => {
                 open_s3(
-                    AmazonS3Builder::from_env().with_bucket_name(bucket),
+                    s3_builder_from_env().with_bucket_name(bucket),
                     bucket,
                     prefix.as_deref(),
                 )
@@ -127,7 +171,7 @@ async fn open_s3(
     let store: Arc<dyn ObjectStore> = match prefix {
         Some(prefix) => Arc::new(PrefixStore::new(
             s3,
-            ObjectPath::parse(prefix).map_err(|_| anyhow!("S3_PREFIX is invalid"))?,
+            ObjectPath::parse(prefix).map_err(|_| anyhow!("STORAGE_PREFIX is invalid"))?,
         )),
         None => Arc::new(s3),
     };
@@ -479,8 +523,8 @@ mod tests {
         assert_eq!(
             config_from(&[
                 ("STORAGE_BACKEND", "s3"),
-                ("S3_BUCKET", "km-files"),
-                ("S3_PREFIX", "/tenant-a/prod/"),
+                ("STORAGE_BUCKET", "km-files"),
+                ("STORAGE_PREFIX", "/tenant-a/prod/"),
             ])
             .unwrap(),
             StorageConfig::S3 {
@@ -489,12 +533,12 @@ mod tests {
             }
         );
 
-        // Endpoint and credentials stay in AWS_* and never enter the locked identity.
+        // Endpoint and credentials are client settings outside the locked identity.
         let with_endpoint = |endpoint| {
             config_from(&[
                 ("STORAGE_BACKEND", "s3"),
-                ("S3_BUCKET", "km-files"),
-                ("AWS_ENDPOINT", endpoint),
+                ("STORAGE_BUCKET", "km-files"),
+                ("STORAGE_ENDPOINT", endpoint),
             ])
             .unwrap()
         };
@@ -504,18 +548,63 @@ mod tests {
         );
 
         let missing_bucket = config_from(&[("STORAGE_BACKEND", "s3")]).unwrap_err();
-        assert!(missing_bucket.to_string().contains("S3_BUCKET"));
+        assert!(missing_bucket.to_string().contains("STORAGE_BUCKET"));
         let bad_prefix = config_from(&[
             ("STORAGE_BACKEND", "s3"),
-            ("S3_BUCKET", "km-files"),
-            ("S3_PREFIX", "a/../b"),
+            ("STORAGE_BUCKET", "km-files"),
+            ("STORAGE_PREFIX", "a/../b"),
         ])
         .unwrap_err();
-        assert!(bad_prefix.to_string().contains("S3_PREFIX"));
+        assert!(bad_prefix.to_string().contains("STORAGE_PREFIX"));
         for backend in ["gcs", "S3", "file"] {
             let error = config_from(&[("STORAGE_BACKEND", backend)]).unwrap_err();
             assert!(error.to_string().contains("STORAGE_BACKEND"));
         }
+    }
+
+    #[test]
+    fn storage_settings_fill_the_s3_client_and_skip_empty_values() {
+        let values = HashMap::from([
+            (
+                "STORAGE_ENDPOINT",
+                "https://account.r2.cloudflarestorage.com",
+            ),
+            ("STORAGE_REGION", "auto"),
+            ("STORAGE_ACCESS_KEY_ID", "key-id"),
+            ("STORAGE_SECRET_ACCESS_KEY", " "),
+            ("STORAGE_TIMEOUT", "120s"),
+        ]);
+        // Stands in for what AmazonS3Builder::from_env picked up from AWS_*.
+        let from_aws_env = AmazonS3Builder::new()
+            .with_access_key_id("aws-key-id")
+            .with_secret_access_key("aws-secret");
+        let builder = with_storage_settings(from_aws_env, |name| {
+            values.get(name).map(|value| (*value).to_owned())
+        });
+        let config = |key| builder.get_config_value(&key);
+
+        assert_eq!(
+            config(AmazonS3ConfigKey::S3Endpoint).as_deref(),
+            Some("https://account.r2.cloudflarestorage.com")
+        );
+        assert_eq!(config(AmazonS3ConfigKey::Region).as_deref(), Some("auto"));
+        assert_eq!(
+            config(AmazonS3ConfigKey::AccessKeyId).as_deref(),
+            Some("key-id")
+        );
+        // A blank setting leaves the value underneath untouched.
+        assert_eq!(
+            config(AmazonS3ConfigKey::SecretAccessKey).as_deref(),
+            Some("aws-secret")
+        );
+        assert_eq!(
+            config(AmazonS3ConfigKey::Client(ClientConfigKey::Timeout)).as_deref(),
+            Some("120s")
+        );
+        assert_eq!(
+            config(AmazonS3ConfigKey::Client(ClientConfigKey::AllowHttp)).as_deref(),
+            Some("false")
+        );
     }
 
     #[tokio::test]
@@ -718,24 +807,24 @@ mod tests {
 
     /// Opt-in: needs the MinIO/S3 environment from the README smoke command.
     #[tokio::test]
-    #[ignore = "requires MinIO/S3 via STORAGE_BACKEND=s3, S3_BUCKET and AWS_*"]
+    #[ignore = "requires MinIO/S3 via STORAGE_BACKEND=s3 and STORAGE_*"]
     async fn minio_smoke_startup_rejects_bad_access_without_leaking_secrets() {
         let StorageConfig::S3 { bucket, prefix } = StorageConfig::from_env().unwrap() else {
             panic!("set STORAGE_BACKEND=s3 for the MinIO smoke test");
         };
-        let real_secret = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
+        let real_secret = std::env::var("STORAGE_SECRET_ACCESS_KEY").unwrap_or_default();
         let wrong_secret = "km-smoke-wrong-secret-value";
         let missing_bucket = format!("km-missing-{}", Uuid::new_v4());
         let cases = [
             (
-                AmazonS3Builder::from_env()
+                s3_builder_from_env()
                     .with_bucket_name(&bucket)
                     .with_secret_access_key(wrong_secret),
                 bucket.as_str(),
                 "HTTP 403",
             ),
             (
-                AmazonS3Builder::from_env().with_bucket_name(&missing_bucket),
+                s3_builder_from_env().with_bucket_name(&missing_bucket),
                 missing_bucket.as_str(),
                 "HTTP 404",
             ),

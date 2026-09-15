@@ -12,17 +12,14 @@ services:
       DATABASE_URL: postgres://km:km@postgres:5432/km
       FILES_DIR: /app/backend/data/files
       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
-      S3_BUCKET: ${S3_BUCKET:-}
-      S3_PREFIX: ${S3_PREFIX:-}
-      # Passed through only when set, so IAM roles are not masked by empty values.
-      AWS_ACCESS_KEY_ID:
-      AWS_SECRET_ACCESS_KEY:
-      AWS_SESSION_TOKEN:
-      AWS_REGION:
-      AWS_DEFAULT_REGION:
-      AWS_ENDPOINT:
-      AWS_ALLOW_HTTP:
-      AWS_TIMEOUT:
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-}
+      STORAGE_PREFIX: ${STORAGE_PREFIX:-}
+      STORAGE_ENDPOINT: ${STORAGE_ENDPOINT:-}
+      STORAGE_REGION: ${STORAGE_REGION:-}
+      STORAGE_ACCESS_KEY_ID: ${STORAGE_ACCESS_KEY_ID:-}
+      STORAGE_SECRET_ACCESS_KEY: ${STORAGE_SECRET_ACCESS_KEY:-}
+      STORAGE_ALLOW_HTTP: ${STORAGE_ALLOW_HTTP:-}
+      STORAGE_TIMEOUT: ${STORAGE_TIMEOUT:-}
       PORT: "8080"
       CF_AI_GATEWAY_BASE_URL: ${CF_AI_GATEWAY_BASE_URL:-}
       CF_AI_GATEWAY_TOKEN: ${CF_AI_GATEWAY_TOKEN:-}
@@ -83,13 +80,13 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-kmminio}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-kmminio-secret}
-      S3_BUCKET: ${S3_BUCKET:-km-files}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-km-files}
     entrypoint:
       - sh
       - -c
       - |
         until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null; do sleep 1; done
-        mc mb --ignore-existing "local/$$S3_BUCKET"
+        mc mb --ignore-existing "local/$$STORAGE_BUCKET"
 
 volumes:
   app_files:
