@@ -90,32 +90,37 @@ Gateway token、chat model、endpoint 或 rerank 設定無效時，後端會在�
 |---|---|---|
 | `STORAGE_BACKEND` | `local` | `local` 或 `s3`；其他值啟動即失敗 |
 | `FILES_DIR` | `./data/files` | `local` 的根目錄 |
-| `S3_BUCKET` | 空 | `s3` 必填 |
-| `S3_PREFIX` | 空 | `s3` 選填的 key 前綴，例如 `tenant-a/prod` |
-| `AWS_*` | 標準 AWS 變數 | `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`AWS_REGION`、`AWS_ENDPOINT`（R2／MinIO）、`AWS_ALLOW_HTTP`（僅限 HTTP endpoint）、`AWS_TIMEOUT`（單次請求逾時，預設 `30s`，上行慢時可調高）；不設帳密時使用 IAM role／instance／container credentials |
+| `STORAGE_BUCKET` | 空 | `s3` 必填 |
+| `STORAGE_PREFIX` | 空 | `s3` 選填的 key 前綴，例如 `tenant-a/prod` |
+| `STORAGE_ENDPOINT` | 空 | R2／MinIO 等非 AWS endpoint |
+| `STORAGE_REGION` | 空 | AWS region（預設 `us-east-1`）；R2 填 `auto` |
+| `STORAGE_ACCESS_KEY_ID`、`STORAGE_SECRET_ACCESS_KEY` | 空 | 存取金鑰；不設時改用平台提供的認證：EC2 instance role，或由 ECS／EKS 等平台直接注入程序環境的標準 `AWS_*` 變數。以本 repo 的 docker compose 啟動時，主機上的 `AWS_*` 不會傳進容器，請填入金鑰或使用 EC2 instance role |
+| `STORAGE_ALLOW_HTTP` | `false` | 僅限 HTTP endpoint（例如本機 MinIO） |
+| `STORAGE_TIMEOUT` | `30s` | 單次請求逾時，上行慢時可調高 |
 
 ```dotenv
 # 本機（預設）
 STORAGE_BACKEND=local
 FILES_DIR=./data/files
 
-# AWS S3（IAM role 時省略 AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY）
+# AWS S3（IAM role 時省略 STORAGE_ACCESS_KEY_ID/STORAGE_SECRET_ACCESS_KEY）
 STORAGE_BACKEND=s3
-S3_BUCKET=km-files
-S3_PREFIX=prod
-AWS_REGION=ap-northeast-1
+STORAGE_BUCKET=km-files
+STORAGE_PREFIX=prod
+STORAGE_REGION=ap-northeast-1
 
 # Cloudflare R2
 STORAGE_BACKEND=s3
-S3_BUCKET=km-files
-AWS_REGION=auto
-AWS_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com
-AWS_ACCESS_KEY_ID=<r2-access-key-id>
-AWS_SECRET_ACCESS_KEY=<r2-secret-access-key>
+STORAGE_BUCKET=km-files
+STORAGE_REGION=auto
+STORAGE_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com
+STORAGE_ACCESS_KEY_ID=<r2-access-key-id>
+STORAGE_SECRET_ACCESS_KEY=<r2-secret-access-key>
 ```
 
 - 設定在連資料庫前解析；`s3` 會先列出一次 bucket／prefix 驗證可存取，失敗即停止啟動。log 只記錄 backend、bucket、prefix 與 endpoint，不含 secret、簽章或 S3 錯誤內文。
 - **初始化鎖定**：第一次對空資料庫啟動時，會把 backend（`s3` 另含 bucket 與 prefix）寫進 `storage_settings`。之後每次啟動都會比對，不一致即停止並顯示「儲存後端已於初始化時鎖定，變更需重新初始化 DB 與儲存空間」與已鎖定／目前設定。`FILES_DIR` 與 S3 endpoint 不列入鎖定，可更換掛載點或 endpoint。
+- **正式部署（`deploy.yml`）**：儲存設定放在 repository 設定，每次部署都寫進主機 `.env`，確保與初始化時的鎖定一致。Variables：`STORAGE_BACKEND`、`STORAGE_BUCKET`、`STORAGE_PREFIX`、`STORAGE_ENDPOINT`、`STORAGE_REGION`；Secrets：`STORAGE_ACCESS_KEY_ID`、`STORAGE_SECRET_ACCESS_KEY`。未設定即為空值，`STORAGE_BACKEND` 未設定即為 `local`。`STORAGE_ALLOW_HTTP=false` 與 `STORAGE_TIMEOUT=120s` 寫死在 `docker-compose.prod.yml`。首次部署到空 DB 前就要設好；`s3` 缺 `STORAGE_BUCKET` 或值不合法時，workflow 會在碰主機前失敗。
 - **已部署環境升級到此版需清空 DB 與檔案重新初始化**：DB 改存相對 key，不提供舊路徑資料轉換；資料庫已有文件但沒有鎖定紀錄時會拒絕啟動。
 - Pdfium／LibreOffice 仍只能讀本機檔，每次轉檔都在系統暫存區（`TMPDIR`）下獨立的 `km-ingest-<run_id>` 目錄進行，不論成功或失敗都會刪除。
 - evaluation 固定使用本機 `EVAL_FILES_DIR`，不受 `STORAGE_BACKEND` 影響；它的獨立 `EVAL_DATABASE_URL` 有自己的鎖定紀錄，與 production 互不影響。
@@ -139,7 +144,7 @@ docker compose logs -f app
 docker compose down
 ```
 
-若要以本機 MinIO 驗證 S3 模式，先在 `.env` 設定 `STORAGE_BACKEND=s3`、`S3_BUCKET=km-files`、`AWS_ENDPOINT=http://minio:9000`、`AWS_ALLOW_HTTP=true`、`AWS_ACCESS_KEY_ID=kmminio`、`AWS_SECRET_ACCESS_KEY=kmminio-secret`，再加上 `minio` profile 啟動（`minio-init` 會建立 bucket；app 若早於 bucket 建立會自動重啟重試）。預設的 `docker compose up` 不會啟動 MinIO。既有資料庫已鎖定為 local 時，必須先清空 DB 與檔案（例如 `docker compose down -v`，會刪除所有資料）才能改用 s3：
+若要以本機 MinIO 驗證 S3 模式，先在 `.env` 設定 `STORAGE_BACKEND=s3`、`STORAGE_BUCKET=km-files`、`STORAGE_ENDPOINT=http://minio:9000`、`STORAGE_ALLOW_HTTP=true`、`STORAGE_ACCESS_KEY_ID=kmminio`、`STORAGE_SECRET_ACCESS_KEY=kmminio-secret`，再加上 `minio` profile 啟動（`minio-init` 會建立 bucket；app 若早於 bucket 建立會自動重啟重試）。預設的 `docker compose up` 不會啟動 MinIO。既有資料庫已鎖定為 local 時，必須先清空 DB 與檔案（例如 `docker compose down -v`，會刪除所有資料）才能改用 s3：
 
 ```bash
 docker compose --profile minio up -d --build
@@ -223,7 +228,7 @@ data: {"type":"done"}
 
 ## Artifact 契約
 
-分頁文件的典型布局如下（根目錄為 `FILES_DIR`，或 `s3://S3_BUCKET/S3_PREFIX`）。每次處理都在本機暫存區轉檔，完成後把整組 artifact 上傳到新的 `artifacts-{run_id}/` 前綴（manifest 最後上傳）；DB transaction commit 是唯一的發布切換點，commit 後才清除舊 run。上傳或 commit 失敗會清掉本次前綴，DB 不會引用殘缺的 artifact set：
+分頁文件的典型布局如下（根目錄為 `FILES_DIR`，或 `s3://STORAGE_BUCKET/STORAGE_PREFIX`）。每次處理都在本機暫存區轉檔，完成後把整組 artifact 上傳到新的 `artifacts-{run_id}/` 前綴（manifest 最後上傳）；DB transaction commit 是唯一的發布切換點，commit 後才清除舊 run。上傳或 commit 失敗會清掉本次前綴，DB 不會引用殘缺的 artifact set：
 
 ```text
 {document_id}/
@@ -361,9 +366,9 @@ fixture 的來源、預期頁數與涵蓋範圍見 [backend/tests/fixtures/READM
 ```bash
 docker compose --profile minio run --rm minio-init   # 啟動 MinIO，建好 bucket 才返回
 cd backend
-STORAGE_BACKEND=s3 S3_BUCKET=km-files S3_PREFIX=smoke \
-AWS_ENDPOINT=http://localhost:9000 AWS_ALLOW_HTTP=true AWS_REGION=us-east-1 \
-AWS_ACCESS_KEY_ID=kmminio AWS_SECRET_ACCESS_KEY=kmminio-secret \
+STORAGE_BACKEND=s3 STORAGE_BUCKET=km-files STORAGE_PREFIX=smoke \
+STORAGE_ENDPOINT=http://localhost:9000 STORAGE_ALLOW_HTTP=true STORAGE_REGION=us-east-1 \
+STORAGE_ACCESS_KEY_ID=kmminio STORAGE_SECRET_ACCESS_KEY=kmminio-secret \
 proto exec rust -- cargo test minio_smoke -- --ignored --nocapture
 cd ..
 docker compose --profile minio rm -sfv minio
