@@ -109,10 +109,13 @@ jobs:
               s3) [ -n "${STORAGE_BUCKET:-}" ] || { echo "STORAGE_BUCKET is required when STORAGE_BACKEND=s3"; exit 1; } ;;
               *) echo "STORAGE_BACKEND must be local or s3"; exit 1 ;;
           esac
-          # metadata-action publishes `{{version}}`, which drops the tag's `v`,
-          # so release.yml can hand this workflow its own ref_name unchanged and
-          # a person can type either form.
-          KM_VERSION=${VERSION#v}
+          # Image tags keep the `v` release.yml publishes, so a bare `0.1.0`
+          # gets it back and `latest` -- or any other non-numeric tag -- is
+          # passed through as typed.
+          case "$VERSION" in
+              [0-9]*) KM_VERSION=v$VERSION ;;
+              *) KM_VERSION=$VERSION ;;
+          esac
           # The whole file is secret material. The Cloudflare tunnel is not in
           # it: that runs as its own project on the host, serves every site on
           # the machine, and is not this deployment's to configure.

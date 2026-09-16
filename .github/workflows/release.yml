@@ -2,16 +2,17 @@
 #
 #   git tag v0.1.0 && git push origin v0.1.0
 #
-# One image goes to ghcr.io, tagged with the version and with `latest`, and
-# built for linux/arm64 only: the deployment host is an aarch64 Raspberry Pi
-# and nothing else consumes this image. Adding amd64 would double the build for
-# an artefact with no reader.
+# One multi-platform image goes to ghcr.io, tagged with the version and with
+# `latest`. arm64 is what the deployment host, an aarch64 Raspberry Pi, pulls;
+# amd64 is for running the same published image on an ordinary x86 machine.
 #
 # The organisation is on the free plan with a private repository, so no hosted
 # arm64 runner is available. The Dockerfile keeps the npm build, the Pdfium
 # download and the cargo build on the runner's own architecture and cross-links
-# the binary, leaving only the runtime stage to be emulated -- and all that
-# stage does is unpack LibreOffice and the CJK fonts.
+# the binary, leaving only the arm64 runtime stage to be emulated -- and all
+# that stage does is unpack LibreOffice and the CJK fonts. amd64 is the
+# runner's own architecture and is emulated nowhere, so the added cost is a
+# second cargo release build, which runs concurrently with the first.
 #
 # Building is all this does. Putting an image on the host is a separate act:
 #
@@ -63,7 +64,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
             type=raw,value=latest
 
       - name: Build and push
@@ -71,7 +72,7 @@ jobs:
         with:
           context: .
           target: runtime
-          platforms: linux/arm64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
