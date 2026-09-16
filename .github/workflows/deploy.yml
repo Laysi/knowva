@@ -83,8 +83,11 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          CF_AI_GATEWAY_TOKEN: ${{ secrets.CF_AI_GATEWAY_TOKEN }}
-          CF_AI_GATEWAY_BASE_URL: ${{ secrets.CF_AI_GATEWAY_BASE_URL }}
+          MODEL_API_TOKEN: ${{ secrets.MODEL_API_TOKEN }}
+          MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
+          MODEL_CHAT_URL: ${{ vars.MODEL_CHAT_URL }}
+          MODEL_EMBED_URL: ${{ vars.MODEL_EMBED_URL }}
+          MODEL_RERANK_URL: ${{ vars.MODEL_RERANK_URL }}
           GEMMA_4_MODEL_ID: ${{ secrets.GEMMA_4_MODEL_ID }}
           # File storage is chosen once, by the first start against an empty
           # database, and locked there. It lives in repository variables and
@@ -123,8 +126,11 @@ jobs:
           cat > env.deploy <<EOF
           KM_VERSION=$KM_VERSION
           POSTGRES_PASSWORD=$POSTGRES_PASSWORD
-          CF_AI_GATEWAY_TOKEN=$CF_AI_GATEWAY_TOKEN
-          CF_AI_GATEWAY_BASE_URL=$CF_AI_GATEWAY_BASE_URL
+          MODEL_API_TOKEN=$MODEL_API_TOKEN
+          MODEL_BASE_URL=$MODEL_BASE_URL
+          MODEL_CHAT_URL=$MODEL_CHAT_URL
+          MODEL_EMBED_URL=$MODEL_EMBED_URL
+          MODEL_RERANK_URL=$MODEL_RERANK_URL
           GEMMA_4_MODEL_ID=$GEMMA_4_MODEL_ID
           STORAGE_BACKEND=$STORAGE_BACKEND
           STORAGE_BUCKET=$STORAGE_BUCKET

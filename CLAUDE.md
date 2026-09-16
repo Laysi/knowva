@@ -4,7 +4,7 @@ This file provides repository guidance for coding agents.
 
 ## Project
 
-Demo of a general-purpose AI knowledge-management system. For the active MVP, all inference uses cloud-hosted APIs and the model families are fixed: Gemma 4 for chat/multimodal reading, `llama-nemotron-embed-vl-1b-v2` for embeddings, and `llama-nemotron-rerank-vl-1b-v2` for reranking. Do not add alternative or local inference paths.
+Demo of a general-purpose AI knowledge-management system. For the active MVP, all inference runs on an on-premise service reached over configured HTTP endpoints, and the model families are fixed: Gemma 4 for chat/multimodal reading, `llama-nemotron-embed-vl-1b-v2` for embeddings, and `llama-nemotron-rerank-vl-1b-v2` for reranking. Do not add in-process inference or provider-specific SDK paths; a different service is a URL change.
 
 The specification priority is the active GitHub issue, then tracker issue #1, then `docs/mvp-now.md`. Keep implementations simple: no auth, no job queue, and chat history remains in frontend state.
 
@@ -20,7 +20,7 @@ The specification priority is the active GitHub issue, then tracker issue #1, th
 - Native conversion smoke test: `docker build --target native-test -t ai-km-demo:native-test .`
 - Stop the backend with `pkill -x km-server`; never use `pkill -f`.
 
-The backend requires `CF_AI_GATEWAY_TOKEN`, a confirmed `GEMMA_4_MODEL_ID`, and `CF_AI_GATEWAY_BASE_URL` (unless all three per-capability `CLOUD_*_URL` gateway routes are set). Provider API keys are not backend configuration; they live in the gateway's BYOK store. The per-capability gateway routes, the two locked Nemotron model IDs, and request timeout are documented in `.env.example`. Restart after changing configuration.
+The backend requires a confirmed `GEMMA_4_MODEL_ID` and `MODEL_BASE_URL` (unless all three per-capability `MODEL_*_URL` routes are set). `MODEL_API_TOKEN` is optional: an unauthenticated on-premise service is addressed without any authorization header. The per-capability routes, the two locked Nemotron model IDs, and request timeout are documented in `.env.example`. Restart after changing configuration.
 
 ## Architecture
 
@@ -37,10 +37,10 @@ The backend requires `CF_AI_GATEWAY_TOKEN`, a confirmed `GEMMA_4_MODEL_ID`, and 
 
 ## Cloud model safety
 
-- All model traffic is routed through a Cloudflare AI Gateway; there are no direct provider endpoint defaults. The NVIDIA hosts are reached via the gateway custom providers `nvidia-build` and `nvidia-ai`, and chat may alternatively use the gateway's OpenRouter route.
-- The backend holds no provider API keys and never sends an upstream `Authorization` header; provider keys live in the gateway's BYOK store, and the backend's only secret is the AI Gateway Run token sent as `cf-aig-authorization`.
-- Parse model configuration before connecting to the database so missing secrets/model IDs fail before traffic is accepted.
-- Logs may include endpoint and model ID, never the gateway token or request auth headers.
+- Model traffic goes to a self-hosted inference service over the OpenAI-compatible chat/embeddings routes and the NVIDIA ranking route; there are no hosted-provider endpoint defaults. Endpoints are configuration, so no URL is hardcoded and no hosted gateway is required.
+- `MODEL_API_TOKEN` is optional and sent as a standard `Authorization: Bearer` header; when it is empty no authorization header is sent at all.
+- Parse model configuration before connecting to the database so missing settings/model IDs fail before traffic is accepted.
+- Logs may include endpoint and model ID, never the API token or request auth headers.
 - Model HTTP errors use a maximum 500-character sanitized snippet and expose HTTP status, timeout, and retryability through one error type.
 - The Gemma model ID has no repository default. Embed and rerank settings may only vendor-qualify their locked family names.
 - Do not send an embedding dimension-reduction parameter; the fixed Embed VL response is validated as 2048 dimensions.

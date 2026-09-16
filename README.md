@@ -30,9 +30,9 @@
 - 本機開發另需 [proto](https://moonrepo.dev/proto)；repository 的 `.prototools` 會安裝固定版本的 Rust、Node.js 與 npm
 - 不使用容器轉檔時，主機需另裝 Pdfium 動態函式庫；可安裝在系統 library path，或以 `PDFIUM_LIBRARY_PATH` 指定檔案／目錄
 - 不使用容器處理 DOCX/PPTX/XLSX 時，主機需另裝 LibreOffice headless 與所需 CJK 字型
-- 一個 Cloudflare AI Gateway(所有模型流量一律經 gateway 轉送,不再直連供應商端點),並啟用 Authenticated Gateway 與一個 Run token
-- 可呼叫上述三個固定模型的 NVIDIA Build API key(chat 改走 OpenRouter 則另備 OpenRouter key),以 BYOK 存放在 gateway;後端不保存任何 provider key
-- 由實際雲端端點確認過的 Gemma 4 model id
+- 一套地端推論服務,提供 OpenAI 相容的 chat/embeddings route 與 NVIDIA ranking route,並已載入上述三個固定模型
+- 服務若需認證,準備一個 bearer token;不需認證時可完全不設
+- 由實際端點確認過的 Gemma 4 model id
 
 ## 設定
 
@@ -42,33 +42,42 @@
 cp .env.example .env
 ```
 
-先在 Cloudflare dashboard 依序完成：建立 AI Gateway → 啟用 Authenticated Gateway 並建立 Run token → 註冊兩個 custom providers（slug `nvidia-build` → `https://integrate.api.nvidia.com`、slug `nvidia-ai` → `https://ai.api.nvidia.com`）→ 以 BYOK 為兩個 custom providers 存入 NVIDIA Build API key（chat 走 OpenRouter 時另存 OpenRouter key）。provider key 一律存於 gateway，後端不會送出上游 `Authorization` header。最少必須填入：
+三個模型都在地端服務上時，最少只需要 base URL 與 chat model id：
 
 ```dotenv
-CF_AI_GATEWAY_BASE_URL=https://gateway.ai.cloudflare.com/v1/<account_id>/<gateway_id>
-CF_AI_GATEWAY_TOKEN=your-ai-gateway-run-token
-CLOUD_CHAT_URL=https://gateway.ai.cloudflare.com/v1/<account_id>/<gateway_id>/custom-nvidia-build/chat/completions
+MODEL_BASE_URL=http://inference-host:8000
 GEMMA_4_MODEL_ID=google/gemma-4-31b-it
 ```
 
-其他 cloud-model 設定：
+chat 與兩個 Nemotron NIM 分屬不同主機時（地端常見），改成三個完整 URL，`MODEL_BASE_URL` 可留空：
+
+```dotenv
+MODEL_CHAT_URL=http://chat-host:8000/v1/chat/completions
+MODEL_EMBED_URL=http://embed-host:8000/v1/embeddings
+MODEL_RERANK_URL=http://rerank-host:8000/v1/ranking
+GEMMA_4_MODEL_ID=google/gemma-4-31b-it
+```
+
+服務需要認證時另外填 `MODEL_API_TOKEN`，後端會以標準 `Authorization: Bearer` 送出；留空則完全不送認證 header。其他模型設定：
 
 | 環境變數 | 必要性 | 說明 |
 |---|---|---|
-| `CLOUD_CHAT_URL` | 選填 | 完整 chat gateway route；model 放在 JSON body；空值時使用預設 route |
-| `CLOUD_EMBED_URL` | 選填 | 完整 embedding gateway route，可獨立切換 provider；空值時使用預設 route |
-| `CLOUD_RERANK_URL` | 選填 | 完整 reranking gateway route，可獨立切換 provider；空值時使用預設 route |
+| `MODEL_BASE_URL` | 三個 `MODEL_*_URL` 未全填時必填 | 地端推論服務 base URL，預設 route 為 `v1/chat/completions`、`v1/embeddings`、`v1/ranking` |
+| `MODEL_API_TOKEN` | 選填 | bearer token；留空代表服務不需認證，後端不送 `Authorization` |
+| `MODEL_CHAT_URL` | 選填 | 完整 chat route；model 放在 JSON body；空值時由 base URL 推導 |
+| `MODEL_EMBED_URL` | 選填 | 完整 embedding route，可獨立指向其他主機；空值時由 base URL 推導 |
+| `MODEL_RERANK_URL` | 選填 | 完整 reranking route，可獨立指向其他主機；空值時由 base URL 推導 |
 | `GEMMA_4_MODEL_ID` | 必填 | 放入 Chat request body 的 provider/model ID |
 | `NEMOTRON_EMBED_MODEL_ID` | 有鎖定預設 | 只接受 `llama-nemotron-embed-vl-1b-v2` family |
 | `NEMOTRON_RERANK_MODEL_ID` | 有鎖定預設 | 只接受 `llama-nemotron-rerank-vl-1b-v2` family |
 | `RERANK_CANDIDATE_TOP_K` | `50` | RRF 候選池送入 VL rerank 的數量，必須不小於 `RERANK_TOP_N` |
 | `RERANK_TOP_N` | `6` | 精排後回答 context 數量，只允許 3–8 |
-| `RERANK_BATCH_SIZE` | `8` | 每次 hosted rerank request 的 passage 數量，範圍為 1–512 |
-| `CLOUD_MODEL_REQUEST_TIMEOUT_SECS` | 有預設 | 所有模型 HTTP/SSE request timeout，必須是正整數 |
+| `RERANK_BATCH_SIZE` | `8` | 每次 rerank request 的 passage 數量，範圍為 1–512 |
+| `MODEL_REQUEST_TIMEOUT_SECS` | 有預設 | 所有模型 HTTP/SSE request timeout，必須是正整數 |
 
-Gateway token、chat model、endpoint 或 rerank 設定無效時，後端會在連接資料庫與接受流量前停止並顯示可理解的錯誤。三個完整 URL 只指定 provider operation route，model 分別放在 JSON request body；因此切換 provider 只需修改 URL，不需修改程式。
+Chat model、endpoint 或 rerank 設定無效時，後端會在連接資料庫與接受流量前停止並顯示可理解的錯誤。URL 只指定服務的 operation route，model 分別放在 JSON request body；因此換一套服務只需修改 URL，不需修改程式。
 
-三個 `CLOUD_*_URL` 都可以各自填入完整 Cloudflare AI Gateway route；當三個都填入時，`CF_AI_GATEWAY_BASE_URL` 可留空。Embedding 仍要求 2048 維向量，Rerank 仍要求目前的 ranking response contract；切換到不相容的模型需要另外調整模型契約與重建索引。
+Embedding 仍要求 2048 維向量，Rerank 仍要求目前的 ranking response contract；切換到不相容的模型需要另外調整模型契約與重建索引。
 
 文件前處理設定：
 
@@ -127,7 +136,7 @@ STORAGE_SECRET_ACCESS_KEY=<r2-secret-access-key>
 
 ## 使用 Docker Compose
 
-容器映像已包含 Pdfium、LibreOffice 與 Noto CJK 字型，不需要主機另外提供 PDF API 或 native library。先設定 `.env` 的 `CF_AI_GATEWAY_BASE_URL`、`CF_AI_GATEWAY_TOKEN` 與 `GEMMA_4_MODEL_ID`，再啟動完整服務：
+容器映像已包含 Pdfium、LibreOffice 與 Noto CJK 字型，不需要主機另外提供 PDF API 或 native library。先設定 `.env` 的 `MODEL_BASE_URL`（或三個 `MODEL_*_URL`）與 `GEMMA_4_MODEL_ID`，再啟動完整服務：
 
 ```bash
 cp .env.example .env
@@ -308,7 +317,7 @@ Cloud run 是明確 opt-in，會 ingest fixtures 並實際呼叫 embedding、rer
 2. 完成 threshold JSON 的所有欄位與排版後，對**最終檔案 bytes**計算 SHA-256（例如 `sha256sum /absolute/path/to/thresholds.json`；之後只要檔案有任何 byte 改動就必須重算）。由同一位 owner 編輯上一步的同一則留言，加入獨立一行 `threshold_sha256: <sha256sum 輸出的 64 字元雜湊>`；編輯留言不會改變 permalink。runner 會從 GitHub 讀取該固定 URL，並要求 URL 與 hash line 都精確符合本機 snapshot。
 3. 由 PostgreSQL 管理者建立一個名稱以 `km_eval_` 開頭的全新空 database，以及名稱可辨識用途的專用登入角色（例如組織自訂的 `km_eval_runner_<識別碼>`；尖括號內容必須換成真實且唯一的值）。以該角色作為 database owner，讓它能執行 migration；接著在任何 migration 前，以 database owner 連線並執行 `COMMENT ON DATABASE <實際的 km_eval_ database 名稱> IS 'ai-km-evaluation-only:v1';`。最後把使用該專用角色與 database 的連線字串設為 `EVAL_DATABASE_URL`。runner 會檢查 current database 名稱、connect role 身分與精確 marker；它也會拒絕 production `DATABASE_URL`、repository 預設 DB，以及 migration 後含有任何 document 的 DB。不要把 placeholder、示意密碼或假 marker 當成正式設定。
 4. 準備專用且為空的 `EVAL_FILES_DIR`。它不可等於、包含或位於 production `FILES_DIR` 或預設 `./data/files` 之下；失敗後會保留完整隔離 run 供診斷，下次不可重用非空目錄。
-5. 設定 Cloudflare AI Gateway/BYOK 與確認過的 Gemma 4 model id：至少提供 `CF_AI_GATEWAY_BASE_URL`、`CF_AI_GATEWAY_TOKEN`、`GEMMA_4_MODEL_ID`；自訂 route 時另設 `CLOUD_CHAT_URL`、`CLOUD_EMBED_URL`、`CLOUD_RERANK_URL`。確認 gateway 已能存取固定 Nemotron embedding/rerank models。
+5. 設定地端推論服務與確認過的 Gemma 4 model id：至少提供 `MODEL_BASE_URL` 與 `GEMMA_4_MODEL_ID`；各能力分屬不同主機時改設 `MODEL_CHAT_URL`、`MODEL_EMBED_URL`、`MODEL_RERANK_URL`，服務需認證時另設 `MODEL_API_TOKEN`。確認服務已載入固定的 Nemotron embedding/rerank models。
 6. 主機安裝 Pdfium 與 LibreOffice/CJK 字型，並以 `PDFIUM_LIBRARY_PATH`、`LIBREOFFICE_BIN` 指向可用 binary/library，讓 PDF、掃描頁與 PPTX fixtures 能完整 ingest。
 
 完成上述前置作業後，從 `backend/` 以單一 cloud command 執行完整資料集；以下所有尖括號都必須替換為真實的隔離環境設定：
@@ -317,9 +326,9 @@ Cloud run 是明確 opt-in，會 ingest fixtures 並實際呼叫 embedding、rer
 cd backend
 EVAL_DATABASE_URL='postgres://<eval-user>:<password>@<host>:<port>/<brand-new-empty-eval-db>' \
 EVAL_FILES_DIR='/absolute/path/to/empty/eval-files' \
-CF_AI_GATEWAY_BASE_URL='https://gateway.ai.cloudflare.com/v1/<account-id>/<gateway-id>' \
-CF_AI_GATEWAY_TOKEN='<gateway-run-token>' \
-GEMMA_4_MODEL_ID='<confirmed-cloud-gemma-4-model-id>' \
+MODEL_BASE_URL='http://<inference-host>:<port>' \
+MODEL_API_TOKEN='<optional-bearer-token>' \
+GEMMA_4_MODEL_ID='<confirmed-gemma-4-model-id>' \
 PDFIUM_LIBRARY_PATH='/absolute/path/to/libpdfium.so' \
 LIBREOFFICE_BIN='/absolute/path/to/libreoffice' \
 proto exec rust -- cargo run -- eval --cloud \
@@ -331,7 +340,7 @@ proto exec rust -- cargo run -- eval --cloud \
 
 正式 run 也接受上述 `--document` / `--query` subset flags。成功寫檔後，stdout 會回傳 `passed` 與路徑；每次輸出位於 `<output>/<run_id>/report.json`、`report.csv`、`report.md`、`run-manifest.json`。`passed: true` 只有在至少一組有效 A/B pair，且 correct-page、citation precision/recall、answer facts recall、B 相對 A improvement 全部達到 owner 鎖定門檻時成立；command 本身完成不代表門檻通過。`report.*` 會列出各 query 的 improvement/same/regression/failure、分數與 failure reasons，`run-manifest.json` 則保存 locked model ids、prompt/top_n、dataset/threshold hash、git revision、subsets、retry/latency/request/fallback telemetry 與安全化失敗案例。preflight、native conversion、cloud contract 或 DB isolation 錯誤會以非零狀態停止；已開始寫入後不會局部清掉 DB/files，以免破壞診斷一致性。
 
-Threshold JSON 只應保存在本機安全位置：不得提交本機 threshold 檔、API/gateway key、`.env` secret 或任何 customer/production 文件。fixture 只能使用 repository 內已審核、標明來源與 license 的 synthetic files。
+Threshold JSON 只應保存在本機安全位置：不得提交本機 threshold 檔、API token、`.env` secret 或任何 customer/production 文件。fixture 只能使用 repository 內已審核、標明來源與 license 的 synthetic files。
 
 ## 驗證
 
@@ -374,7 +383,7 @@ cd ..
 docker compose --profile minio rm -sfv minio
 ```
 
-若要選擇性驗證經 Cloudflare AI Gateway 的真實 NVIDIA Build endpoint，先在 `.env` 填妥 `CF_AI_GATEWAY_BASE_URL`（或完整的 `CLOUD_EMBED_URL` gateway route）、`CF_AI_GATEWAY_TOKEN` 與 `GEMMA_4_MODEL_ID`，並確認 NVIDIA key 已以 BYOK 存於 gateway，再明確執行下列 ignored test。它會各送一次 text query、text passage、image passage 與 image+text passage（共四次雲端呼叫）；一般 `cargo test` 與 CI 不會執行：
+若要選擇性驗證真實 Embed VL endpoint，先在 `.env` 填妥 `MODEL_BASE_URL`（或完整的 `MODEL_EMBED_URL`）與 `GEMMA_4_MODEL_ID`，服務需認證時另填 `MODEL_API_TOKEN`，再明確執行下列 ignored test。它會各送一次 text query、text passage、image passage 與 image+text passage（共四次真實呼叫）；一般 `cargo test` 與 CI 不會執行：
 
 ```bash
 cd backend
