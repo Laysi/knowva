@@ -412,7 +412,7 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
             return;
         }
     };
-    let rag_context::RagContext { content, sources } = context;
+    let (content, sources) = context.into_parts();
 
     let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
     let stream_task = tokio::spawn(async move {
