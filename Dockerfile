@@ -146,8 +146,8 @@ RUN apt-get update \
        libreoffice-writer \
        libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 10001 km \
-    && useradd --uid 10001 --gid km --create-home --home-dir /app km
+    && groupadd --gid 10001 knowva \
+    && useradd --uid 10001 --gid knowva --create-home --home-dir /app knowva
 COPY --from=pdfium /opt/pdfium/lib/libpdfium.so /usr/local/lib/libpdfium.so
 COPY --from=pdfium /opt/pdfium/LICENSE /usr/share/doc/pdfium/LICENSE
 RUN ldconfig
@@ -156,9 +156,9 @@ WORKDIR /app/backend
 COPY --from=backend-builder /tmp/knowva-server ./knowva-server
 COPY --from=frontend-builder /src/frontend/dist /app/frontend/dist
 RUN mkdir -p /app/backend/data/files \
-    && chown -R km:km /app
+    && chown -R knowva:knowva /app
 
-USER km
+USER knowva
 ENV PORT=8080 \
     FILES_DIR=/app/backend/data/files \
     PDFIUM_LIBRARY_PATH=/usr/local/lib/libpdfium.so \

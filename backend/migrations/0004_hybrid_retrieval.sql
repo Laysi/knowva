@@ -9,7 +9,7 @@
 -- same rows as the GIN index, so BM25 does not rescan the whole corpus for N,
 -- average document length, or document frequency on every query.
 
-CREATE FUNCTION km_bm25_tokenize(input text)
+CREATE FUNCTION knowva_bm25_tokenize(input text)
 RETURNS text[]
 LANGUAGE plpgsql
 IMMUTABLE
@@ -99,9 +99,9 @@ $$;
 ALTER TABLE document_units
   ADD COLUMN retrieval_ready boolean NOT NULL DEFAULT false,
   ADD COLUMN bm25_tokens text[]
-    GENERATED ALWAYS AS (km_bm25_tokenize(content)) STORED,
+    GENERATED ALWAYS AS (knowva_bm25_tokenize(content)) STORED,
   ADD COLUMN bm25_length integer
-    GENERATED ALWAYS AS (cardinality(km_bm25_tokenize(content))) STORED;
+    GENERATED ALWAYS AS (cardinality(knowva_bm25_tokenize(content))) STORED;
 
 -- Denormalizing readiness onto the indexed row lets both partial indexes avoid
 -- inactive units. Every retrieval query also joins documents and checks the
@@ -111,7 +111,7 @@ SET retrieval_ready = (document.status = 'ready')
 FROM documents AS document
 WHERE document.id = unit.document_id;
 
-CREATE FUNCTION km_set_unit_retrieval_ready()
+CREATE FUNCTION knowva_set_unit_retrieval_ready()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -131,9 +131,9 @@ $$;
 CREATE TRIGGER document_units_set_retrieval_ready
 BEFORE INSERT OR UPDATE OF document_id, retrieval_ready ON document_units
 FOR EACH ROW
-EXECUTE FUNCTION km_set_unit_retrieval_ready();
+EXECUTE FUNCTION knowva_set_unit_retrieval_ready();
 
-CREATE FUNCTION km_sync_document_retrieval_ready()
+CREATE FUNCTION knowva_sync_document_retrieval_ready()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -151,7 +151,7 @@ $$;
 CREATE TRIGGER documents_sync_retrieval_ready
 AFTER UPDATE OF status ON documents
 FOR EACH ROW
-EXECUTE FUNCTION km_sync_document_retrieval_ready();
+EXECUTE FUNCTION knowva_sync_document_retrieval_ready();
 
 DROP INDEX document_units_embedding_hnsw;
 
@@ -165,18 +165,18 @@ CREATE INDEX document_units_bm25_tokens_gin
     AND content IS NOT NULL
     AND btrim(content) <> '';
 
-CREATE TABLE km_bm25_corpus_stats (
+CREATE TABLE knowva_bm25_corpus_stats (
   singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
   document_count bigint NOT NULL CHECK (document_count >= 0),
   total_length bigint NOT NULL CHECK (total_length >= 0)
 );
 
-CREATE TABLE km_bm25_term_stats (
+CREATE TABLE knowva_bm25_term_stats (
   term text PRIMARY KEY,
   document_frequency bigint NOT NULL CHECK (document_frequency > 0)
 );
 
-INSERT INTO km_bm25_corpus_stats (singleton, document_count, total_length)
+INSERT INTO knowva_bm25_corpus_stats (singleton, document_count, total_length)
 SELECT true,
        count(*),
        COALESCE(sum(bm25_length), 0)
@@ -185,7 +185,7 @@ WHERE retrieval_ready
   AND content IS NOT NULL
   AND btrim(content) <> '';
 
-INSERT INTO km_bm25_term_stats (term, document_frequency)
+INSERT INTO knowva_bm25_term_stats (term, document_frequency)
 SELECT token.term, count(*)
 FROM document_units AS unit
 CROSS JOIN LATERAL (
@@ -197,36 +197,36 @@ WHERE unit.retrieval_ready
   AND btrim(unit.content) <> ''
 GROUP BY token.term;
 
-CREATE FUNCTION km_bm25_add_stats(tokens text[], document_length integer)
+CREATE FUNCTION knowva_bm25_add_stats(tokens text[], document_length integer)
 RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  UPDATE km_bm25_corpus_stats
+  UPDATE knowva_bm25_corpus_stats
   SET document_count = document_count + 1,
       total_length = total_length + document_length
   WHERE singleton;
 
-  INSERT INTO km_bm25_term_stats (term, document_frequency)
+  INSERT INTO knowva_bm25_term_stats (term, document_frequency)
   SELECT DISTINCT token, 1
   FROM unnest(tokens) AS token
   WHERE token <> ''
   ON CONFLICT (term) DO UPDATE
-  SET document_frequency = km_bm25_term_stats.document_frequency + 1;
+  SET document_frequency = knowva_bm25_term_stats.document_frequency + 1;
 END;
 $$;
 
-CREATE FUNCTION km_bm25_remove_stats(tokens text[], document_length integer)
+CREATE FUNCTION knowva_bm25_remove_stats(tokens text[], document_length integer)
 RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  UPDATE km_bm25_corpus_stats
+  UPDATE knowva_bm25_corpus_stats
   SET document_count = document_count - 1,
       total_length = total_length - document_length
   WHERE singleton;
 
-  DELETE FROM km_bm25_term_stats AS stats
+  DELETE FROM knowva_bm25_term_stats AS stats
   WHERE stats.document_frequency = 1
     AND stats.term IN (
     SELECT DISTINCT token
@@ -234,7 +234,7 @@ BEGIN
     WHERE token <> ''
   );
 
-  UPDATE km_bm25_term_stats AS stats
+  UPDATE knowva_bm25_term_stats AS stats
   SET document_frequency = stats.document_frequency - 1
   WHERE stats.term IN (
     SELECT DISTINCT token
@@ -244,7 +244,7 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION km_bm25_sync_stats()
+CREATE FUNCTION knowva_bm25_sync_stats()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -265,10 +265,10 @@ BEGIN
   END IF;
 
   IF old_is_indexable THEN
-    PERFORM km_bm25_remove_stats(OLD.bm25_tokens, OLD.bm25_length);
+    PERFORM knowva_bm25_remove_stats(OLD.bm25_tokens, OLD.bm25_length);
   END IF;
   IF new_is_indexable THEN
-    PERFORM km_bm25_add_stats(NEW.bm25_tokens, NEW.bm25_length);
+    PERFORM knowva_bm25_add_stats(NEW.bm25_tokens, NEW.bm25_length);
   END IF;
 
   RETURN NULL;
@@ -278,4 +278,4 @@ $$;
 CREATE TRIGGER document_units_sync_bm25_stats
 AFTER INSERT OR DELETE OR UPDATE OF document_id, retrieval_ready, content ON document_units
 FOR EACH ROW
-EXECUTE FUNCTION km_bm25_sync_stats();
+EXECUTE FUNCTION knowva_bm25_sync_stats();

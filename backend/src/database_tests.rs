@@ -604,7 +604,7 @@ async fn bm25_tokenizer_normalizes_traditional_chinese_english_numbers_and_produ
     pool: PgPool,
 ) -> anyhow::Result<()> {
     let tokens: Vec<String> = sqlx::query_scalar(
-        "SELECT km_bm25_tokenize('知識，管理！PostgreSQL／ＢＭ２５ 版本１２３ ＮＸ－２０４８－Ｖ２')",
+        "SELECT knowva_bm25_tokenize('知識，管理！PostgreSQL／ＢＭ２５ 版本１２３ ＮＸ－２０４８－Ｖ２')",
     )
     .fetch_one(&pool)
     .await?;
@@ -629,16 +629,16 @@ async fn bm25_tokenizer_normalizes_traditional_chinese_english_numbers_and_produ
     }
 
     let full_width: Vec<String> =
-        sqlx::query_scalar("SELECT km_bm25_tokenize('ＮＸ－２０４８－Ｖ２')")
+        sqlx::query_scalar("SELECT knowva_bm25_tokenize('ＮＸ－２０４８－Ｖ２')")
             .fetch_one(&pool)
             .await?;
-    let half_width: Vec<String> = sqlx::query_scalar("SELECT km_bm25_tokenize('nx-2048-v2')")
+    let half_width: Vec<String> = sqlx::query_scalar("SELECT knowva_bm25_tokenize('nx-2048-v2')")
         .fetch_one(&pool)
         .await?;
     assert_eq!(full_width, half_width);
 
     let punctuation_variant: Vec<String> =
-        sqlx::query_scalar("SELECT km_bm25_tokenize('知識。管理 PostgreSQL, BM25; 123')")
+        sqlx::query_scalar("SELECT knowva_bm25_tokenize('知識。管理 PostgreSQL, BM25; 123')")
             .fetch_one(&pool)
             .await?;
     for basic_term in ["知識", "管理", "postgresql", "bm25", "123"] {
@@ -666,7 +666,7 @@ async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delet
     .await?;
 
     let initial_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
     )
     .fetch_one(&pool)
     .await?;
@@ -682,13 +682,13 @@ async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delet
             .fetch_one(&pool)
             .await?;
     let ready_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
     )
     .fetch_one(&pool)
     .await?;
     assert_eq!(ready_stats, (1, i64::from(first_length)));
     let alpha_df: i64 = sqlx::query_scalar(
-        "SELECT document_frequency FROM km_bm25_term_stats WHERE term = 'alpha'",
+        "SELECT document_frequency FROM knowva_bm25_term_stats WHERE term = 'alpha'",
     )
     .fetch_one(&pool)
     .await?;
@@ -704,35 +704,37 @@ async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delet
             .fetch_one(&pool)
             .await?;
     let changed_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
     )
     .fetch_one(&pool)
     .await?;
     assert_eq!(changed_stats, (1, i64::from(changed_length)));
     let alpha_df: Option<i64> = sqlx::query_scalar(
-        "SELECT document_frequency FROM km_bm25_term_stats WHERE term = 'alpha'",
+        "SELECT document_frequency FROM knowva_bm25_term_stats WHERE term = 'alpha'",
     )
     .fetch_optional(&pool)
     .await?;
     assert!(alpha_df.is_none());
-    let beta_df: i64 =
-        sqlx::query_scalar("SELECT document_frequency FROM km_bm25_term_stats WHERE term = 'beta'")
-            .fetch_one(&pool)
-            .await?;
+    let beta_df: i64 = sqlx::query_scalar(
+        "SELECT document_frequency FROM knowva_bm25_term_stats WHERE term = 'beta'",
+    )
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(beta_df, 1);
 
     let second_document = insert_document(&pool, "ready").await?;
     insert_text_unit(&pool, second_document, 0, "beta gamma", &embedding).await?;
     let two_document_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
     )
     .fetch_one(&pool)
     .await?;
     assert_eq!(two_document_stats.0, 2);
-    let beta_df: i64 =
-        sqlx::query_scalar("SELECT document_frequency FROM km_bm25_term_stats WHERE term = 'beta'")
-            .fetch_one(&pool)
-            .await?;
+    let beta_df: i64 = sqlx::query_scalar(
+        "SELECT document_frequency FROM knowva_bm25_term_stats WHERE term = 'beta'",
+    )
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(beta_df, 2);
 
     sqlx::query("UPDATE documents SET status = 'failed' WHERE id = $1")
@@ -740,15 +742,16 @@ async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delet
         .execute(&pool)
         .await?;
     let failed_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
     )
     .fetch_one(&pool)
     .await?;
     assert_eq!(failed_stats.0, 1);
-    let beta_df: i64 =
-        sqlx::query_scalar("SELECT document_frequency FROM km_bm25_term_stats WHERE term = 'beta'")
-            .fetch_one(&pool)
-            .await?;
+    let beta_df: i64 = sqlx::query_scalar(
+        "SELECT document_frequency FROM knowva_bm25_term_stats WHERE term = 'beta'",
+    )
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(beta_df, 1);
 
     sqlx::query("UPDATE documents SET status = 'ready' WHERE id = $1")
@@ -756,7 +759,7 @@ async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delet
         .execute(&pool)
         .await?;
     let restored_count: i64 =
-        sqlx::query_scalar("SELECT document_count FROM km_bm25_corpus_stats WHERE singleton")
+        sqlx::query_scalar("SELECT document_count FROM knowva_bm25_corpus_stats WHERE singleton")
             .fetch_one(&pool)
             .await?;
     assert_eq!(restored_count, 2);
@@ -774,7 +777,7 @@ async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delet
             .await?;
     assert!(!moved_ready);
     let moved_count: i64 =
-        sqlx::query_scalar("SELECT document_count FROM km_bm25_corpus_stats WHERE singleton")
+        sqlx::query_scalar("SELECT document_count FROM knowva_bm25_corpus_stats WHERE singleton")
             .fetch_one(&pool)
             .await?;
     assert_eq!(moved_count, 1);
@@ -793,7 +796,7 @@ async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delet
         "direct flag updates must follow canonical document status"
     );
     let canonical_count: i64 =
-        sqlx::query_scalar("SELECT document_count FROM km_bm25_corpus_stats WHERE singleton")
+        sqlx::query_scalar("SELECT document_count FROM knowva_bm25_corpus_stats WHERE singleton")
             .fetch_one(&pool)
             .await?;
     assert_eq!(canonical_count, 1);
@@ -804,7 +807,7 @@ async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delet
         .execute(&pool)
         .await?;
     let moved_back_count: i64 =
-        sqlx::query_scalar("SELECT document_count FROM km_bm25_corpus_stats WHERE singleton")
+        sqlx::query_scalar("SELECT document_count FROM knowva_bm25_corpus_stats WHERE singleton")
             .fetch_one(&pool)
             .await?;
     assert_eq!(moved_back_count, 2);
@@ -814,7 +817,7 @@ async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delet
         .execute(&pool)
         .await?;
     let after_first_delete: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
     )
     .fetch_one(&pool)
     .await?;
@@ -825,12 +828,12 @@ async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delet
         .execute(&pool)
         .await?;
     let final_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM km_bm25_corpus_stats WHERE singleton",
+        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
     )
     .fetch_one(&pool)
     .await?;
     assert_eq!(final_stats, (0, 0));
-    let term_count: i64 = sqlx::query_scalar("SELECT count(*) FROM km_bm25_term_stats")
+    let term_count: i64 = sqlx::query_scalar("SELECT count(*) FROM knowva_bm25_term_stats")
         .fetch_one(&pool)
         .await?;
     assert_eq!(term_count, 0);
@@ -1037,7 +1040,7 @@ async fn production_candidate_predicates_use_hnsw_and_gin_indexes(
         "EXPLAIN (COSTS OFF) \
          WITH query_terms AS MATERIALIZED ( \
            SELECT DISTINCT token AS term \
-           FROM unnest(km_bm25_tokenize($1)) AS token \
+           FROM unnest(knowva_bm25_tokenize($1)) AS token \
            WHERE token <> '' \
          ), query_token_array AS ( \
            SELECT COALESCE(array_agg(term ORDER BY term), ARRAY[]::text[]) AS terms \
@@ -1207,7 +1210,7 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
 async fn image_embedding_publish_is_idempotent_and_never_duplicates_units(
     pool: PgPool,
 ) -> anyhow::Result<()> {
-    let files_dir = std::env::temp_dir().join(format!("km-artifact-retry-{}", Uuid::new_v4()));
+    let files_dir = std::env::temp_dir().join(format!("knowva-artifact-retry-{}", Uuid::new_v4()));
     let storage = Storage::local(&files_dir)?;
     let (document_id, storage_key) = store_original(
         &pool,
@@ -1808,12 +1811,12 @@ async fn failed_publication_commit_keeps_the_previous_artifact_set_complete(
 
     // A deferred constraint trigger makes the next publication fail inside COMMIT.
     sqlx::raw_sql(
-        "CREATE FUNCTION km_test_fail_commit() RETURNS trigger LANGUAGE plpgsql AS \
+        "CREATE FUNCTION knowva_test_fail_commit() RETURNS trigger LANGUAGE plpgsql AS \
          $$ BEGIN RAISE EXCEPTION 'injected commit failure'; END $$; \
-         CREATE CONSTRAINT TRIGGER km_test_fail_commit \
+         CREATE CONSTRAINT TRIGGER knowva_test_fail_commit \
          AFTER INSERT ON document_artifact_sets \
          DEFERRABLE INITIALLY DEFERRED \
-         FOR EACH ROW EXECUTE FUNCTION km_test_fail_commit();",
+         FOR EACH ROW EXECUTE FUNCTION knowva_test_fail_commit();",
     )
     .execute(&pool)
     .await?;
@@ -1878,7 +1881,7 @@ async fn failed_publication_commit_keeps_the_previous_artifact_set_complete(
 async fn delete_keeps_a_retry_handle_when_storage_cleanup_fails(
     pool: PgPool,
 ) -> anyhow::Result<()> {
-    let files_dir = std::env::temp_dir().join(format!("km-delete-retry-{}", Uuid::new_v4()));
+    let files_dir = std::env::temp_dir().join(format!("knowva-delete-retry-{}", Uuid::new_v4()));
     let storage = Storage::local(&files_dir)?;
     let (document_id, _) =
         store_original(&pool, &storage, "cleanup.pdf", b"fixture".to_vec()).await?;
@@ -1933,7 +1936,7 @@ async fn delete_keeps_a_retry_handle_when_storage_cleanup_fails(
 
 #[sqlx::test]
 async fn markdown_and_text_fixtures_keep_heading_aware_staging(pool: PgPool) -> anyhow::Result<()> {
-    let root = std::env::temp_dir().join(format!("km-text-fixtures-{}", Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!("knowva-text-fixtures-{}", Uuid::new_v4()));
     let fixtures = crate::test_fixtures::write_all(&root)?;
     let (models, mock, server) = spawn_embedding_mock(false).await;
     let state = test_state(&pool, models, Storage::memory());
@@ -2007,7 +2010,7 @@ async fn upload_answer_delete_flow(pool: &PgPool, storage: Storage) -> anyhow::R
     let (models, mock, server) = spawn_embedding_mock(false).await;
     let app = api_router(test_state(pool, models, storage.clone()));
 
-    let boundary = "km-storage-flow";
+    let boundary = "knowva-storage-flow";
     let mut body = format!(
         "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
          filename=\"blue-page.png\"\r\nContent-Type: image/png\r\n\r\n"
@@ -2139,7 +2142,7 @@ async fn upload_answer_delete_flow(pool: &PgPool, storage: Storage) -> anyhow::R
 
 #[sqlx::test]
 async fn upload_answer_delete_flow_with_local_storage(pool: PgPool) -> anyhow::Result<()> {
-    let files_dir = std::env::temp_dir().join(format!("km-flow-local-{}", Uuid::new_v4()));
+    let files_dir = std::env::temp_dir().join(format!("knowva-flow-local-{}", Uuid::new_v4()));
     upload_answer_delete_flow(&pool, Storage::local(&files_dir)?).await?;
     assert_eq!(
         std::fs::read_dir(&files_dir)?.count(),
@@ -2176,7 +2179,7 @@ async fn first_start_records_the_backend_and_only_files_dir_may_change(
     ensure_initialization_lock(
         &pool,
         &StorageConfig::Local {
-            files_dir: "/srv/km/files".into(),
+            files_dir: "/srv/knowva/files".into(),
         },
     )
     .await?;
@@ -2198,7 +2201,7 @@ async fn first_start_records_the_backend_and_only_files_dir_may_change(
     let error = ensure_initialization_lock(
         &pool,
         &StorageConfig::S3 {
-            bucket: "km-files".to_owned(),
+            bucket: "knowva-files".to_owned(),
             prefix: None,
         },
     )
@@ -2208,7 +2211,7 @@ async fn first_start_records_the_backend_and_only_files_dir_may_change(
     assert!(error.contains("儲存後端已於初始化時鎖定，變更需重新初始化 DB 與儲存空間"));
     assert!(error.contains("已鎖定：backend=local"), "{error}");
     assert!(
-        error.contains("目前設定：backend=s3, bucket=km-files"),
+        error.contains("目前設定：backend=s3, bucket=knowva-files"),
         "{error}"
     );
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM storage_settings")
@@ -2224,14 +2227,14 @@ async fn s3_lock_covers_bucket_and_prefix_but_not_the_endpoint(pool: PgPool) -> 
         bucket: bucket.to_owned(),
         prefix: prefix.map(str::to_owned),
     };
-    ensure_initialization_lock(&pool, &s3("km-files", Some("tenant-a"))).await?;
+    ensure_initialization_lock(&pool, &s3("knowva-files", Some("tenant-a"))).await?;
     // The endpoint is a client setting outside the lock, so moving endpoints
     // restarts with the identical recorded identity.
-    ensure_initialization_lock(&pool, &s3("km-files", Some("tenant-a"))).await?;
+    ensure_initialization_lock(&pool, &s3("knowva-files", Some("tenant-a"))).await?;
     for changed in [
-        s3("km-other", Some("tenant-a")),
-        s3("km-files", Some("tenant-b")),
-        s3("km-files", None),
+        s3("knowva-other", Some("tenant-a")),
+        s3("knowva-files", Some("tenant-b")),
+        s3("knowva-files", None),
         StorageConfig::Local {
             files_dir: "./data/files".into(),
         },

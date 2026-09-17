@@ -9,7 +9,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://km:km@postgres:5432/km
+      DATABASE_URL: postgres://knowva:knowva@postgres:5432/knowva
       FILES_DIR: /app/backend/data/files
       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
       STORAGE_BUCKET: ${STORAGE_BUCKET:-}
@@ -48,13 +48,13 @@ services:
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     environment:
-      POSTGRES_USER: km
-      POSTGRES_PASSWORD: km
-      POSTGRES_DB: km
+      POSTGRES_USER: knowva
+      POSTGRES_PASSWORD: knowva
+      POSTGRES_DB: knowva
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U km"]
+      test: ["CMD-SHELL", "pg_isready -U knowva"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -66,8 +66,8 @@ services:
     profiles: ["minio"]
     command: server /data --console-address :9001
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-kmminio}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-kmminio-secret}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-knowvaminio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-knowvaminio-secret}
     ports:
       - "${MINIO_PORT:-9000}:9000"
       - "${MINIO_CONSOLE_PORT:-9001}:9001"
@@ -78,9 +78,9 @@ services:
     depends_on:
       - minio
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-kmminio}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-kmminio-secret}
-      STORAGE_BUCKET: ${STORAGE_BUCKET:-km-files}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-knowvaminio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-knowvaminio-secret}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-knowva-files}
     entrypoint:
       - sh
       - -c

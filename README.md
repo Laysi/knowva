@@ -116,13 +116,13 @@ FILES_DIR=./data/files
 
 # AWS S3（IAM role 時省略 STORAGE_ACCESS_KEY_ID/STORAGE_SECRET_ACCESS_KEY）
 STORAGE_BACKEND=s3
-STORAGE_BUCKET=km-files
+STORAGE_BUCKET=knowva-files
 STORAGE_PREFIX=prod
 STORAGE_REGION=ap-northeast-1
 
 # Cloudflare R2
 STORAGE_BACKEND=s3
-STORAGE_BUCKET=km-files
+STORAGE_BUCKET=knowva-files
 STORAGE_REGION=auto
 STORAGE_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com
 STORAGE_ACCESS_KEY_ID=<r2-access-key-id>
@@ -133,7 +133,7 @@ STORAGE_SECRET_ACCESS_KEY=<r2-secret-access-key>
 - **初始化鎖定**：第一次對空資料庫啟動時，會把 backend（`s3` 另含 bucket 與 prefix）寫進 `storage_settings`。之後每次啟動都會比對，不一致即停止並顯示「儲存後端已於初始化時鎖定，變更需重新初始化 DB 與儲存空間」與已鎖定／目前設定。`FILES_DIR` 與 S3 endpoint 不列入鎖定，可更換掛載點或 endpoint。
 - **正式部署（`deploy.yml`）**：儲存設定放在 repository 設定，每次部署都寫進主機 `.env`，確保與初始化時的鎖定一致。Variables：`STORAGE_BACKEND`、`STORAGE_BUCKET`、`STORAGE_PREFIX`、`STORAGE_ENDPOINT`、`STORAGE_REGION`；Secrets：`STORAGE_ACCESS_KEY_ID`、`STORAGE_SECRET_ACCESS_KEY`。未設定即為空值，`STORAGE_BACKEND` 未設定即為 `local`。`STORAGE_ALLOW_HTTP=false` 與 `STORAGE_TIMEOUT=120s` 寫死在 `docker-compose.prod.yml`。首次部署到空 DB 前就要設好；`s3` 缺 `STORAGE_BUCKET` 或值不合法時，workflow 會在碰主機前失敗。
 - **已部署環境升級到此版需清空 DB 與檔案重新初始化**：DB 改存相對 key，不提供舊路徑資料轉換；資料庫已有文件但沒有鎖定紀錄時會拒絕啟動。
-- Pdfium／LibreOffice 仍只能讀本機檔，每次轉檔都在系統暫存區（`TMPDIR`）下獨立的 `km-ingest-<run_id>` 目錄進行，不論成功或失敗都會刪除。
+- Pdfium／LibreOffice 仍只能讀本機檔，每次轉檔都在系統暫存區（`TMPDIR`）下獨立的 `knowva-ingest-<run_id>` 目錄進行，不論成功或失敗都會刪除。
 - evaluation 固定使用本機 `EVAL_FILES_DIR`，不受 `STORAGE_BACKEND` 影響；它的獨立 `EVAL_DATABASE_URL` 有自己的鎖定紀錄，與 production 互不影響。
 
 ## 使用 Docker Compose
@@ -155,7 +155,7 @@ docker compose logs -f app
 docker compose down
 ```
 
-若要以本機 MinIO 驗證 S3 模式，先在 `.env` 設定 `STORAGE_BACKEND=s3`、`STORAGE_BUCKET=km-files`、`STORAGE_ENDPOINT=http://minio:9000`、`STORAGE_ALLOW_HTTP=true`、`STORAGE_ACCESS_KEY_ID=kmminio`、`STORAGE_SECRET_ACCESS_KEY=kmminio-secret`，再加上 `minio` profile 啟動（`minio-init` 會建立 bucket；app 若早於 bucket 建立會自動重啟重試）。預設的 `docker compose up` 不會啟動 MinIO。既有資料庫已鎖定為 local 時，必須先清空 DB 與檔案（例如 `docker compose down -v`，會刪除所有資料）才能改用 s3：
+若要以本機 MinIO 驗證 S3 模式，先在 `.env` 設定 `STORAGE_BACKEND=s3`、`STORAGE_BUCKET=knowva-files`、`STORAGE_ENDPOINT=http://minio:9000`、`STORAGE_ALLOW_HTTP=true`、`STORAGE_ACCESS_KEY_ID=knowvaminio`、`STORAGE_SECRET_ACCESS_KEY=knowvaminio-secret`，再加上 `minio` profile 啟動（`minio-init` 會建立 bucket；app 若早於 bucket 建立會自動重啟重試）。預設的 `docker compose up` 不會啟動 MinIO。既有資料庫已鎖定為 local 時，必須先清空 DB 與檔案（例如 `docker compose down -v`，會刪除所有資料）才能改用 s3：
 
 ```bash
 docker compose --profile minio up -d --build
@@ -320,7 +320,7 @@ Cloud run 是明確 opt-in，會 ingest fixtures 並實際呼叫 embedding、rer
    ```
 
 2. 完成 threshold JSON 的所有欄位與排版後，對**最終檔案 bytes**計算 SHA-256（例如 `sha256sum /absolute/path/to/thresholds.json`；之後只要檔案有任何 byte 改動就必須重算）。由同一位 owner 編輯上一步的同一則留言，加入獨立一行 `threshold_sha256: <sha256sum 輸出的 64 字元雜湊>`；編輯留言不會改變 permalink。runner 會從 GitHub 讀取該固定 URL，並要求 URL 與 hash line 都精確符合本機 snapshot。
-3. 由 PostgreSQL 管理者建立一個名稱以 `km_eval_` 開頭的全新空 database，以及名稱可辨識用途的專用登入角色（例如組織自訂的 `km_eval_runner_<識別碼>`；尖括號內容必須換成真實且唯一的值）。以該角色作為 database owner，讓它能執行 migration；接著在任何 migration 前，以 database owner 連線並執行 `COMMENT ON DATABASE <實際的 km_eval_ database 名稱> IS 'ai-km-evaluation-only:v1';`。最後把使用該專用角色與 database 的連線字串設為 `EVAL_DATABASE_URL`。runner 會檢查 current database 名稱、connect role 身分與精確 marker；它也會拒絕 production `DATABASE_URL`、repository 預設 DB，以及 migration 後含有任何 document 的 DB。不要把 placeholder、示意密碼或假 marker 當成正式設定。
+3. 由 PostgreSQL 管理者建立一個名稱以 `knowva_eval_` 開頭的全新空 database，以及名稱可辨識用途的專用登入角色（例如組織自訂的 `knowva_eval_runner_<識別碼>`；尖括號內容必須換成真實且唯一的值）。以該角色作為 database owner，讓它能執行 migration；接著在任何 migration 前，以 database owner 連線並執行 `COMMENT ON DATABASE <實際的 knowva_eval_ database 名稱> IS 'knowva-evaluation-only:v1';`。最後把使用該專用角色與 database 的連線字串設為 `EVAL_DATABASE_URL`。runner 會檢查 current database 名稱、connect role 身分與精確 marker；它也會拒絕 production `DATABASE_URL`、repository 預設 DB，以及 migration 後含有任何 document 的 DB。不要把 placeholder、示意密碼或假 marker 當成正式設定。
 4. 準備專用且為空的 `EVAL_FILES_DIR`。它不可等於、包含或位於 production `FILES_DIR` 或預設 `./data/files` 之下；失敗後會保留完整隔離 run 供診斷，下次不可重用非空目錄。
 5. 設定地端推論服務與確認過的 Gemma 4 model id：至少提供 `MODEL_BASE_URL` 與 `GEMMA_4_MODEL_ID`；各能力分屬不同主機時改設 `MODEL_CHAT_URL`、`MODEL_EMBED_URL`、`MODEL_RERANK_URL`，服務需認證時另設 `MODEL_API_TOKEN`。確認服務已載入固定的 Nemotron embedding/rerank models。
 6. 主機安裝 Pdfium 與 LibreOffice/CJK 字型，並以 `PDFIUM_LIBRARY_PATH`、`LIBREOFFICE_BIN` 指向可用 binary/library，讓 PDF、掃描頁與 PPTX fixtures 能完整 ingest。
@@ -398,9 +398,9 @@ fixture 的來源、預期頁數與涵蓋範圍見 [backend/tests/fixtures/READM
 ```bash
 docker compose --profile minio run --rm minio-init   # 啟動 MinIO，建好 bucket 才返回
 cd backend
-STORAGE_BACKEND=s3 STORAGE_BUCKET=km-files STORAGE_PREFIX=smoke \
+STORAGE_BACKEND=s3 STORAGE_BUCKET=knowva-files STORAGE_PREFIX=smoke \
 STORAGE_ENDPOINT=http://localhost:9000 STORAGE_ALLOW_HTTP=true STORAGE_REGION=us-east-1 \
-STORAGE_ACCESS_KEY_ID=kmminio STORAGE_SECRET_ACCESS_KEY=kmminio-secret \
+STORAGE_ACCESS_KEY_ID=knowvaminio STORAGE_SECRET_ACCESS_KEY=knowvaminio-secret \
 proto exec rust -- cargo test minio_smoke -- --ignored --nocapture
 cd ..
 docker compose --profile minio rm -sfv minio

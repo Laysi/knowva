@@ -638,7 +638,7 @@ pub(crate) async fn bm25_candidates_from_pool(
     let rows = sqlx::query_as::<_, CandidateRow>(
         "WITH query_terms AS MATERIALIZED ( \
            SELECT DISTINCT token AS term \
-           FROM unnest(km_bm25_tokenize($1)) AS token \
+           FROM unnest(knowva_bm25_tokenize($1)) AS token \
            WHERE token <> '' \
          ), query_token_array AS ( \
            SELECT COALESCE(array_agg(term ORDER BY term), ARRAY[]::text[]) AS terms \
@@ -674,9 +674,9 @@ pub(crate) async fn bm25_candidates_from_pool(
                   )::double precision AS score \
            FROM candidate_units AS candidate \
            JOIN documents AS document ON document.id = candidate.document_id \
-           CROSS JOIN km_bm25_corpus_stats AS corpus \
+           CROSS JOIN knowva_bm25_corpus_stats AS corpus \
            JOIN query_terms AS query ON query.term = ANY(candidate.bm25_tokens) \
-           JOIN km_bm25_term_stats AS term_stats ON term_stats.term = query.term \
+           JOIN knowva_bm25_term_stats AS term_stats ON term_stats.term = query.term \
            CROSS JOIN LATERAL ( \
              SELECT cardinality(array_positions(candidate.bm25_tokens, query.term))::double precision AS tf \
            ) AS frequency \

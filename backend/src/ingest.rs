@@ -131,7 +131,7 @@ struct ScratchDir(PathBuf);
 
 impl ScratchDir {
     fn create(run_id: Uuid) -> std::io::Result<Self> {
-        let path = std::env::temp_dir().join(format!("km-ingest-{run_id}"));
+        let path = std::env::temp_dir().join(format!("knowva-ingest-{run_id}"));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
@@ -1394,7 +1394,7 @@ mod tests {
     #[ignore = "requires Pdfium and LibreOffice"]
     async fn native_conversion_runs_in_scratch_and_publishes_relative_keys() -> anyhow::Result<()> {
         let fixtures_root =
-            std::env::temp_dir().join(format!("km-ingest-native-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("knowva-ingest-native-{}", Uuid::new_v4()));
         let fixtures = crate::test_fixtures::write_all(&fixtures_root)?;
         let storage = Storage::memory();
         let state = AppState {

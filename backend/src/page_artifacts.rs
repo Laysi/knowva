@@ -690,7 +690,7 @@ mod tests {
     }
 
     fn test_dir(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("km-page-artifacts-{label}-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("knowva-page-artifacts-{label}-{}", Uuid::new_v4()))
     }
 
     #[test]

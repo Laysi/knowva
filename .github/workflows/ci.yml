@@ -85,20 +85,20 @@ jobs:
       postgres:
         image: pgvector/pgvector:pg17
         env:
-          POSTGRES_USER: km
-          POSTGRES_PASSWORD: km
-          POSTGRES_DB: km
+          POSTGRES_USER: knowva
+          POSTGRES_PASSWORD: knowva
+          POSTGRES_DB: knowva
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U km"
+          --health-cmd "pg_isready -U knowva"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
 
     env:
       # #[sqlx::test] creates a temporary database per test from this URL.
-      DATABASE_URL: postgres://km:km@localhost:5432/km
+      DATABASE_URL: postgres://knowva:knowva@localhost:5432/knowva
 
     steps:
       - name: Checkout

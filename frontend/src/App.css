@@ -388,46 +388,43 @@
   border-radius: var(--radius-md);
 }
 
-/* thinking dots — hidden once an error is present */
-.typing {
-  display: inline-flex;
-  gap: 5px;
-  align-items: center;
-  height: 24px;
+/* While the answer is still forming the mark traces the track's edge.
+   Hidden once an error is present. */
+.thinking {
+  position: relative;
+  width: 104px;
+  height: 26px;
 }
 
-.typing span {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--color-accent);
-  opacity: 0.4;
-  animation: typing 1.2s infinite ease-in-out;
+.thinking-track {
+  position: absolute;
+  inset: 0;
+  background: var(--color-accent-weak);
+  border: 1px solid var(--color-accent-weak-border);
+  border-radius: var(--radius-full);
 }
 
-.typing span:nth-child(2) {
-  animation-delay: 0.18s;
+.thinking-star {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  font-size: 17px;
+  color: var(--color-accent);
+  filter: drop-shadow(0 0 6px rgba(109, 74, 255, 0.65));
+  offset-path: path("M13 0H91A13 13 0 0 1 91 26H13A13 13 0 0 1 13 0Z");
+  offset-rotate: 0deg;
+  animation: thinking-orbit 2.4s linear infinite;
 }
 
-.typing span:nth-child(3) {
-  animation-delay: 0.36s;
+@keyframes thinking-orbit {
+  to {
+    offset-distance: 100%;
+  }
 }
 
-.msg-error ~ .typing {
+.msg-error ~ .thinking {
   display: none;
-}
-
-@keyframes typing {
-  0%,
-  60%,
-  100% {
-    translate: 0 0;
-    opacity: 0.35;
-  }
-  30% {
-    translate: 0 -4px;
-    opacity: 1;
-  }
 }
 
 /* ---- Composer ---- */
@@ -1248,7 +1245,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .typing span,
+  .thinking-star,
   .status-processing .status-dot,
   .aui-md[data-status="running"] > :last-child::after,
   .spinner {

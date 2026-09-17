@@ -32,7 +32,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://km:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/km
+      DATABASE_URL: postgres://knowva:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/knowva
       FILES_DIR: /app/backend/data/files
       PORT: "8080"
       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
@@ -69,13 +69,13 @@ services:
     image: pgvector/pgvector:pg17
     restart: unless-stopped
     environment:
-      POSTGRES_USER: km
+      POSTGRES_USER: knowva
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
-      POSTGRES_DB: km
+      POSTGRES_DB: knowva
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U km"]
+      test: ["CMD-SHELL", "pg_isready -U knowva"]
       interval: 5s
       timeout: 5s
       retries: 5

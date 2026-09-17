@@ -32,7 +32,7 @@ use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-pub(crate) const DEFAULT_DATABASE_URL: &str = "postgres://km:km@localhost:5432/km";
+pub(crate) const DEFAULT_DATABASE_URL: &str = "postgres://knowva:knowva@localhost:5432/knowva";
 pub(crate) const DEFAULT_FILES_DIR: &str = "./data/files";
 
 #[derive(Clone)]

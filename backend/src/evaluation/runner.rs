@@ -49,8 +49,8 @@ const DEFAULT_SEED: u64 = 42;
 const DEFAULT_CONCURRENCY: usize = 1;
 const PROMPT_VERSION: &str = "gemma4-rag-v1";
 const MAX_ANSWER_CHARS: usize = 4_000;
-const EVALUATION_DATABASE_PREFIX: &str = "km_eval_";
-const EVALUATION_DATABASE_MARKER: &str = "ai-km-evaluation-only:v1";
+const EVALUATION_DATABASE_PREFIX: &str = "knowva_eval_";
+const EVALUATION_DATABASE_MARKER: &str = "knowva-evaluation-only:v1";
 const GITHUB_COMMENT_API_BASE: &str = "https://api.github.com/repos/Laysi/knowva/issues/comments/";
 const THRESHOLD_APPROVER_LOGIN: &str = "Ruisi-Lu";
 
@@ -123,7 +123,7 @@ impl ThresholdApprovalVerifier for GitHubThresholdApprovalVerifier {
             let response = self
                 .http
                 .get(endpoint)
-                .header(reqwest::header::USER_AGENT, "ai-km-evaluation-runner")
+                .header(reqwest::header::USER_AGENT, "knowva-evaluation-runner")
                 .header(reqwest::header::ACCEPT, "application/vnd.github+json")
                 .send()
                 .await
@@ -881,7 +881,7 @@ fn validate_database_identity_values(
     if !database_name.starts_with(EVALUATION_DATABASE_PREFIX)
         || database_name.len() == EVALUATION_DATABASE_PREFIX.len()
     {
-        bail!("evaluation database name must use the dedicated km_eval_ prefix");
+        bail!("evaluation database name must use the dedicated knowva_eval_ prefix");
     }
     if current_user.trim().is_empty() {
         bail!("evaluation database user identity is invalid");
@@ -1818,7 +1818,7 @@ mod tests {
     use super::*;
 
     fn temporary_directory(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("km-eval-{label}-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("knowva-eval-{label}-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temporary directory");
         path
     }
@@ -1897,7 +1897,7 @@ mod tests {
             ),
             (
                 "DATABASE_URL".to_owned(),
-                "postgres://km:km@localhost:5432/production".to_owned(),
+                "postgres://knowva:knowva@localhost:5432/production".to_owned(),
             ),
             (
                 "FILES_DIR".to_owned(),
@@ -2278,7 +2278,7 @@ mod tests {
 
         let nested_eval_root = production_root.join("nested-eval");
         let overlap_environment = environment(
-            "postgres://km:km@localhost:5432/evaluation",
+            "postgres://knowva:knowva@localhost:5432/evaluation",
             &nested_eval_root,
             &production_root,
         );
@@ -2291,7 +2291,7 @@ mod tests {
 
         let default_eval_files = root.join(DEFAULT_FILES_DIR);
         let default_files_environment = environment(
-            "postgres://km:km@localhost:5432/evaluation",
+            "postgres://knowva:knowva@localhost:5432/evaluation",
             &default_eval_files,
             &production_root,
         );
@@ -2441,7 +2441,7 @@ mod tests {
         assert!(
             validate_database_identity_values(
                 "production",
-                "km_eval_user",
+                "knowva_eval_user",
                 Some(EVALUATION_DATABASE_MARKER),
                 false,
             )
@@ -2449,8 +2449,8 @@ mod tests {
         );
         assert!(
             validate_database_identity_values(
-                "km_eval_fixture",
-                "km_eval_user",
+                "knowva_eval_fixture",
+                "knowva_eval_user",
                 Some("wrong-marker"),
                 false,
             )
@@ -2458,16 +2458,16 @@ mod tests {
         );
         assert!(
             validate_database_identity_values(
-                "km_eval_fixture",
-                "km_eval_user",
+                "knowva_eval_fixture",
+                "knowva_eval_user",
                 Some(EVALUATION_DATABASE_MARKER),
                 true,
             )
             .is_err()
         );
         validate_database_identity_values(
-            "km_eval_fixture",
-            "km_eval_user",
+            "knowva_eval_fixture",
+            "knowva_eval_user",
             Some(EVALUATION_DATABASE_MARKER),
             false,
         )
@@ -2476,7 +2476,10 @@ mod tests {
 
     #[test]
     fn production_defaults_remain_the_server_defaults() {
-        assert_eq!(DEFAULT_DATABASE_URL, "postgres://km:km@localhost:5432/km");
+        assert_eq!(
+            DEFAULT_DATABASE_URL,
+            "postgres://knowva:knowva@localhost:5432/knowva"
+        );
         assert_eq!(DEFAULT_FILES_DIR, "./data/files");
     }
 }

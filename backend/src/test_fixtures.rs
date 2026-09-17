@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn fixture_sources_have_expected_container_shape() -> anyhow::Result<()> {
-        let root = std::env::temp_dir().join(format!("km-fixtures-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("knowva-fixtures-{}", uuid::Uuid::new_v4()));
         let fixtures = write_all(&root)?;
         assert!(fixtures.native_pdf.metadata()?.len() > 100);
         assert!(fixtures.scanned_pdf.metadata()?.len() > 100);

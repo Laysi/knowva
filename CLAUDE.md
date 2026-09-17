@@ -51,7 +51,7 @@ The backend requires a confirmed `GEMMA_4_MODEL_ID` and `MODEL_BASE_URL` (unless
 
 - Pdfium is a runtime shared-library dependency for PDF/Office page rendering; `PDFIUM_LIBRARY_PATH` may point to the library or its directory.
 - LibreOffice is only required for DOCX/PPTX/XLSX and is selected with `LIBREOFFICE_BIN`.
-- The runtime image pins Pdfium Chromium 7763 by architecture and includes LibreOffice plus Noto CJK fonts; it runs as the non-root `km` user.
+- The runtime image pins Pdfium Chromium 7763 by architecture and includes LibreOffice plus Noto CJK fonts; it runs as the non-root `knowva` user.
 - The default page render setting is 180 DPI and conversion timeout is 120 seconds; see `.env.example`.
 - The real PDF/Office fixture smoke test is explicitly ignored on machines without both native dependencies. It also verifies native PDF image+text and scanned PDF image-only requests against a mock endpoint. The `native-test` image target provides a reproducible opt-in run; its command and expected page counts are documented in `README.md` and `backend/tests/fixtures/README.md`.
 - A separate ignored real-cloud Embed VL smoke covers all four input shapes and must only be run explicitly with configured credentials; normal tests and CI use deterministic mock endpoints.

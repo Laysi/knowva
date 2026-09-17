@@ -868,7 +868,7 @@ mod tests {
     fn temporary_directory() -> PathBuf {
         let suffix = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "km-evaluation-schema-{}-{suffix}",
+            "knowva-evaluation-schema-{}-{suffix}",
             std::process::id()
         ));
         fs::create_dir_all(path.join("documents")).expect("create test fixture directory");

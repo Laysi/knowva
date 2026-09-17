@@ -1688,7 +1688,7 @@ mod tests {
         let bytes = serde_json::to_vec_pretty(&threshold_config()).expect("serialize thresholds");
         let suffix = NEXT_STAGING_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "ai-km-threshold-snapshot-{}-{suffix}.json",
+            "knowva-threshold-snapshot-{}-{suffix}.json",
             std::process::id()
         ));
         fs::write(&path, &bytes).expect("write thresholds");
@@ -1706,7 +1706,7 @@ mod tests {
     #[test]
     fn threshold_validation_rejects_wrong_provenance_and_values() {
         for invalid in [
-            "https://github.com/example/ai-km-demo/issues/1#issuecomment-123",
+            "https://github.com/example/knowva/issues/1#issuecomment-123",
             "https://github.com/laysi/knowva/issues/1#issuecomment-123",
             "https://github.com/Laysi/knowva/issues/2#issuecomment-123",
             "https://github.example/Laysi/knowva/issues/1#issuecomment-123",

@@ -515,20 +515,20 @@ mod tests {
             }
         );
         assert_eq!(
-            config_from(&[("STORAGE_BACKEND", "local"), ("FILES_DIR", "/srv/km")]).unwrap(),
+            config_from(&[("STORAGE_BACKEND", "local"), ("FILES_DIR", "/srv/knowva")]).unwrap(),
             StorageConfig::Local {
-                files_dir: "/srv/km".into()
+                files_dir: "/srv/knowva".into()
             }
         );
         assert_eq!(
             config_from(&[
                 ("STORAGE_BACKEND", "s3"),
-                ("STORAGE_BUCKET", "km-files"),
+                ("STORAGE_BUCKET", "knowva-files"),
                 ("STORAGE_PREFIX", "/tenant-a/prod/"),
             ])
             .unwrap(),
             StorageConfig::S3 {
-                bucket: "km-files".to_owned(),
+                bucket: "knowva-files".to_owned(),
                 prefix: Some("tenant-a/prod".to_owned())
             }
         );
@@ -537,7 +537,7 @@ mod tests {
         let with_endpoint = |endpoint| {
             config_from(&[
                 ("STORAGE_BACKEND", "s3"),
-                ("STORAGE_BUCKET", "km-files"),
+                ("STORAGE_BUCKET", "knowva-files"),
                 ("STORAGE_ENDPOINT", endpoint),
             ])
             .unwrap()
@@ -551,7 +551,7 @@ mod tests {
         assert!(missing_bucket.to_string().contains("STORAGE_BUCKET"));
         let bad_prefix = config_from(&[
             ("STORAGE_BACKEND", "s3"),
-            ("STORAGE_BUCKET", "km-files"),
+            ("STORAGE_BUCKET", "knowva-files"),
             ("STORAGE_PREFIX", "a/../b"),
         ])
         .unwrap_err();
@@ -687,7 +687,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_prefix_delete_leaves_no_empty_document_directory() {
-        let root = std::env::temp_dir().join(format!("km-storage-local-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("knowva-storage-local-{}", Uuid::new_v4()));
         let storage = Storage::local(&root).unwrap();
         let document_id = Uuid::new_v4();
         for key in [
@@ -711,7 +711,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn local_symlinks_never_escape_the_document_directory() {
-        let base = std::env::temp_dir().join(format!("km-storage-symlink-{}", Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("knowva-storage-symlink-{}", Uuid::new_v4()));
         let root = base.join("files");
         let outside = base.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
@@ -813,8 +813,8 @@ mod tests {
             panic!("set STORAGE_BACKEND=s3 for the MinIO smoke test");
         };
         let real_secret = std::env::var("STORAGE_SECRET_ACCESS_KEY").unwrap_or_default();
-        let wrong_secret = "km-smoke-wrong-secret-value";
-        let missing_bucket = format!("km-missing-{}", Uuid::new_v4());
+        let wrong_secret = "knowva-smoke-wrong-secret-value";
+        let missing_bucket = format!("knowva-missing-{}", Uuid::new_v4());
         let cases = [
             (
                 s3_builder_from_env()
