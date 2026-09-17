@@ -14,6 +14,7 @@ mod database_tests;
 mod test_fixtures;
 
 use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderValue, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -27,8 +28,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
-use tower_http::cors::CorsLayer;
+use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 pub(crate) const DEFAULT_DATABASE_URL: &str = "postgres://km:km@localhost:5432/km";
 pub(crate) const DEFAULT_FILES_DIR: &str = "./data/files";
@@ -100,16 +102,38 @@ async fn main() -> anyhow::Result<()> {
         document_locks: ingest::DocumentLocks::default(),
     });
 
-    let api_routes = api_router(state);
+    // No CORS layer: the frontend is served from this process, so the browser
+    // only ever makes same-origin requests -- in development too, where Vite
+    // proxies /api rather than letting the page call the backend directly. A
+    // permissive layer would just let any other site reach an API that has no
+    // authentication in front of it.
+    let app = api_router(state);
 
-    let app = api_routes.layer(CorsLayer::permissive());
-
+    // Compression wraps the static files only. /api/chat is an SSE stream, and
+    // a compressor in front of it can hold token chunks back.
     let dist_dir = "../frontend/dist";
     let app = if Path::new(dist_dir).exists() {
+        // Vite writes content-hashed filenames under assets/, so those never
+        // change meaning and can be cached indefinitely. index.html names them
+        // and must be revalidated, or a deploy would not be picked up.
+        let assets = Router::new()
+            .fallback_service(ServeDir::new(format!("{dist_dir}/assets")))
+            .layer(SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ))
+            .layer(CompressionLayer::new());
         let index_html = format!("{dist_dir}/index.html");
-        let serve_dir = ServeDir::new(dist_dir).not_found_service(ServeFile::new(index_html));
-        app.fallback_service(serve_dir)
+        let shell = Router::new()
+            .fallback_service(ServeDir::new(dist_dir).not_found_service(ServeFile::new(index_html)))
+            .layer(SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-cache"),
+            ))
+            .layer(CompressionLayer::new());
+        app.nest_service("/assets", assets).fallback_service(shell)
     } else {
+        tracing::warn!("{dist_dir} not found; serving the API without a frontend");
         app
     };
 
