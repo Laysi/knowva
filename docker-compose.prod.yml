@@ -25,7 +25,7 @@
 
 services:
   app:
-    image: ghcr.io/laysi/outsourcing-ai-km:${KM_VERSION:-latest}
+    image: ghcr.io/laysi/knowva:${KNOWVA_VERSION:-latest}
     restart: unless-stopped
     init: true
     depends_on:

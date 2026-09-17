@@ -116,15 +116,15 @@ jobs:
           # gets it back and `latest` -- or any other non-numeric tag -- is
           # passed through as typed.
           case "$VERSION" in
-              [0-9]*) KM_VERSION=v$VERSION ;;
-              *) KM_VERSION=$VERSION ;;
+              [0-9]*) KNOWVA_VERSION=v$VERSION ;;
+              *) KNOWVA_VERSION=$VERSION ;;
           esac
           # The whole file is secret material. The Cloudflare tunnel is not in
           # it: that runs as its own project on the host, serves every site on
           # the machine, and is not this deployment's to configure.
           umask 077
           cat > env.deploy <<EOF
-          KM_VERSION=$KM_VERSION
+          KNOWVA_VERSION=$KNOWVA_VERSION
           POSTGRES_PASSWORD=$POSTGRES_PASSWORD
           MODEL_API_TOKEN=$MODEL_API_TOKEN
           MODEL_BASE_URL=$MODEL_BASE_URL

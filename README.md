@@ -298,13 +298,13 @@ Cloud run 是明確 opt-in，會 ingest fixtures 並實際呼叫 embedding、rer
 
 執行前必須完成下列事項：
 
-1. 由固定核准者 GitHub login **`Ruisi-Lu`** 先在 `Laysi/outsourcing-ai-km` issue #1 建立一則留言，鎖定 correct-page recall 的 stage、k、minimum，citation precision/recall、answer facts recall，以及 B 相對 A improvement 的實際數值。GitHub API 回傳的 comment author 必須精確為 `Ruisi-Lu`，且 `author_association` 必須為 `OWNER`、`MEMBER` 或 `COLLABORATOR`；login 大小寫不同、其他作者或僅為 `CONTRIBUTOR` 都不會通過。所有 minimum 必須是 0 到 1 的 JSON number，k 必須是正整數；不要由執行者臨時決定門檻。先取得該留言固定的 `https://github.com/Laysi/outsourcing-ai-km/issues/1#issuecomment-<id>` permalink，再把它寫入本機 threshold JSON 的 `issue_comment_url`。下列只是 schema 示意；尖括號欄位必須換成留言已鎖定的真實內容，不能直接執行，也不要填一個看似可通過的假 URL 或猜測值：
+1. 由固定核准者 GitHub login **`Ruisi-Lu`** 先在 `Laysi/knowva` issue #1 建立一則留言，鎖定 correct-page recall 的 stage、k、minimum，citation precision/recall、answer facts recall，以及 B 相對 A improvement 的實際數值。GitHub API 回傳的 comment author 必須精確為 `Ruisi-Lu`，且 `author_association` 必須為 `OWNER`、`MEMBER` 或 `COLLABORATOR`；login 大小寫不同、其他作者或僅為 `CONTRIBUTOR` 都不會通過。所有 minimum 必須是 0 到 1 的 JSON number，k 必須是正整數；不要由執行者臨時決定門檻。先取得該留言固定的 `https://github.com/Laysi/knowva/issues/1#issuecomment-<id>` permalink，再把它寫入本機 threshold JSON 的 `issue_comment_url`。下列只是 schema 示意；尖括號欄位必須換成留言已鎖定的真實內容，不能直接執行，也不要填一個看似可通過的假 URL 或猜測值：
 
    ```text
    {
      "schema_version": "1.0",
      "version": "<owner-locked-version>",
-     "issue_comment_url": "<real-Laysi/outsourcing-ai-km-issue-1-comment-permalink>",
+     "issue_comment_url": "<real-Laysi/knowva-issue-1-comment-permalink>",
      "minimums": {
        "correct_page_recall_at_k": {
          "stage": "<dense|bm25|rrf|rerank>",

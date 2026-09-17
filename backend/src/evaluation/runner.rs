@@ -51,8 +51,7 @@ const PROMPT_VERSION: &str = "gemma4-rag-v1";
 const MAX_ANSWER_CHARS: usize = 4_000;
 const EVALUATION_DATABASE_PREFIX: &str = "km_eval_";
 const EVALUATION_DATABASE_MARKER: &str = "ai-km-evaluation-only:v1";
-const GITHUB_COMMENT_API_BASE: &str =
-    "https://api.github.com/repos/Laysi/outsourcing-ai-km/issues/comments/";
+const GITHUB_COMMENT_API_BASE: &str = "https://api.github.com/repos/Laysi/knowva/issues/comments/";
 const THRESHOLD_APPROVER_LOGIN: &str = "Ruisi-Lu";
 
 #[cfg(test)]
@@ -149,7 +148,7 @@ impl ThresholdApprovalVerifier for GitHubThresholdApprovalVerifier {
 
 fn threshold_comment_id(issue_comment_url: &str) -> anyhow::Result<&str> {
     issue_comment_url
-        .strip_prefix("https://github.com/Laysi/outsourcing-ai-km/issues/1#issuecomment-")
+        .strip_prefix("https://github.com/Laysi/knowva/issues/1#issuecomment-")
         .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
         .context("threshold approval URL is invalid")
 }
@@ -1829,7 +1828,7 @@ mod tests {
         let value = serde_json::json!({
             "schema_version": "1.0",
             "version": "thresholds-locked-v1",
-            "issue_comment_url": "https://github.com/Laysi/outsourcing-ai-km/issues/1#issuecomment-12345",
+            "issue_comment_url": "https://github.com/Laysi/knowva/issues/1#issuecomment-12345",
             "minimums": {
                 "correct_page_recall_at_k": {
                     "stage": "rerank",
@@ -1965,11 +1964,11 @@ mod tests {
 
         let cases = [
             (
-                "https://github.com/example/outsourcing-ai-km/issues/1#issuecomment-12345",
+                "https://github.com/example/knowva/issues/1#issuecomment-12345",
                 marker.as_str(),
             ),
             (
-                "https://github.com/Laysi/outsourcing-ai-km/issues/1#issuecomment-54321",
+                "https://github.com/Laysi/knowva/issues/1#issuecomment-54321",
                 marker.as_str(),
             ),
             (pinned_url.as_str(), "threshold_sha256: wrong-secret-hash"),
@@ -1992,7 +1991,7 @@ mod tests {
 
         let mut wrong_repository = snapshot.clone();
         wrong_repository.config.issue_comment_url =
-            "https://github.com/example/outsourcing-ai-km/issues/1#issuecomment-12345".to_owned();
+            "https://github.com/example/knowva/issues/1#issuecomment-12345".to_owned();
         let body = format!("threshold_sha256: {}", wrong_repository.identity.sha256);
         let error = validate_threshold_approval(
             &wrong_repository,

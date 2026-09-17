@@ -415,7 +415,7 @@ pub fn validate_threshold_config(config: &ThresholdConfig) -> ReportResult<()> {
 
 fn validate_issue_comment_url(value: &str) -> ReportResult<()> {
     let valid = value
-        .strip_prefix("https://github.com/Laysi/outsourcing-ai-km/issues/1#issuecomment-")
+        .strip_prefix("https://github.com/Laysi/knowva/issues/1#issuecomment-")
         .is_some_and(|comment_id| {
             !comment_id.is_empty()
                 && !comment_id.starts_with('0')
@@ -1517,9 +1517,8 @@ mod tests {
         ThresholdConfig {
             schema_version: THRESHOLD_SCHEMA_VERSION.to_owned(),
             version: "thresholds-2026-07-13".to_owned(),
-            issue_comment_url:
-                "https://github.com/Laysi/outsourcing-ai-km/issues/1#issuecomment-123456789"
-                    .to_owned(),
+            issue_comment_url: "https://github.com/Laysi/knowva/issues/1#issuecomment-123456789"
+                .to_owned(),
             minimums: ThresholdMinimums {
                 correct_page_recall_at_k: CorrectPageRecallThreshold {
                     stage: RetrievalStage::Rerank,
@@ -1708,11 +1707,11 @@ mod tests {
     fn threshold_validation_rejects_wrong_provenance_and_values() {
         for invalid in [
             "https://github.com/example/ai-km-demo/issues/1#issuecomment-123",
-            "https://github.com/laysi/outsourcing-ai-km/issues/1#issuecomment-123",
-            "https://github.com/Laysi/outsourcing-ai-km/issues/2#issuecomment-123",
-            "https://github.example/Laysi/outsourcing-ai-km/issues/1#issuecomment-123",
-            "https://github.com/Laysi/outsourcing-ai-km/issues/1#issuecomment-123?token=secret",
-            "https://github.com/Laysi/outsourcing-ai-km/issues/1#issuecomment-0",
+            "https://github.com/laysi/knowva/issues/1#issuecomment-123",
+            "https://github.com/Laysi/knowva/issues/2#issuecomment-123",
+            "https://github.example/Laysi/knowva/issues/1#issuecomment-123",
+            "https://github.com/Laysi/knowva/issues/1#issuecomment-123?token=secret",
+            "https://github.com/Laysi/knowva/issues/1#issuecomment-0",
         ] {
             let mut config = threshold_config();
             config.issue_comment_url = invalid.to_owned();

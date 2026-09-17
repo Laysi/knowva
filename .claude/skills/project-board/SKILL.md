@@ -1,9 +1,9 @@
 ---
 name: project-board
-description: Laysi/outsourcing-ai-km 的 GitHub issue 專案政策 overlay。凡是「建 issue、拆工作、寫驗收條件、連結 PR/commit、標記 blocker、寫 implementation note、close issue、更新 tracker #1」都依本 skill 操作。執行機制＝github-loop-engineering-skill（GitHub MCP 優先）；本 skill 提供本 repo 的座標、語意約定、內文格式、close ritual 與 gh CLI fallback。
+description: Laysi/knowva 的 GitHub issue 專案政策 overlay。凡是「建 issue、拆工作、寫驗收條件、連結 PR/commit、標記 blocker、寫 implementation note、close issue、更新 tracker #1」都依本 skill 操作。執行機制＝github-loop-engineering-skill（GitHub MCP 優先）；本 skill 提供本 repo 的座標、語意約定、內文格式、close ritual 與 gh CLI fallback。
 ---
 
-# outsourcing-ai-km issue 操作手冊
+# knowva issue 操作手冊
 
 issue 同步是完成定義的一部分，政策規則在 `CLAUDE.md`「Project management (GitHub issues)」章節；本檔是操作細節。
 
@@ -24,7 +24,7 @@ issue 同步是完成定義的一部分，政策規則在 `CLAUDE.md`「Project 
 
 ## 固定座標
 
-- Repo：`Laysi/outsourcing-ai-km`（private），預設分支 `main`。
+- Repo：`Laysi/knowva`（private），預設分支 `main`。
 - **規格優先序：當前 issue > tracker #1 > `docs/mvp-now.md`**（同 CLAUDE.md）。
 - Tracker：#1「[MVP] 雲端視覺 RAG：客戶文件可問答」，用內文的「工作項目與順序」checklist 追蹤子工作，**不是** GitHub sub-issue。
 
@@ -146,12 +146,12 @@ API／SSE／資料模型等必須遵守的介面，例如「API/SSE 契約」「
 MCP 沒連上時走這條，**先回報再 fallback**。`gh` 已登入（帳號 `jerry830401`），issue 與 label 操作直接可用：
 
 ```bash
-gh issue list --repo Laysi/outsourcing-ai-km --state all --search "[MVP-"
-gh issue view <N> --repo Laysi/outsourcing-ai-km --json title,body,labels,state
-gh issue create --repo Laysi/outsourcing-ai-km --title "…" --label enhancement --body-file <file>
-gh issue edit <N> --repo Laysi/outsourcing-ai-km --body-file <file>
-gh issue comment <N> --repo Laysi/outsourcing-ai-km --body-file <file>
-gh issue close <N> --repo Laysi/outsourcing-ai-km --reason completed
+gh issue list --repo Laysi/knowva --state all --search "[MVP-"
+gh issue view <N> --repo Laysi/knowva --json title,body,labels,state
+gh issue create --repo Laysi/knowva --title "…" --label enhancement --body-file <file>
+gh issue edit <N> --repo Laysi/knowva --body-file <file>
+gh issue comment <N> --repo Laysi/knowva --body-file <file>
+gh issue close <N> --repo Laysi/knowva --reason completed
 ```
 
 內文一律用 `--body-file`（放 scratchpad），不要把多行 zh-TW 塞進 `--body` 引號裡。
