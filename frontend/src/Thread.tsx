@@ -111,7 +111,7 @@ const AssistantMessage = () => (
         </ErrorPrimitive.Root>
       </MessagePrimitive.Error>
       <MessagePrimitive.If hasContent={false}>
-        <div className="typing" aria-label="生成回覆中">
+        <div className="typing" aria-label="思考中">
           <span />
           <span />
           <span />
