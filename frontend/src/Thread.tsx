@@ -111,11 +111,10 @@ const AssistantMessage = () => (
         </ErrorPrimitive.Root>
       </MessagePrimitive.Error>
       <MessagePrimitive.If hasContent={false}>
-        <div className="thinking" role="status" aria-label="生成回覆中">
-          <span className="thinking-track" />
-          <span className="thinking-star">
-            <BrandMark />
-          </span>
+        <div className="typing" aria-label="生成回覆中">
+          <span />
+          <span />
+          <span />
         </div>
       </MessagePrimitive.If>
     </div>
