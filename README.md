@@ -223,6 +223,8 @@ proto run npm -- run build
 
 `status` 維持 `processing` / `ready` / `failed`；`processingStage` 進一步區分 `queued` / `extracting` / `indexing` / `ready` / `failed`。失敗時 `processingError` 只提供固定的繁中 code/message，不會回傳資料庫診斷、provider response、路徑或 secret。Deprecated aliases 只供現有 MVP client 過渡，`chunk_count` 固定等於 `unitCount`。
 
+`POST /api/chat` 的 request body 是 `{"messages": [...], "previousSources": [...]}`。`previousSources` 可省略，內容是上一則 assistant 訊息收到的 `sources` 事件原樣回送（只讀 `unitId`，其餘欄位忽略），用來決定本輪 context 區塊的排列順序；它不影響檢索到哪些來源，也不會把沒被檢索到的來源加回 context。
+
 `/api/chat` 的純文字串流契約維持不變；有檢索來源時，`sources` 一定在 `done` 前送出。模型端 HTTP 錯誤包含 status、最多 500 字的安全 response snippet 與可重試狀態；timeout 也會以統一錯誤回傳。
 
 分頁 source 的 `pageNumber` 是 1-based；文字 source 的 `pageNumber` 固定為 JSON `null`，並以 0-based `unitIndex` 標識文字單元（UI 顯示時加一）。同文件的不同頁不會去重，完整 SSE 範例如下：
@@ -267,7 +269,7 @@ DB 欄位（`documents.storage_path`、`document_artifact_sets.*_path`／`artifa
 - Page passage 只讀已發布 artifact：有文字層時送 image+text，掃描頁送 image-only（完全省略 `text`），MD/TXT chunk 送 text-only。物件 key 與本機路徑都不進 payload，圖片以有上限的並行讀取後只以記憶體 data URL 傳送；預設每批 8 筆，API 回應即使重排順序也依每批 local index 映回原 unit。
 - 每筆 `RetrievalCandidate` 直接帶 `unit_id`、0-based `unit_index`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、兩路 rank/score、`rrf_score` 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
 - Rerank 每批都嚴格驗證回應筆數、index 唯一且不越界、score finite，再驗證跨批映射。408、429、5xx、transport error 與 timeout 最多嘗試三次；耗盡後以原 RRF top_n 原序回退，且 rerank 欄位保持 null。設定、artifact 或 hosted response contract 錯誤不回退，會回傳可診斷錯誤。Structured log 僅記錄各階段筆數、延遲、fallback 與 model id，不含 query、文件內容、secret 或 base64。
-- 排名只決定哪些來源進入 context，不決定貼上去的順序：context 區塊固定依 `(document_id, page_number)` 排序後才組裝，`[S1]`..`[Sn]` 依該順序連號並與 SSE `sources` 事件一致。同一組來源因此永遠產生位元組相同的 context，讓追問能命中推論服務的前綴 prompt cache。payload 或完整 request 超限時，仍是從排名最低的來源開始整筆移除，再重新編號；知識庫總覽（catalog）問題維持既有的文件時序。
+- context 區塊採追加式排列：`POST /api/chat` 的 `previousSources` 帶回上一輪答案的來源與順序，本輪仍檢索到的來源就留在原位、原順序，本輪新進的來源再依排名接在尾端。推論服務的 prompt cache 是前綴比對，唯有這種排列能把「追問檢索到重疊來源」穩定換成快取命中；來源完全沒變時整段 prompt（連同它後面的對話歷史）都會命中。沒有 `previousSources` 時（第一個問題、catalog、文件摘要）就直接照排名排列——最相關的來源最可能在下一輪續留，把它放在最前面，下一輪能重用的前綴才最長。`[S1]`..`[Sn]` 依版面位置連號並與 SSE `sources` 事件一致；payload 或完整 request 超限時仍是從排名最低的來源開始整筆移除，再重新編號。
 
 ## A/B 評測
 

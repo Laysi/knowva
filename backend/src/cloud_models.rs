@@ -2802,8 +2802,8 @@ mod tests {
     async fn candidates_flow_to_matching_gemma_parts_and_structured_sources_without_inline_citation()
      {
         let storage = crate::storage::Storage::memory();
-        // Context blocks are laid out by `(document_id, page_number)`, so the two documents
-        // get fixed ids that keep the page source in the first block.
+        // Nothing was carried over from a previous answer, so the blocks follow the ranking
+        // this test passes in: the page source stays in the first block.
         let page_document_id = uuid::Uuid::from_u128(1);
         let page_path = format!("{page_document_id}/artifacts-run/pages/0005.png");
         let mut png = Vec::new();
@@ -2851,7 +2851,7 @@ mod tests {
                 rerank_rank: Some(2),
             },
         ];
-        let context = crate::rag_context::build_rag_context(&candidates, &storage)
+        let context = crate::rag_context::build_rag_context(&candidates, &storage, &[])
             .await
             .expect("build real RAG context");
         assert_eq!(context.sources.len(), 2);

@@ -6,9 +6,11 @@ import type {
 } from "@assistant-ui/react";
 import { BackendAdapter } from "./BackendAdapter";
 
-const runOptions = (): ChatModelRunOptions =>
+const runOptions = (
+  messages: readonly unknown[] = [],
+): ChatModelRunOptions =>
   ({
-    messages: [],
+    messages,
     runConfig: {},
     abortSignal: new AbortController().signal,
     context: {},
@@ -17,9 +19,11 @@ const runOptions = (): ChatModelRunOptions =>
     },
   }) as unknown as ChatModelRunOptions;
 
-const collectUpdates = async (): Promise<ChatModelRunResult[]> => {
+const collectUpdates = async (
+  messages: readonly unknown[] = [],
+): Promise<ChatModelRunResult[]> => {
   const updates: ChatModelRunResult[] = [];
-  const iterator = BackendAdapter.run(runOptions()) as AsyncGenerator<
+  const iterator = BackendAdapter.run(runOptions(messages)) as AsyncGenerator<
     ChatModelRunResult,
     void
   >;
@@ -101,6 +105,62 @@ describe("BackendAdapter", () => {
       { type: "text", text: "前段後段" },
       { type: "data", name: "sources", data: sources },
     ] satisfies ThreadAssistantMessagePart[]);
+  });
+
+  it("echoes the latest answer's sources so the next context keeps their order", async () => {
+    const sources = [
+      {
+        sourceId: "S1",
+        documentId: "manual",
+        unitId: 103,
+        unitIndex: 2,
+        filename: "手冊.pdf",
+        pageNumber: 3,
+        kind: "page",
+      },
+      {
+        sourceId: "S2",
+        documentId: "manual",
+        unitId: 106,
+        unitIndex: 5,
+        filename: "手冊.pdf",
+        pageNumber: 6,
+        kind: "page",
+      },
+    ];
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      sseResponse([{ type: "sources", sources: [] }, { type: "done" }]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await collectUpdates([
+      { role: "user", content: [{ type: "text", text: "第一個問題" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "第一個回答" },
+          { type: "data", name: "sources", data: sources },
+        ],
+      },
+      { role: "user", content: [{ type: "text", text: "追問" }] },
+    ]);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(body.previousSources).toEqual(sources);
+  });
+
+  it("sends no previous sources when the answer carried none", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      sseResponse([{ type: "sources", sources: [] }, { type: "done" }]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await collectUpdates([
+      { role: "user", content: [{ type: "text", text: "第一個問題" }] },
+    ]);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(body.previousSources).toEqual([]);
   });
 
   it("parses CRLF SSE events split across transport chunks", async () => {

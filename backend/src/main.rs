@@ -286,8 +286,21 @@ async fn list_documents(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ChatRequest {
     messages: Vec<ChatMessage>,
+    /// Sources the previous answer cited, echoed back by the client in the order they were
+    /// laid out. `/api/chat` is stateless and the history carries text only, so this is the
+    /// only way the next context can keep those blocks where the prompt cache expects them.
+    /// Unknown fields are ignored, so a client may echo the `sources` event unchanged.
+    #[serde(default)]
+    previous_sources: Vec<PreviousSource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviousSource {
+    unit_id: i64,
 }
 
 async fn chat(
@@ -308,6 +321,14 @@ async fn chat(
 }
 
 async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc::Sender<SseEvent>) {
+    // A retrieval context never lays out more than this many blocks, so anything past the cap
+    // could not name a block of the previous context even if a client sent it.
+    let previous_units = req
+        .previous_sources
+        .iter()
+        .take(rag_context::MAX_RAG_SOURCES)
+        .map(|source| source.unit_id)
+        .collect::<Vec<_>>();
     let last_user_text = req
         .messages
         .iter()
@@ -365,7 +386,11 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
         tokio::select! {
             biased;
             _ = tx.closed() => return,
-            result = rag_context::build_rag_context(&candidates, &state.storage) => result,
+            result = rag_context::build_rag_context(
+                &candidates,
+                &state.storage,
+                &previous_units,
+            ) => result,
         }
     };
     let context = match context {
@@ -510,6 +535,36 @@ mod tests {
 
     fn pending_upstream() -> tokio::task::JoinHandle<()> {
         tokio::spawn(std::future::pending())
+    }
+
+    #[test]
+    fn chat_request_reads_echoed_sources_and_stays_valid_without_them() {
+        // A client echoes the `sources` event unchanged, so the request must accept the
+        // whole source object and read only the unit it names.
+        let echoed: ChatRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"追問"}],
+                "previousSources":[
+                  {"sourceId":"S1","documentId":"00000000-0000-0000-0000-000000000001",
+                   "unitId":103,"unitIndex":2,"filename":"manual.pdf","pageNumber":3,
+                   "kind":"page"},
+                  {"sourceId":"S2","documentId":"00000000-0000-0000-0000-000000000001",
+                   "unitId":106,"unitIndex":5,"filename":"manual.pdf","pageNumber":6,
+                   "kind":"page"}]}"#,
+        )
+        .expect("echoed sources are accepted");
+        assert_eq!(
+            echoed
+                .previous_sources
+                .iter()
+                .map(|source| source.unit_id)
+                .collect::<Vec<_>>(),
+            vec![103, 106]
+        );
+
+        let first_question: ChatRequest =
+            serde_json::from_str(r#"{"messages":[{"role":"user","content":"第一個問題"}]}"#)
+                .expect("the field stays optional");
+        assert!(first_question.previous_sources.is_empty());
     }
 
     #[test]

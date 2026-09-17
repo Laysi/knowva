@@ -1,5 +1,6 @@
 import type {
   ChatModelAdapter,
+  ChatModelRunOptions,
   ThreadAssistantMessagePart,
 } from "@assistant-ui/react";
 
@@ -107,6 +108,28 @@ const sourceData = (value: unknown): ChatSource[] | null => {
   return sourceIds.size === value.length ? value : null;
 };
 
+/**
+ * Sources of the most recent answer, in the order the backend laid them out.
+ *
+ * The inference prompt cache matches on a prefix, so the backend keeps those blocks where
+ * they already are and appends the newly retrieved ones. `/api/chat` is stateless and the
+ * thread lives here, so the order is only known to the backend if this sends it back.
+ */
+const previousSources = (
+  messages: ChatModelRunOptions["messages"],
+): ChatSource[] => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "assistant") continue;
+    const part = message.content.find(
+      (part) => part.type === "data" && part.name === "sources",
+    );
+    if (part?.type !== "data") return [];
+    return sourceData(part.data) ?? [];
+  }
+  return [];
+};
+
 const appendTextDelta = (
   content: readonly ThreadAssistantMessagePart[],
   activeTextIndex: number | null,
@@ -148,6 +171,7 @@ export const BackendAdapter: ChatModelAdapter = {
               .flatMap((part) => (part.type === "text" ? [part.text] : []))
               .join("\n"),
           })),
+          previousSources: previousSources(messages),
         }),
         signal: abortSignal,
       });
