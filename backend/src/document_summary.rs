@@ -88,7 +88,7 @@ pub(crate) async fn generate_best_effort(
         return None;
     }
 
-    let context = match crate::rag_context::build_rag_context(&candidates, storage).await {
+    let context = match crate::rag_context::build_rag_context(&candidates, storage, &[]).await {
         Ok(context) => context,
         Err(error) => {
             tracing::warn!(
@@ -509,7 +509,7 @@ mod tests {
 
         let candidates = summary_candidates(document_id, &pages, &[]);
         assert_eq!(candidates.len(), MAX_SUMMARY_SOURCE_UNITS);
-        let context = crate::rag_context::build_rag_context(&candidates, &storage)
+        let context = crate::rag_context::build_rag_context(&candidates, &storage, &[])
             .await
             .expect("build bounded page summary context");
         assert_eq!(context.sources.len(), MAX_SUMMARY_SOURCE_UNITS);

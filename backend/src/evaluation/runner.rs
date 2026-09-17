@@ -1229,7 +1229,7 @@ async fn answer_mode(
     query: &str,
     candidates: &[RetrievalCandidate],
 ) -> ModeAnswer {
-    let context = match build_rag_context(candidates, &state.storage).await {
+    let context = match build_rag_context(candidates, &state.storage, &[]).await {
         Ok(context) => context,
         Err(error) => return failed_answer("rag_context_failed", error.client_message(), false),
     };
