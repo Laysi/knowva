@@ -1,4 +1,6 @@
-# AI 知識中樞（MVP）
+# Knowva 知星（MVP）
+
+> 點亮你的知識星系 — Your knowledge supernova
 
 通用企業 AI 知識管理系統 demo：保存使用者文件、建立檢索資料，並以 SSE 串流回答問題與附上來源。MVP 的所有模型推論只呼叫雲端託管 API。
 
@@ -162,7 +164,7 @@ docker compose --profile minio up -d --build
 若要在 build 階段實際驗證 Pdfium 與 LibreOffice 對 PDF、掃描 PDF、DOCX、PPTX、XLSX 的分頁與頁序：
 
 ```bash
-docker build --target native-test -t ai-km-demo:native-test .
+docker build --target native-test -t knowva:native-test .
 ```
 
 ## 本機開發
@@ -357,7 +359,7 @@ Threshold JSON 只應保存在本機安全位置：不得提交本機 threshold 
 
 兩條都只在 `main` 寫入。GitHub 的 cache 依分支隔離：在 PR 分支寫的 entry 只有那個分支讀得到，若每個 PR 都寫入，只會用滿 repository 的配額並擠掉所有 PR 共用的那一份 main entry。PR 一律讀 main 的快取。
 
-Dockerfile 把相依圖編在自己的 layer：`backend-builder` 與 `native-test` 都先以 placeholder main 編一次相依，再蓋上真正的 source。registry cache 帶得動 layer，帶不動 cache mount，所以相依改放 layer 之後才真正被快取住——只改 source 時只重編 `km-server`，改 `Cargo.lock` 才會重編相依。placeholder 自己的 fingerprint 與產物在同一層刪掉，cargo 不會把 stub 當成最新的 `km-server` 直接送進 runtime。
+Dockerfile 把相依圖編在自己的 layer：`backend-builder` 與 `native-test` 都先以 placeholder main 編一次相依，再蓋上真正的 source。registry cache 帶得動 layer，帶不動 cache mount，所以相依改放 layer 之後才真正被快取住——只改 source 時只重編 `knowva-server`，改 `Cargo.lock` 才會重編相依。placeholder 自己的 fingerprint 與產物在同一層刪掉，cargo 不會把 stub 當成最新的 `knowva-server` 直接送進 runtime。
 
 `native-test` 從 `backend-base` 分支出來而不是從 `backend-builder`：ignored test 跑的是 test profile，用不到 release binary，繼承它只是把整個 crate 編兩次。代價是 CI 不再順便驗證 release build 編得過，那要等 tag 觸發 `release.yml`，與「未經審查的 tag 只賠掉一次 build」這個既有取捨一致。
 

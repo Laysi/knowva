@@ -89,9 +89,9 @@ export const DocumentList = ({
                 </span>
               )}
               <span className="doc-metrics">
-                <span className="doc-metric">頁數 {doc.pageCount}</span>
+                <span className="doc-metric">{doc.pageCount} 頁</span>
                 <span aria-hidden="true"> · </span>
-                <span className="doc-metric">檢索單元 {doc.unitCount}</span>
+                <span className="doc-metric">{doc.unitCount} 段</span>
                 {created && (
                   <>
                     <span aria-hidden="true"> · </span>
@@ -108,7 +108,7 @@ export const DocumentList = ({
             type="button"
             className="doc-delete"
             aria-label={`刪除 ${doc.filename}`}
-            title="刪除文件"
+            title="刪除"
             onClick={() => onDelete?.(doc)}
           >
             <TrashIcon />
@@ -207,7 +207,7 @@ export const Documents = () => {
   };
 
   const handleDelete = async (doc: DocumentRow) => {
-    if (!window.confirm(`確定要刪除「${doc.filename}」嗎？`)) return;
+    if (!window.confirm(`確定刪除「${doc.filename}」？`)) return;
     try {
       const res = await fetch(`/api/documents/${doc.id}`, { method: "DELETE" });
       if (!res.ok) {
@@ -275,19 +275,20 @@ export const Documents = () => {
           </span>
           <div className="dropzone-text">
             <strong>
-              {uploading ? "上傳與解析中…" : "拖曳檔案到這裡，或點擊選擇檔案"}
+              {uploading ? "上傳中，正在解析…" : "把檔案拖進來，或點擊選擇"}
             </strong>
             <span>
-              支援 PDF、DOCX、PPTX、XLSX、PNG/JPEG/WebP、STP、EML/MSG、TXT/MD
+              PDF、Word、PowerPoint、Excel、圖片、STP、Email、純文字 · 單檔上限
+              50 MiB
             </span>
           </div>
         </div>
 
         <div className="library-head">
-          <h2>知識庫文件</h2>
+          <h2>文件庫</h2>
           {loaded && docs.length > 0 && (
             <span className="library-count">
-              共 {docs.length} 份 · {readyCount} 份可查詢
+              {docs.length} 份 · {readyCount} 份可查詢
             </span>
           )}
         </div>
@@ -295,7 +296,7 @@ export const Documents = () => {
         {!loaded ? (
           <div className="docs-loading">
             <span className="spinner" />
-            載入文件中…
+            載入中…
           </div>
         ) : docs.length === 0 ? (
           listError ? (
@@ -308,9 +309,9 @@ export const Documents = () => {
               <span className="docs-empty-icon">
                 <DocsIcon />
               </span>
-              <h3>尚未建立任何文件</h3>
+              <h3>這裡還沒有文件</h3>
               <p>
-                上傳手冊、規範、簡報或報表，系統會自動解析內容並建立可檢索的知識庫。
+                上傳手冊、規範、簡報或報表，知星會讀完內容並建立索引，之後就能直接問。
               </p>
             </div>
           )

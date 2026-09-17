@@ -314,7 +314,7 @@ fn required_value(
 }
 
 fn usage() -> &'static str {
-    "usage: km-server eval [--dry-run|--cloud] [--manifest PATH] [--output PATH] \
+    "usage: knowva-server eval [--dry-run|--cloud] [--manifest PATH] [--output PATH] \
      [--thresholds PATH] [--document KEY]... [--query ID]... [--seed N] \
      [--concurrency N]"
 }

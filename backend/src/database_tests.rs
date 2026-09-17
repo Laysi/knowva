@@ -1071,7 +1071,7 @@ async fn production_candidate_predicates_use_hnsw_and_gin_indexes(
 #[sqlx::test]
 async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow::Result<()> {
     let document_id = Uuid::new_v4();
-    let files_dir = std::env::temp_dir().join(format!("km-server-{document_id}"));
+    let files_dir = std::env::temp_dir().join(format!("knowva-server-{document_id}"));
     let storage = Storage::local(&files_dir)?;
     let storage_key = format!("{document_id}/original.pdf");
     let artifact_dir = format!("{document_id}/artifacts-fixture");

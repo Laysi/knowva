@@ -11,9 +11,9 @@ import {
   BrandMark,
   SendIcon,
   StopIcon,
-  AlertIcon,
-  WrenchIcon,
-  SlidersIcon,
+  CompassIcon,
+  ListIcon,
+  UserIcon,
   ArrowRightIcon,
 } from "./Icons";
 import type { ReactNode } from "react";
@@ -27,14 +27,14 @@ const sourceLabel = (source: ChatSource): string => {
   if (source.kind === "page") {
     return source.pageNumber !== null && Number.isFinite(source.pageNumber)
       ? `${source.filename} · 第 ${source.pageNumber} 頁`
-      : `${source.filename} · 頁面來源`;
+      : `${source.filename} · 頁面`;
   }
 
   return typeof source.unitIndex === "number" &&
     Number.isInteger(source.unitIndex) &&
     source.unitIndex >= 0
     ? `${source.filename} · 第 ${source.unitIndex + 1} 段`
-    : `${source.filename} · 文字來源`;
+    : `${source.filename} · 段落`;
 };
 
 type SourceListProps = Pick<DataMessagePartProps<ChatSource[]>, "data">;
@@ -55,9 +55,9 @@ export const SourceList = ({ data }: SourceListProps) => {
 };
 
 const SUGGESTIONS: { icon: ReactNode; text: string }[] = [
-  { icon: <AlertIcon />, text: "知識庫目前涵蓋哪些主題?" },
-  { icon: <WrenchIcon />, text: "幫我整理知識庫內容的重點摘要" },
-  { icon: <SlidersIcon />, text: "新進人員應該先了解哪些重要資訊?" },
+  { icon: <CompassIcon />, text: "知識庫裡有哪些主題？" },
+  { icon: <ListIcon />, text: "整理知識庫的重點" },
+  { icon: <UserIcon />, text: "新人該先看哪幾份文件？" },
 ];
 
 const Welcome = () => (
@@ -65,10 +65,7 @@ const Welcome = () => (
     <span className="welcome-mark">
       <BrandMark />
     </span>
-    <h2 className="welcome-title">請問有什麼可以協助?</h2>
-    <p className="welcome-sub">
-      詢問知識庫中的任何內容,系統會依據已上傳的文件作答並標註來源。
-    </p>
+    <h2 className="welcome-title">想知道什麼？</h2>
     <div className="suggestions">
       {SUGGESTIONS.map((s) => (
         <ThreadPrimitive.Suggestion
@@ -128,7 +125,7 @@ const Composer = () => (
   <ComposerPrimitive.Root className="composer">
     <ComposerPrimitive.Input
       className="composer-input"
-      placeholder="輸入你的問題,系統會依據知識庫回答並附上來源"
+      placeholder="問問你的文件…"
       submitMode="enter"
       maxRows={8}
     />
@@ -166,7 +163,7 @@ export const Thread = () => (
       <div className="composer-col">
         <Composer />
         <p className="composer-hint">
-          Enter 送出 · Shift + Enter 換行 · 回答由 AI 生成,請以原始文件為準
+          內容由語言模型生成，可能有誤，以原始文件為準。
         </p>
       </div>
     </div>

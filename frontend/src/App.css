@@ -1,5 +1,6 @@
 /* ============================================================
-   App shell
+   Knowva — app shell
+   Deep-space navigation rail against a white workspace.
    ============================================================ */
 .app {
   display: flex;
@@ -10,132 +11,130 @@
 
 .sidebar {
   flex: none;
-  width: 264px;
+  width: 268px;
   display: flex;
   flex-direction: column;
-  padding: var(--space-4) var(--space-3);
-  background: var(--color-surface);
-  border-right: 1px solid var(--color-border);
+  padding: var(--space-5) var(--space-3) var(--space-4);
+  color: var(--color-space-text);
+  /* Deep space, lit from the brand mark's corner and again from below. */
+  background-color: var(--color-space-deep);
+  background-image: radial-gradient(
+      120% 58% at 12% 0%,
+      rgba(109, 74, 255, 0.42),
+      transparent 62%
+    ),
+    radial-gradient(
+      96% 46% at 100% 100%,
+      rgba(58, 96, 224, 0.28),
+      transparent 70%
+    ),
+    linear-gradient(180deg, var(--color-space) 0%, var(--color-space-deep) 100%);
+  box-shadow: 1px 0 0 rgba(16, 20, 42, 0.1),
+    10px 0 28px -14px rgba(16, 20, 42, 0.22);
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: var(--space-2) var(--space-2) var(--space-5);
+  gap: 12px;
+  padding: var(--space-2) var(--space-2) var(--space-6);
 }
 
 .brand-mark {
   flex: none;
-  width: 42px;
-  height: 42px;
+  width: 44px;
+  height: 44px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 23px;
+  font-size: 27px;
   color: #fff;
-  background: var(--color-accent);
-  border-radius: 11px;
-  box-shadow: var(--shadow-sm);
+  filter: drop-shadow(0 1px 1.5px rgba(26, 8, 72, 0.4));
+  background: var(--gradient-nova);
+  border-radius: 13px;
+  box-shadow: var(--gloss-edge), var(--shadow-nova);
 }
 
 .brand-text {
   display: flex;
   flex-direction: column;
-  line-height: 1.25;
+  line-height: 1.3;
   min-width: 0;
 }
 
 .brand-name {
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 600;
-  color: var(--color-text);
-  letter-spacing: 0.01em;
+  color: #fff;
+  letter-spacing: 0.005em;
 }
 
 .brand-sub {
   font-size: 12.5px;
-  color: var(--color-text-muted);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--color-space-text-muted);
 }
 
 .nav {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
 }
 
 .nav-item {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: 12px;
   padding: 12px 14px;
   border: none;
   border-radius: var(--radius-md);
   background: none;
-  color: var(--color-text-secondary);
+  color: var(--color-space-text-muted);
   font-size: 15.5px;
   font-weight: 500;
   text-align: left;
-  transition: background 0.13s ease, color 0.13s ease;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
 .nav-item:hover {
-  background: var(--color-surface-hover);
-  color: var(--color-text);
+  background: var(--color-space-hover);
+  color: var(--color-space-text);
 }
 
 .nav-item.active {
-  background: var(--color-accent-weak);
-  color: var(--color-accent);
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.15),
+    rgba(255, 255, 255, 0.05)
+  );
+  color: #fff;
   font-weight: 600;
+}
+
+/* Nova bar marking the active view. */
+.nav-item.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  translate: 0 -50%;
+  width: 3px;
+  height: 20px;
+  border-radius: var(--radius-full);
+  background: var(--gradient-nova);
 }
 
 .nav-icon {
   flex: none;
   display: flex;
   font-size: 20px;
-  opacity: 0.85;
+  opacity: 0.8;
 }
 
 .nav-item.active .nav-icon {
   opacity: 1;
-}
-
-.sidebar-spacer {
-  flex: 1;
-}
-
-.sidebar-footer {
-  display: flex;
-  flex-direction: column;
-  gap: 9px;
-  padding: var(--space-3) var(--space-2) var(--space-1);
-  border-top: 1px solid var(--color-border);
-}
-
-.footer-note {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12.5px;
-  color: var(--color-text-muted);
-}
-
-.footer-note-icon {
-  font-size: 15px;
-  color: var(--color-success);
-}
-
-.badge-demo {
-  align-self: flex-start;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  color: var(--color-text-secondary);
-  background: var(--color-surface-sunken);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  padding: 2px 8px;
 }
 
 /* ---- Content column ---- */
@@ -154,13 +153,13 @@
 }
 
 .content-title {
-  font-size: 21px;
-  font-weight: 600;
-  letter-spacing: 0.01em;
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
 }
 
 .content-desc {
-  margin-top: 3px;
+  margin-top: 4px;
   font-size: 14.5px;
   color: var(--color-text-muted);
 }
@@ -210,31 +209,40 @@
 }
 
 .welcome-mark {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 64px;
-  height: 64px;
-  font-size: 33px;
+  width: 72px;
+  height: 72px;
+  font-size: 36px;
   color: var(--color-accent);
-  background: var(--color-accent-weak);
+  background: var(--gradient-nova-soft);
   border: 1px solid var(--color-accent-weak-border);
   border-radius: var(--radius-xl);
   margin-bottom: var(--space-5);
 }
 
-.welcome-title {
-  font-size: 27px;
-  font-weight: 600;
-  margin-bottom: 10px;
+/* The nova's own glow. */
+.welcome-mark::after {
+  content: "";
+  position: absolute;
+  inset: -22px;
+  border-radius: 50%;
+  background: radial-gradient(
+    closest-side,
+    rgba(109, 74, 255, 0.18),
+    transparent 100%
+  );
+  z-index: -1;
 }
 
-.welcome-sub {
-  max-width: 500px;
-  margin: 0 auto var(--space-6);
-  font-size: 16px;
-  line-height: 1.65;
-  color: var(--color-text-secondary);
+.welcome-title {
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  /* Carries the gap the removed sub-line used to provide. */
+  margin-bottom: var(--space-6);
 }
 
 .suggestions {
@@ -247,24 +255,31 @@
 .suggestion {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 13px;
   width: 100%;
   padding: 15px 18px;
   background: var(--color-surface);
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-xs);
   color: var(--color-text);
   font-size: 15.5px;
   font-weight: 500;
   transition: border-color 0.15s ease, background 0.15s ease,
-    box-shadow 0.15s ease;
+    box-shadow 0.15s ease, transform 0.15s ease;
 }
 
 .suggestion:hover {
-  background: var(--color-accent-weak);
-  border-color: var(--color-accent-weak-border);
+  background: var(--color-surface);
+  border-color: var(--color-accent);
   box-shadow: var(--shadow-sm);
+  transform: translateY(-1px);
+}
+
+.suggestion:active {
+  transform: translateY(0);
+  box-shadow: var(--shadow-xs);
+  background: var(--color-accent-weak);
 }
 
 .suggestion-icon {
@@ -272,16 +287,17 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
+  width: 36px;
+  height: 36px;
   font-size: 18px;
   color: var(--color-accent);
-  background: var(--color-surface-sunken);
+  background: var(--color-accent-weak);
   border-radius: var(--radius-sm);
 }
 
 .suggestion:hover .suggestion-icon {
-  background: var(--color-surface);
+  background: var(--gradient-nova);
+  color: #fff;
 }
 
 .suggestion-text {
@@ -294,13 +310,13 @@
   font-size: 17px;
   color: var(--color-text-faint);
   opacity: 0;
-  transform: translateX(-4px);
-  transition: opacity 0.15s ease, transform 0.15s ease, color 0.15s ease;
+  translate: -4px 0;
+  transition: opacity 0.15s ease, translate 0.15s ease, color 0.15s ease;
 }
 
 .suggestion:hover .suggestion-go {
   opacity: 1;
-  transform: none;
+  translate: 0;
   color: var(--color-accent);
 }
 
@@ -323,7 +339,8 @@
   padding: 12px 18px;
   background: var(--color-accent);
   color: #fff;
-  border-radius: 17px 17px 5px 17px;
+  border-radius: 18px 18px 6px 18px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26), var(--shadow-xs);
   font-size: 16.5px;
   line-height: 1.6;
   white-space: pre-wrap;
@@ -347,11 +364,12 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 19px;
-  color: var(--color-accent);
-  background: var(--color-accent-weak);
-  border: 1px solid var(--color-accent-weak-border);
-  border-radius: 10px;
+  font-size: 20px;
+  color: #fff;
+  filter: drop-shadow(0 1px 1px rgba(26, 8, 72, 0.35));
+  background: var(--gradient-nova);
+  border-radius: 11px;
+  box-shadow: var(--gloss-edge), var(--shadow-xs);
 }
 
 .msg-body {
@@ -382,7 +400,8 @@
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--color-text-faint);
+  background: var(--color-accent);
+  opacity: 0.4;
   animation: typing 1.2s infinite ease-in-out;
 }
 
@@ -402,11 +421,11 @@
   0%,
   60%,
   100% {
-    transform: translateY(0);
-    opacity: 0.4;
+    translate: 0 0;
+    opacity: 0.35;
   }
   30% {
-    transform: translateY(-4px);
+    translate: 0 -4px;
     opacity: 1;
   }
 }
@@ -432,8 +451,8 @@
   gap: 10px;
   padding: 12px 12px 12px 20px;
   background: var(--color-surface);
-  border: 2px solid var(--color-border-strong);
-  border-radius: 22px;
+  border: 1.5px solid var(--color-border-strong);
+  border-radius: 24px;
   box-shadow: var(--shadow-md);
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
@@ -476,33 +495,37 @@
   width: 46px;
   height: 46px;
   border: none;
-  border-radius: 14px;
-  background: var(--color-accent);
+  border-radius: 15px;
+  background: var(--gradient-nova);
   color: #fff;
   font-size: 22px;
-  transition: background 0.15s ease, transform 0.05s ease;
+  box-shadow: var(--gloss-edge), var(--shadow-nova);
+  transition: filter 0.15s ease, translate 0.05s ease, box-shadow 0.15s ease;
 }
 
 .composer-btn:hover:not(:disabled) {
-  background: var(--color-accent-hover);
+  filter: brightness(1.07);
 }
 
 .composer-btn:active:not(:disabled) {
-  transform: translateY(1px);
+  translate: 0 1px;
 }
 
 .composer-btn:disabled {
   background: var(--color-border-strong);
   color: #fff;
+  box-shadow: none;
   cursor: not-allowed;
 }
 
 .composer-btn-stop {
   background: var(--color-text);
+  box-shadow: none;
   font-size: 18px;
 }
 
 .composer-btn-stop:hover:not(:disabled) {
+  filter: none;
   background: #000;
 }
 
@@ -510,7 +533,7 @@
   margin-top: 11px;
   text-align: center;
   font-size: 13px;
-  color: var(--color-text-faint);
+  color: var(--color-text-muted);
 }
 
 /* ============================================================
@@ -541,7 +564,7 @@
 .aui-md h4 {
   margin: 20px 0 10px;
   line-height: 1.35;
-  font-weight: 600;
+  font-weight: 650;
 }
 
 .aui-md h1 {
@@ -565,7 +588,7 @@
 }
 
 .aui-md li::marker {
-  color: var(--color-text-muted);
+  color: var(--color-accent);
 }
 
 .aui-md a {
@@ -575,7 +598,7 @@
 }
 
 .aui-md strong {
-  font-weight: 600;
+  font-weight: 650;
   color: var(--color-text);
 }
 
@@ -613,7 +636,6 @@
   color: var(--color-text);
 }
 
-/* Tables — CNC parameter sheets */
 .aui-md table {
   width: 100%;
   margin: 6px 0 16px;
@@ -627,14 +649,14 @@
 
 .aui-md th,
 .aui-md td {
-  padding: 8px 12px;
+  padding: 9px 12px;
   text-align: left;
   border-bottom: 1px solid var(--color-border);
   vertical-align: top;
 }
 
 .aui-md thead th {
-  font-weight: 600;
+  font-weight: 650;
   color: var(--color-text);
   background: var(--color-surface-sunken);
   border-bottom: 1px solid var(--color-border-strong);
@@ -662,9 +684,9 @@
 
 .aui-md hr ~ p {
   margin-bottom: 8px;
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 600;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.04em;
   color: var(--color-text-muted);
 }
 
@@ -702,7 +724,7 @@
   width: 21px;
   height: 21px;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 650;
   color: var(--color-accent);
   background: var(--color-accent-weak);
   border-radius: var(--radius-sm);
@@ -717,9 +739,9 @@
 
 .source-list h3 {
   margin: 0 0 8px;
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 600;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.04em;
   color: var(--color-text-secondary);
 }
 
@@ -755,7 +777,7 @@
   width: 21px;
   height: 21px;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 650;
   color: var(--color-accent);
   background: var(--color-accent-weak);
   border-radius: var(--radius-sm);
@@ -794,8 +816,7 @@
 }
 
 .documents-inner {
-  max-width: 1000px;
-  margin: 0 auto;
+  max-width: 1240px;
   padding: var(--space-6) var(--space-8) var(--space-10);
 }
 
@@ -839,7 +860,7 @@
   height: 52px;
   font-size: 25px;
   color: var(--color-accent);
-  background: var(--color-accent-weak);
+  background: var(--gradient-nova-soft);
   border-radius: var(--radius-md);
 }
 
@@ -851,7 +872,7 @@
 
 .dropzone-text strong {
   font-size: 16.5px;
-  font-weight: 600;
+  font-weight: 650;
   color: var(--color-text);
 }
 
@@ -866,12 +887,12 @@
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
-  margin: var(--space-8) 2px var(--space-3);
+  margin: var(--space-8) 0 var(--space-3);
 }
 
 .library-head h2 {
   font-size: 16.5px;
-  font-weight: 600;
+  font-weight: 650;
 }
 
 .library-count {
@@ -882,23 +903,27 @@
 .doc-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
 }
 
 .doc-row {
   display: flex;
   align-items: flex-start;
   gap: 14px;
-  padding: 17px 18px;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--color-border);
+  transition: background 0.15s ease;
+}
+
+.doc-row:last-child {
+  border-bottom: none;
 }
 
 .doc-row:hover {
-  border-color: var(--color-border-strong);
-  box-shadow: var(--shadow-sm);
+  background: var(--color-surface-zebra);
 }
 
 .doc-row.is-failed {
@@ -915,9 +940,9 @@
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.02em;
-  color: var(--color-text-secondary);
-  background: var(--color-surface-sunken);
-  border: 1px solid var(--color-border);
+  color: var(--color-accent);
+  background: var(--gradient-nova-soft);
+  border: 1px solid var(--color-accent-weak-border);
   border-radius: var(--radius-md);
 }
 
@@ -936,7 +961,7 @@
 .doc-name {
   min-width: 0;
   font-size: 15.5px;
-  font-weight: 600;
+  font-weight: 650;
   color: var(--color-text);
   white-space: nowrap;
   overflow: hidden;
@@ -956,7 +981,7 @@
 }
 
 .doc-summary.is-empty {
-  color: var(--color-text-faint);
+  color: var(--color-text-muted);
 }
 
 .doc-meta {
@@ -1050,7 +1075,7 @@
   flex: none;
   padding: 5px 10px;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 650;
   color: var(--color-danger-text);
   background: var(--color-surface);
   border: 1px solid var(--color-danger-border);
@@ -1182,7 +1207,7 @@
 
 @keyframes spin {
   to {
-    transform: rotate(360deg);
+    rotate: 360deg;
   }
 }
 
@@ -1205,7 +1230,7 @@
 
 @media (max-width: 720px) {
   .sidebar {
-    width: 72px;
+    width: 76px;
     padding: var(--space-4) var(--space-2);
     align-items: center;
   }
@@ -1213,17 +1238,12 @@
     padding: var(--space-2) 0 var(--space-4);
   }
   .brand-text,
-  .nav-label,
-  .footer-note,
-  .badge-demo {
+  .nav-label {
     display: none;
   }
   .nav-item {
     justify-content: center;
     padding: 10px;
-  }
-  .sidebar-footer {
-    border-top: none;
   }
 }
 
@@ -1233,5 +1253,8 @@
   .aui-md[data-status="running"] > :last-child::after,
   .spinner {
     animation: none;
+  }
+  .suggestion:hover {
+    transform: none;
   }
 }

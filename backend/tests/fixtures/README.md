@@ -30,7 +30,7 @@ proto exec rust -- cargo test -- --ignored --exact --nocapture --test-threads=1 
 或直接使用包含固定 Pdfium、LibreOffice 與 CJK 字型的 Docker 驗證 target：
 
 ```bash
-docker build --target native-test -t ai-km-demo:native-test .
+docker build --target native-test -t knowva:native-test .
 ```
 
 此 smoke test 會實際比較頁數與頁序，並以 mock endpoint 確認原生 PDF 逐頁送出 image+text、掃描 PDF 沒有文字時仍送出 image-only embedding；不會耗用真實雲端額度。第二支測試走實際 ingest 路徑：原檔從 storage 取回本機暫存區轉檔，再以 `{document_id}/artifacts-{run_id}/...` 相對 key 上傳頁圖、`converted.pdf` 與 manifest，並確認暫存區已刪除。真實 NVIDIA Embed VL 的可選 smoke 指令見 repository 根目錄 `README.md`。

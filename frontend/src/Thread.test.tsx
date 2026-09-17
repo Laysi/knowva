@@ -56,7 +56,7 @@ describe("SourceList", () => {
     const html = renderToStaticMarkup(<SourceList data={sources} />);
 
     expect(html).toContain("維運筆記.md · 第 1 段");
-    expect(html).toContain("維運筆記.md · 文字來源");
+    expect(html).toContain("維運筆記.md · 段落");
     expect(html).not.toContain("第 null 頁");
     expect(html).not.toContain("null");
   });

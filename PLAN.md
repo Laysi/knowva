@@ -1,4 +1,4 @@
-# 通用 AI 知識管理系統 — Active MVP
+# Knowva 知星 — Active MVP
 
 > 初版 demo 規劃已由 GitHub tracker 取代。實作優先序為目前子 issue、[tracker #1](https://github.com/Laysi/outsourcing-ai-km/issues/1)、`docs/mvp-now.md`；本檔只保留方便進入專案的摘要，不再描述已退場的 provider 或 ingestion 路徑。
 

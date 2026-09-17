@@ -15,11 +15,24 @@ const base = {
   "aria-hidden": true,
 };
 
-// Hex-nut product mark (brand + assistant avatar).
+// Knowva monogram: a K whose stem is a double-tapered ray, whose arms are star
+// spikes springing from it, and whose fourth ray breaks out to the left. The
+// letterform and the burst are one shape — a plain star is too generic a figure
+// to hold as a mark. The four spikes are separate paths on purpose: as subpaths
+// of one path their windings would cancel and punch a hole through the junction.
 export const BrandMark = ({ className }: IconProps) => (
-  <svg {...base} className={className}>
-    <path d="M12 3 20 7.5v9L12 21 4 16.5v-9z" />
-    <circle cx="12" cy="12" r="3.4" />
+  <svg
+    className={className}
+    viewBox="0 0 24 24"
+    width="1em"
+    height="1em"
+    fill="currentColor"
+    aria-hidden="true"
+  >
+    <path d="M9.6 .6 11.5 12 9.6 23.4 7.7 12Z" />
+    <path d="M9 14.6 22.3 3.2 9 10.6Z" />
+    <path d="M9 13.4 22.3 20.8 9 9.4Z" />
+    <path d="M10.2 10.4 1.7 12 10.2 13.6Z" />
   </svg>
 );
 
@@ -65,26 +78,24 @@ export const UploadIcon = ({ className }: IconProps) => (
   </svg>
 );
 
-export const AlertIcon = ({ className }: IconProps) => (
+export const CompassIcon = ({ className }: IconProps) => (
   <svg {...base} className={className}>
-    <path d="M10.3 3.9 2 18.1A2 2 0 0 0 3.7 21h16.6a2 2 0 0 0 1.7-2.9L13.7 3.9a2 2 0 0 0-3.4 0Z" />
-    <path d="M12 9v4.5" />
-    <path d="M12 17h.01" />
+    <circle cx="12" cy="12" r="8.6" />
+    <path d="m15.4 8.6-1.8 5-5 1.8 1.8-5z" />
   </svg>
 );
 
-export const WrenchIcon = ({ className }: IconProps) => (
+export const ListIcon = ({ className }: IconProps) => (
   <svg {...base} className={className}>
-    <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8z" />
+    <path d="M4.6 6.6h.01M4.6 12h.01M4.6 17.4h.01" />
+    <path d="M8.6 6.6h10.8M8.6 12h10.8M8.6 17.4h7" />
   </svg>
 );
 
-export const SlidersIcon = ({ className }: IconProps) => (
+export const UserIcon = ({ className }: IconProps) => (
   <svg {...base} className={className}>
-    <path d="M4 7h16M4 12h16M4 17h16" />
-    <circle cx="9" cy="7" r="2.1" fill="var(--color-surface)" />
-    <circle cx="15" cy="12" r="2.1" fill="var(--color-surface)" />
-    <circle cx="10" cy="17" r="2.1" fill="var(--color-surface)" />
+    <circle cx="12" cy="8.2" r="3.7" />
+    <path d="M4.9 20.3a7.1 7.1 0 0 1 14.2 0" />
   </svg>
 );
 
@@ -101,12 +112,5 @@ export const ArrowRightIcon = ({ className }: IconProps) => (
   <svg {...base} className={className}>
     <path d="M5 12h13" />
     <path d="M12.5 5.5 19 12l-6.5 6.5" />
-  </svg>
-);
-
-export const ShieldIcon = ({ className }: IconProps) => (
-  <svg {...base} className={className}>
-    <path d="M12 3.2 5 6v5.5c0 4.2 2.9 7.4 7 8.8 4.1-1.4 7-4.6 7-8.8V6z" />
-    <path d="M9.3 12.2 11.2 14l3.4-3.6" />
   </svg>
 );

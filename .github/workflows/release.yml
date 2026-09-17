@@ -78,7 +78,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           # The Dockerfile compiles the dependency graph in a layer of its
           # own, so this now carries it too: a release whose Cargo.lock is
-          # unchanged rebuilds km-server and nothing else. The scope keeps it
+          # unchanged rebuilds knowva-server and nothing else. The scope keeps it
           # apart from ci.yml's, so neither evicts the other.
           cache-from: type=gha,scope=release
           cache-to: type=gha,mode=max,scope=release

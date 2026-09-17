@@ -17,8 +17,8 @@ The specification priority is the active GitHub issue, then tracker issue #1, th
 - Frontend: `cd frontend && proto run npm -- run dev`
 - Backend checks: run `proto exec rust -- cargo fmt --check`, `proto exec rust -- cargo clippy --all-targets -- -D warnings`, and `proto exec rust -- cargo test` from `backend/`
 - Frontend checks: run `proto run npm -- ci`, `proto run npm -- run lint`, and `proto run npm -- run build` from `frontend/`
-- Native conversion smoke test: `docker build --target native-test -t ai-km-demo:native-test .`
-- Stop the backend with `pkill -x km-server`; never use `pkill -f`.
+- Native conversion smoke test: `docker build --target native-test -t knowva:native-test .`
+- Stop the backend with `pkill -x knowva-server`; never use `pkill -f`.
 
 The backend requires a confirmed `GEMMA_4_MODEL_ID` and `MODEL_BASE_URL` (unless all three per-capability `MODEL_*_URL` routes are set). `MODEL_API_TOKEN` is optional: an unauthenticated on-premise service is addressed without any authorization header. The per-capability routes, the two locked Nemotron model IDs, and request timeout are documented in `.env.example`. Restart after changing configuration.
 

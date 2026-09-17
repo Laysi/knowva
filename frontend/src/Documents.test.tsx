@@ -74,12 +74,12 @@ describe("DocumentList", () => {
 
     expect(snapshotMarkup).toMatchSnapshot();
     expect(html).toContain("排隊中");
-    expect(html).toContain("處理中 · 擷取內容");
-    expect(html).toContain("完成");
+    expect(html).toContain("讀取內容中");
+    expect(html).toContain("可查詢");
     expect(html).toContain("失敗");
     expect(html).toContain("尚無摘要");
-    expect(html).toContain("頁數 5");
-    expect(html).toContain("檢索單元 18");
+    expect(html).toContain("5 頁");
+    expect(html).toContain("18 段");
     expect(html).toContain("原生 PDF");
     expect(html).toContain("新人訓練");
     expect(html).not.toContain("段落");
@@ -87,13 +87,13 @@ describe("DocumentList", () => {
   });
 
   it("uses explicit extracting and indexing copy", () => {
-    expect(documentStatusLabel(documents[1]!)).toBe("處理中 · 擷取內容");
+    expect(documentStatusLabel(documents[1]!)).toBe("讀取內容中");
     expect(
       documentStatusLabel({
         ...documents[1]!,
         processingStage: "indexing",
       }),
-    ).toBe("處理中 · 建立索引");
+    ).toBe("建立索引中");
   });
 
   it("keeps polling for every processing stage and stops for terminal rows", () => {

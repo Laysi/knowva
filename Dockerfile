@@ -70,13 +70,13 @@ WORKDIR /src/backend
 
 FROM backend-base AS backend-builder
 # Compiles the dependency graph on its own, against a placeholder main, so that
-# a source-only change reuses this layer and leaves only km-server itself to
+# a source-only change reuses this layer and leaves only knowva-server itself to
 # build. The registry and the target directory are deliberately not on cache
 # mounts: a registry cache carries layers, and carries nothing that a cache
 # mount holds, so on CI a mounted target directory is empty on every run.
 #
 # The placeholder's own fingerprint and output are deleted afterwards. Without
-# that, cargo can find an up-to-date km-server built from `fn main() {}` and
+# that, cargo can find an up-to-date knowva-server built from `fn main() {}` and
 # publish the stub as the server.
 COPY backend/Cargo.toml backend/Cargo.lock ./
 RUN triple="$(cat /triple)" \
@@ -84,17 +84,17 @@ RUN triple="$(cat /triple)" \
     && echo 'fn main() {}' > src/main.rs \
     && cargo build --locked --release --target "$triple" \
     && rm -rf src \
-         "target/$triple/release/.fingerprint/km-server-"* \
-         "target/$triple/release/deps/km_server-"* \
-         "target/$triple/release/km-server"
+         "target/$triple/release/.fingerprint/knowva-server-"* \
+         "target/$triple/release/deps/knowva_server-"* \
+         "target/$triple/release/knowva-server"
 COPY backend/src ./src
 COPY backend/migrations ./migrations
 RUN triple="$(cat /triple)" \
     && cargo build --locked --release --target "$triple" \
-    && cp "target/$triple/release/km-server" /tmp/km-server
+    && cp "target/$triple/release/knowva-server" /tmp/knowva-server
 
 # Explicit verification target. Build with:
-# docker build --target native-test -t ai-km-demo:native-test .
+# docker build --target native-test -t knowva:native-test .
 #
 # It branches off backend-base rather than off backend-builder: the ignored
 # tests run in the test profile and never look at the release binary, so
@@ -124,9 +124,9 @@ RUN triple="$(cat /triple)" \
     && echo 'fn main() {}' > src/main.rs \
     && cargo build --locked --tests --target "$triple" \
     && rm -rf src \
-         "target/$triple/debug/.fingerprint/km-server-"* \
-         "target/$triple/debug/deps/km_server-"* \
-         "target/$triple/debug/km-server"
+         "target/$triple/debug/.fingerprint/knowva-server-"* \
+         "target/$triple/debug/deps/knowva_server-"* \
+         "target/$triple/debug/knowva-server"
 COPY backend/src ./src
 COPY backend/migrations ./migrations
 RUN triple="$(cat /triple)" \
@@ -153,7 +153,7 @@ COPY --from=pdfium /opt/pdfium/LICENSE /usr/share/doc/pdfium/LICENSE
 RUN ldconfig
 
 WORKDIR /app/backend
-COPY --from=backend-builder /tmp/km-server ./km-server
+COPY --from=backend-builder /tmp/knowva-server ./knowva-server
 COPY --from=frontend-builder /src/frontend/dist /app/frontend/dist
 RUN mkdir -p /app/backend/data/files \
     && chown -R km:km /app
@@ -165,4 +165,4 @@ ENV PORT=8080 \
     LIBREOFFICE_BIN=/usr/bin/libreoffice
 EXPOSE 8080
 STOPSIGNAL SIGTERM
-CMD ["./km-server"]
+CMD ["./knowva-server"]

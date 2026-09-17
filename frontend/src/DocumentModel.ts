@@ -61,21 +61,21 @@ export function safeDocumentFailureMessage(
   switch (error?.code) {
     case "unsupported_file_type":
     case "unsupported_format":
-      return "不支援此檔案格式，請改用上方列出的格式。";
+      return "不支援這種檔案格式，請改用上方列出的格式。";
     case "file_too_large":
-      return "檔案超過 50 MiB 上限，請縮小檔案後重新上傳。";
+      return "檔案超過 50 MiB 上限，請壓縮或拆分後再上傳。";
     case "encrypted_document":
     case "password_protected":
-      return "無法讀取受密碼保護的文件，請解除保護後重新上傳。";
+      return "文件有密碼保護，請解除後再上傳。";
     case "extraction_failed":
     case "extract_failed":
     case "artifact_processing_failed":
-      return "無法擷取文件內容，請確認檔案可正常開啟後重新上傳。";
+      return "讀不到文件內容，請確認檔案能正常開啟後再上傳。";
     case "indexing_failed":
     case "index_failed":
-      return "建立檢索索引失敗，請稍後重新上傳。";
+      return "建立索引失敗，請稍後重新上傳。";
     default:
-      return "文件處理失敗，請刪除後重新上傳；若持續發生，請聯絡管理員。";
+      return "文件處理失敗，請刪除後重新上傳；若一直失敗，請聯絡管理員。";
   }
 }
 
@@ -87,7 +87,7 @@ export function documentRequestErrorMessage(
   status?: number,
 ): string {
   if (status === undefined) {
-    return "無法連線至伺服器，請確認網路後再試。";
+    return "連不上伺服器，請確認網路後再試。";
   }
 
   if (status === 401 || status === 403) {
@@ -97,22 +97,22 @@ export function documentRequestErrorMessage(
   }
 
   if (action === "upload") {
-    if (status === 413) return "檔案太大，伺服器無法處理，請稍後再試。";
+    if (status === 413) return "檔案太大，伺服器無法處理。";
     if (status === 400 || status === 415) {
       return "檔案格式不受支援或內容無法解析，請確認檔案後再試。";
     }
-    if (status === 409) return "這份文件已存在或正在處理中。";
+    if (status === 409) return "這份文件已經在知識庫裡，或正在處理中。";
     if (status === 429) return "上傳過於頻繁，請稍後再試。";
     return "上傳失敗，伺服器暫時無法處理檔案，請稍後再試。";
   }
 
   if (action === "delete") {
-    if (status === 404) return "文件已不存在，請重新載入清單。";
-    if (status === 409) return "文件目前正在使用中，請稍後再刪除。";
+    if (status === 404) return "這份文件已經不在了，請重新載入清單。";
+    if (status === 409) return "文件正在使用中，請稍後再刪除。";
     return "刪除失敗，伺服器暫時無法處理，請稍後再試。";
   }
 
-  if (status === 429) return "文件清單載入過於頻繁，請稍後再試。";
+  if (status === 429) return "重新整理太頻繁，請稍後再試。";
   return "文件清單載入失敗，請稍後再試。";
 }
 
@@ -125,7 +125,7 @@ export function validateUploadFile(
   );
 
   if (!hasSupportedExtension) {
-    return "不支援此檔案格式，請選擇 PDF、Office、圖片、STP 或 email 檔案。";
+    return "不支援這種檔案格式，請選擇 PDF、Office、圖片、STP 或 Email 檔案。";
   }
   return null;
 }
@@ -135,18 +135,18 @@ export function shouldPollDocuments(documents: readonly DocumentRow[]): boolean 
 }
 
 export function documentStatusLabel(doc: DocumentRow): string {
-  if (doc.status === "ready") return "完成";
+  if (doc.status === "ready") return "可查詢";
   if (doc.status === "failed") return "失敗";
 
   switch (doc.processingStage) {
     case "queued":
       return "排隊中";
     case "extracting":
-      return "處理中 · 擷取內容";
+      return "讀取內容中";
     case "indexing":
-      return "處理中 · 建立索引";
+      return "建立索引中";
     case "ready":
-      return "處理中 · 即將完成";
+      return "即將完成";
     case "failed":
       return "處理中";
   }
@@ -162,17 +162,17 @@ export const documentVisualStatus = (
 export const documentSummary = (doc: DocumentRow): string => {
   if (doc.summary?.trim()) return doc.summary;
   if (doc.status === "ready") return "尚無摘要";
-  if (doc.status === "failed") return "處理失敗，無法產生摘要。";
+  if (doc.status === "failed") return "處理失敗，沒有摘要。";
 
   switch (doc.processingStage) {
     case "queued":
-      return "等待系統開始處理…";
+      return "排隊等待處理…";
     case "extracting":
-      return "正在擷取文件內容…";
+      return "正在讀取文件內容…";
     case "indexing":
-      return "正在建立檢索索引…";
+      return "正在建立索引…";
     case "ready":
-      return "文件處理即將完成…";
+      return "就快完成了…";
     case "failed":
       return "正在更新處理狀態…";
   }
