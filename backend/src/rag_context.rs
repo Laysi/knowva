@@ -60,9 +60,25 @@ pub struct SourceRef {
     pub kind: String,
 }
 
+/// Order the retained sources are laid out in inside [`RagContext::content`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockOrder {
+    /// Sorted by `(document_id, page_number)`. Inference prompt caches match on a token
+    /// prefix, so a rank-independent layout turns overlapping retrievals into cache hits.
+    Stable,
+    /// Kept in the caller's order. The catalog listing is already deterministic and
+    /// chronological, so re-sorting it would only scramble a stable layout.
+    AsGiven,
+}
+
 pub struct RagContext {
     pub content: ApiChatContent,
     pub sources: Vec<SourceRef>,
+    /// Retained sources in final retrieval-ranking order. `content` and `sources` are the
+    /// rendered projection of this list, so keeping it lets eviction stay rank-based while
+    /// the rendered blocks follow [`BlockOrder`].
+    ranked: Vec<PreparedSource>,
+    order: BlockOrder,
 }
 
 impl fmt::Debug for RagContext {
@@ -76,30 +92,23 @@ impl fmt::Debug for RagContext {
 }
 
 impl RagContext {
+    /// Splits the context into its model-visible content and its structured source metadata.
+    pub fn into_parts(self) -> (ApiChatContent, Vec<SourceRef>) {
+        (self.content, self.sources)
+    }
+
     /// Removes exactly one lowest-ranked source and its model-visible parts.
     ///
     /// Rank one is never removed: callers use a `false` result to report that the complete
-    /// request cannot fit even after every optional tail source has been discarded.
+    /// request cannot fit even after every optional tail source has been discarded. The
+    /// remaining sources are re-rendered, so source ids stay contiguous in block order.
     pub(crate) fn drop_lowest_source(&mut self) -> bool {
-        if self.sources.len() <= 1 {
+        if self.ranked.len() <= 1 {
             return false;
         }
-        let Some(source) = self.sources.last() else {
-            return false;
-        };
-        let remove_parts = match source.kind.as_str() {
-            "page" => 2,
-            "text" => 1,
-            _ => return false,
-        };
-        let ApiChatContent::Parts(parts) = &mut self.content else {
-            return false;
-        };
-        let Some(retained_parts) = parts.len().checked_sub(remove_parts) else {
-            return false;
-        };
-        parts.truncate(retained_parts);
-        self.sources.pop();
+        let mut ranked = std::mem::take(&mut self.ranked);
+        ranked.pop();
+        *self = render_context(ranked, self.order);
         true
     }
 }
@@ -238,11 +247,49 @@ struct PreparedSource {
     kind: PreparedSourceKind,
 }
 
+impl PreparedSource {
+    /// Total order used by [`BlockOrder::Stable`].
+    ///
+    /// `(document_id, page_number)` is the ordering the layout is meant to express; the rest
+    /// only breaks ties. Callers are expected to pass one candidate per unit, but the key does
+    /// not depend on that: it continues through every field the block renders, so two sources
+    /// can only tie when their rendered bytes are identical and their order cannot matter.
+    fn block_key(&self) -> (Uuid, Option<i32>, i32, i64, &str, u8, &str, &str) {
+        let (page_number, kind_rank, text, image) = match &self.kind {
+            PreparedSourceKind::Page {
+                page_number,
+                extracted_text,
+                image,
+            } => (
+                Some(*page_number),
+                0,
+                extracted_text.as_deref().unwrap_or(""),
+                image.data_url.as_str(),
+            ),
+            PreparedSourceKind::Text { content } => (None, 1, content.as_str(), ""),
+        };
+        (
+            self.document_id,
+            page_number,
+            self.unit_index,
+            self.unit_id,
+            self.filename.as_str(),
+            kind_rank,
+            text,
+            image,
+        )
+    }
+}
+
 /// Builds a bounded multimodal context from candidates already in final retrieval order.
 ///
 /// At most the first six candidates are considered. If the serialized content is too large,
 /// complete sources are removed from the low-ranked tail; a source's payload and structured
 /// metadata are therefore always retained or removed together.
+///
+/// Ranking selects the sources; it does not lay them out. The retained sources are emitted in
+/// [`BlockOrder::Stable`] order so that the same set of sources always produces byte-identical
+/// content, which is what lets a follow-up question reuse the inference prompt cache.
 pub async fn build_rag_context(
     candidates: &[RetrievalCandidate],
     storage: &Storage,
@@ -285,7 +332,7 @@ pub fn build_catalog_context(
         });
     }
 
-    let context = build_context_prefix(&prepared);
+    let context = render_context(prepared, BlockOrder::AsGiven);
     if serialized_content_bytes(&context.content)? > MAX_SERIALIZED_RAG_CONTENT_BYTES {
         return Err(RagContextError::Serialization {
             detail: "catalog context exceeds the knowledge-base context limit".to_string(),
@@ -301,7 +348,7 @@ async fn build_rag_context_with_limits(
 ) -> Result<RagContext, RagContextError> {
     let selected = &candidates[..candidates.len().min(MAX_RAG_SOURCES)];
     if selected.is_empty() {
-        return Ok(build_context_prefix(&[]));
+        return Ok(render_context(Vec::new(), BlockOrder::Stable));
     }
 
     // Fetch every distinct page image with bounded concurrency first. A fetch
@@ -373,17 +420,22 @@ async fn build_rag_context_with_limits(
         });
     }
 
-    for retained in (1..=individually_eligible).rev() {
-        let context = build_context_prefix(&prepared[..retained]);
+    let highest_ranked_unit_id = prepared[0].unit_id;
+    prepared.truncate(individually_eligible);
+    // Eviction stays rank-based even though the blocks are laid out by document and page:
+    // every pass discards the lowest-ranked source and re-renders the retained set.
+    let mut context = render_context(prepared, BlockOrder::Stable);
+    loop {
         let payload_bytes = serialized_content_bytes(&context.content)?;
         if payload_bytes <= limits.max_serialized_content_bytes {
             return Ok(context);
         }
+        if !context.drop_lowest_source() {
+            return Err(RagContextError::PayloadTooLarge {
+                unit_id: highest_ranked_unit_id,
+            });
+        }
     }
-
-    Err(RagContextError::PayloadTooLarge {
-        unit_id: prepared[0].unit_id,
-    })
 }
 
 fn page_image_key(candidate: &RetrievalCandidate) -> Option<&str> {
@@ -553,12 +605,22 @@ fn serialized_content_bytes(content: &ApiChatContent) -> Result<usize, RagContex
         .map_err(serialization_error)
 }
 
-fn build_context_prefix(prepared: &[PreparedSource]) -> RagContext {
-    let mut content_parts = Vec::with_capacity(prepared.len() * 2);
-    let mut sources = Vec::with_capacity(prepared.len());
+/// Renders retained sources into model content plus the matching structured metadata.
+///
+/// `ranked` stays in final retrieval-ranking order so eviction can keep dropping the lowest
+/// rank; `order` decides where each source is placed. `[S1]..[Sn]` are assigned by layout
+/// position, so the ids stay contiguous and match the order of the returned [`SourceRef`]s.
+fn render_context(ranked: Vec<PreparedSource>, order: BlockOrder) -> RagContext {
+    let mut layout = (0..ranked.len()).collect::<Vec<_>>();
+    if order == BlockOrder::Stable {
+        layout.sort_by_key(|index| ranked[*index].block_key());
+    }
 
-    for (index, source) in prepared.iter().enumerate() {
-        let source_id = format!("S{}", index + 1);
+    let mut content_parts = Vec::with_capacity(ranked.len() * 2);
+    let mut sources = Vec::with_capacity(ranked.len());
+
+    for (position, source) in layout.into_iter().map(|index| &ranked[index]).enumerate() {
+        let source_id = format!("S{}", position + 1);
         let filename = quoted(&source.filename);
         match &source.kind {
             PreparedSourceKind::Page {
@@ -631,7 +693,28 @@ content:\n\
     RagContext {
         content: ApiChatContent::Parts(content_parts),
         sources,
+        ranked,
+        order,
     }
+}
+
+/// Builds a rendered text-only context for tests in other modules of this crate.
+#[cfg(test)]
+pub(crate) fn text_context_for_test(contents: &[String]) -> RagContext {
+    let ranked = contents
+        .iter()
+        .enumerate()
+        .map(|(index, content)| PreparedSource {
+            unit_id: index as i64 + 1,
+            unit_index: index as i32,
+            document_id: Uuid::from_u128(index as u128 + 1),
+            filename: format!("source-{}.md", index + 1),
+            kind: PreparedSourceKind::Text {
+                content: content.clone(),
+            },
+        })
+        .collect::<Vec<_>>();
+    render_context(ranked, BlockOrder::Stable)
 }
 
 fn quoted(value: &str) -> String {
@@ -998,35 +1081,182 @@ mod tests {
 
     #[test]
     fn complete_request_trimming_drops_metadata_and_parts_atomically() {
-        let mut context = build_context_prefix(&[
-            PreparedSource {
-                unit_id: 1,
-                unit_index: 0,
-                document_id: Uuid::new_v4(),
-                filename: "first.md".to_string(),
-                kind: PreparedSourceKind::Text {
-                    content: "first".to_string(),
+        // The rank-two source sorts ahead of rank one, so a rendered-order eviction would
+        // remove the wrong block.
+        let mut context = render_context(
+            vec![
+                PreparedSource {
+                    unit_id: 1,
+                    unit_index: 0,
+                    document_id: Uuid::from_u128(2),
+                    filename: "first.md".to_string(),
+                    kind: PreparedSourceKind::Text {
+                        content: "first".to_string(),
+                    },
                 },
-            },
-            PreparedSource {
-                unit_id: 2,
-                unit_index: 1,
-                document_id: Uuid::new_v4(),
-                filename: "second.md".to_string(),
-                kind: PreparedSourceKind::Text {
-                    content: "second".to_string(),
+                PreparedSource {
+                    unit_id: 2,
+                    unit_index: 1,
+                    document_id: Uuid::from_u128(1),
+                    filename: "second.md".to_string(),
+                    kind: PreparedSourceKind::Text {
+                        content: "second".to_string(),
+                    },
                 },
-            },
-        ]);
+            ],
+            BlockOrder::Stable,
+        );
+        assert_eq!(context.sources[0].unit_id, 2);
 
         assert!(context.drop_lowest_source());
         assert_eq!(context.sources.len(), 1);
         assert_eq!(context.sources[0].source_id, "S1");
+        assert_eq!(context.sources[0].unit_id, 1);
         let ApiChatContent::Parts(parts) = &context.content else {
             panic!("RAG context must remain multipart");
         };
         assert_eq!(parts.len(), 1);
+        let payload = serde_json::to_string(&context.content).expect("serialize content");
+        assert!(payload.contains("first"));
+        assert!(!payload.contains("second"));
         assert!(!context.drop_lowest_source());
+    }
+
+    #[tokio::test]
+    async fn block_order_is_independent_of_the_ranking_that_selected_the_sources() {
+        let storage = Storage::memory();
+        let manual = Uuid::from_u128(2);
+        let notes = Uuid::from_u128(1);
+        let page_seven = page_fixture(&storage, manual, 7, 30).await;
+        let page_three = page_fixture(&storage, manual, 3, 40).await;
+        let candidates = vec![
+            candidate(
+                11,
+                manual,
+                "manual.pdf",
+                "page",
+                Some(7),
+                Some(&page_seven),
+                Some("seventh page"),
+            ),
+            text_candidate(12, notes, "notes.md", "operating notes"),
+            candidate(
+                13,
+                manual,
+                "manual.pdf",
+                "page",
+                Some(3),
+                Some(&page_three),
+                Some("third page"),
+            ),
+        ];
+        let reversed = candidates.iter().rev().cloned().collect::<Vec<_>>();
+
+        let first = build_rag_context(&candidates, &storage)
+            .await
+            .expect("build context");
+        let second = build_rag_context(&reversed, &storage)
+            .await
+            .expect("build reversed context");
+
+        assert_eq!(
+            serde_json::to_vec(&first.content).expect("serialize first"),
+            serde_json::to_vec(&second.content).expect("serialize second")
+        );
+        let source_identity = |context: &RagContext| {
+            context
+                .sources
+                .iter()
+                .map(|source| {
+                    (
+                        source.source_id.clone(),
+                        source.document_id,
+                        source.page_number,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(source_identity(&first), source_identity(&second));
+        assert_eq!(
+            source_identity(&first),
+            vec![
+                ("S1".to_string(), notes, None),
+                ("S2".to_string(), manual, Some(3)),
+                ("S3".to_string(), manual, Some(7)),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_unit_identities_still_render_byte_identical_content() {
+        // Callers deduplicate by unit, so this collision should never reach the renderer.
+        // The layout must stay deterministic anyway, because the source ids are what the
+        // answer cites.
+        let document_id = Uuid::from_u128(7);
+        let source = |content: &str| PreparedSource {
+            unit_id: 5,
+            unit_index: 0,
+            document_id,
+            filename: "collision.md".to_string(),
+            kind: PreparedSourceKind::Text {
+                content: content.to_string(),
+            },
+        };
+
+        let first = render_context(vec![source("alpha"), source("beta")], BlockOrder::Stable);
+        let second = render_context(vec![source("beta"), source("alpha")], BlockOrder::Stable);
+
+        assert_eq!(
+            serde_json::to_vec(&first.content).expect("serialize first"),
+            serde_json::to_vec(&second.content).expect("serialize second")
+        );
+        let payload = serde_json::to_string(&first.content).expect("serialize content");
+        assert!(payload.find("alpha") < payload.find("beta"));
+    }
+
+    #[tokio::test]
+    async fn source_ids_stay_contiguous_and_match_the_rendered_block_order() {
+        let storage = Storage::memory();
+        let document_id = Uuid::new_v4();
+        let mut candidates = Vec::new();
+        for (unit_id, page) in [(21_i64, 9_i32), (22, 4), (23, 6)] {
+            let key = page_fixture(&storage, document_id, page, page as u8).await;
+            candidates.push(candidate(
+                unit_id,
+                document_id,
+                "manual.pdf",
+                "page",
+                Some(page),
+                Some(&key),
+                Some(&format!("page {page} text")),
+            ));
+        }
+
+        let context = build_rag_context(&candidates, &storage)
+            .await
+            .expect("build context");
+
+        let rendered_ids = match &context.content {
+            ApiChatContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ApiChatContentPart::Text { text } => {
+                        text.split_whitespace().next().map(str::to_owned)
+                    }
+                    ApiChatContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>(),
+            ApiChatContent::Text(_) => panic!("context must use multipart content"),
+        };
+        assert_eq!(rendered_ids, vec!["[S1]", "[S2]", "[S3]"]);
+        assert_eq!(
+            context
+                .sources
+                .iter()
+                .map(|source| (source.source_id.as_str(), source.page_number))
+                .collect::<Vec<_>>(),
+            vec![("S1", Some(4)), ("S2", Some(6)), ("S3", Some(9))]
+        );
     }
 
     #[tokio::test]

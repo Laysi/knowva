@@ -267,6 +267,7 @@ DB 欄位（`documents.storage_path`、`document_artifact_sets.*_path`／`artifa
 - Page passage 只讀已發布 artifact：有文字層時送 image+text，掃描頁送 image-only（完全省略 `text`），MD/TXT chunk 送 text-only。物件 key 與本機路徑都不進 payload，圖片以有上限的並行讀取後只以記憶體 data URL 傳送；預設每批 8 筆，API 回應即使重排順序也依每批 local index 映回原 unit。
 - 每筆 `RetrievalCandidate` 直接帶 `unit_id`、0-based `unit_index`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、兩路 rank/score、`rrf_score` 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
 - Rerank 每批都嚴格驗證回應筆數、index 唯一且不越界、score finite，再驗證跨批映射。408、429、5xx、transport error 與 timeout 最多嘗試三次；耗盡後以原 RRF top_n 原序回退，且 rerank 欄位保持 null。設定、artifact 或 hosted response contract 錯誤不回退，會回傳可診斷錯誤。Structured log 僅記錄各階段筆數、延遲、fallback 與 model id，不含 query、文件內容、secret 或 base64。
+- 排名只決定哪些來源進入 context，不決定貼上去的順序：context 區塊固定依 `(document_id, page_number)` 排序後才組裝，`[S1]`..`[Sn]` 依該順序連號並與 SSE `sources` 事件一致。同一組來源因此永遠產生位元組相同的 context，讓追問能命中推論服務的前綴 prompt cache。payload 或完整 request 超限時，仍是從排名最低的來源開始整筆移除，再重新編號；知識庫總覽（catalog）問題維持既有的文件時序。
 
 ## A/B 評測
 

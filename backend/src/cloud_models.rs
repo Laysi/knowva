@@ -2802,7 +2802,9 @@ mod tests {
     async fn candidates_flow_to_matching_gemma_parts_and_structured_sources_without_inline_citation()
      {
         let storage = crate::storage::Storage::memory();
-        let page_document_id = uuid::Uuid::new_v4();
+        // Context blocks are laid out by `(document_id, page_number)`, so the two documents
+        // get fixed ids that keep the page source in the first block.
+        let page_document_id = uuid::Uuid::from_u128(1);
         let page_path = format!("{page_document_id}/artifacts-run/pages/0005.png");
         let mut png = Vec::new();
         image::RgbImage::from_pixel(8, 8, image::Rgb([20, 40, 60]))
@@ -2812,7 +2814,7 @@ mod tests {
             .put(&page_path, png)
             .await
             .expect("store integration PNG");
-        let text_document_id = uuid::Uuid::new_v4();
+        let text_document_id = uuid::Uuid::from_u128(2);
         let candidates = vec![
             crate::search::RetrievalCandidate {
                 unit_id: 41,
@@ -3034,25 +3036,13 @@ mod tests {
             role: "user".to_string(),
             content: format!("history-overhead-{}", "h".repeat(300)),
         }];
-        let first_part = ApiChatContentPart::Text {
-            text: format!("[S1] {}", "a".repeat(400)),
-        };
-        let second_part = ApiChatContentPart::Text {
-            text: format!("[S2] {}", "b".repeat(400)),
-        };
-        let source = |index: u128| crate::rag_context::SourceRef {
-            source_id: format!("S{index}"),
-            document_id: uuid::Uuid::from_u128(index),
-            unit_id: index as i64,
-            unit_index: index as i32 - 1,
-            filename: format!("source-{index}.md"),
-            page_number: None,
-            kind: "text".to_string(),
-        };
-
+        let first_content = "a".repeat(400);
+        let second_content = "b".repeat(400);
+        let one_source_context =
+            crate::rag_context::text_context_for_test(std::slice::from_ref(&first_content));
         let one_source_request = client.chat_request_with_context(
             "system".to_string(),
-            ApiChatContent::Parts(vec![first_part.clone()]),
+            one_source_context.content.clone(),
             messages.clone(),
             true,
             4096,
@@ -3060,10 +3050,7 @@ mod tests {
         );
         let one_source_bytes =
             serialize_chat_request(&one_source_request).expect("measure one-source request");
-        let context = crate::rag_context::RagContext {
-            content: ApiChatContent::Parts(vec![first_part, second_part]),
-            sources: vec![source(1), source(2)],
-        };
+        let context = crate::rag_context::text_context_for_test(&[first_content, second_content]);
         let fitted = client
             .fit_rag_context_to_request_with_limit(
                 "system",
@@ -3074,6 +3061,8 @@ mod tests {
             .expect("lowest source should be evicted");
         assert_eq!(fitted.sources.len(), 1);
         assert_eq!(fitted.sources[0].source_id, "S1");
+        // Eviction removes the lowest-ranked source, never the first rendered block.
+        assert_eq!(fitted.sources[0].unit_id, 1);
         let ApiChatContent::Parts(parts) = &fitted.content else {
             panic!("fitted context must remain multipart");
         };
