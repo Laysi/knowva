@@ -76,8 +76,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # cargo keeps its target directory on a cache mount, which no registry
-          # cache carries, so the backend compiles from scratch on every run;
-          # this saves the base layers and the apt stages only.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # The Dockerfile compiles the dependency graph in a layer of its
+          # own, so this now carries it too: a release whose Cargo.lock is
+          # unchanged rebuilds km-server and nothing else. The scope keeps it
+          # apart from ci.yml's, so neither evicts the other.
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,mode=max,scope=release

@@ -345,6 +345,24 @@ proto exec rust -- cargo run -- eval --cloud \
 
 Threshold JSON 只應保存在本機安全位置：不得提交本機 threshold 檔、API token、`.env` secret 或任何 customer/production 文件。fixture 只能使用 repository 內已審核、標明來源與 license 的 synthetic files。
 
+## CI 與快取
+
+`ci.yml` 的三個檢查 job 前面先跑一個 `changes` job，用改動路徑決定哪幾個要跑：`backend/**` 觸發 backend 與 native-conversion，`frontend/**` 觸發 frontend，`Dockerfile` 與 `.dockerignore` 觸發 native-conversion，`.prototools` 與 workflow 本身觸發全部。只改文件的 PR 因此只花一個短 job。
+
+只有 pull request 會過濾。那是 paths-filter 能直接從 API 回答的事件，不需要 checkout 也不需要 history；要過濾 push 就得在每一次 run 完整 fetch 整個 repo，只為了省下「每次合併一次」而且 PR 已經檢查過的那一趟。所以 push 到 main 與手動 dispatch 一律全跑。
+
+只有在 filter 確實執行且成功時才採信它的輸出。一個寫出部分 output 之後才失敗的 step，否則會被照單全收；而一個無法判斷改了什麼的 filter，絕不能有權決定「什麼都不用檢查」。它出錯的每一種方式（包含被 skip）都會退回這個 workflow 原本的全跑。
+
+快取有兩條。cargo 這條由 `Swatinem/rust-cache` 帶走 cargo registry 與 `backend/target`，clippy 與測試不必每次從零編譯；Docker layer 這條走 buildx 的 GitHub Actions cache，`native-conversion` 用 `scope=native-test`、`release.yml` 用 `scope=release`，兩者不會互相驅逐。
+
+兩條都只在 `main` 寫入。GitHub 的 cache 依分支隔離：在 PR 分支寫的 entry 只有那個分支讀得到，若每個 PR 都寫入，只會用滿 repository 的配額並擠掉所有 PR 共用的那一份 main entry。PR 一律讀 main 的快取。
+
+Dockerfile 把相依圖編在自己的 layer：`backend-builder` 與 `native-test` 都先以 placeholder main 編一次相依，再蓋上真正的 source。registry cache 帶得動 layer，帶不動 cache mount，所以相依改放 layer 之後才真正被快取住——只改 source 時只重編 `km-server`，改 `Cargo.lock` 才會重編相依。placeholder 自己的 fingerprint 與產物在同一層刪掉，cargo 不會把 stub 當成最新的 `km-server` 直接送進 runtime。
+
+`native-test` 從 `backend-base` 分支出來而不是從 `backend-builder`：ignored test 跑的是 test profile，用不到 release binary，繼承它只是把整個 crate 編兩次。代價是 CI 不再順便驗證 release build 編得過，那要等 tag 觸發 `release.yml`，與「未經審查的 tag 只賠掉一次 build」這個既有取捨一致。
+
+`backend/Cargo.toml` 的 `[profile.dev] debug = "line-tables-only"` 只影響 dev 與 test profile：panic backtrace 仍有檔名與行號，但不再寫入與連結完整 debug info，測試 build 與被快取的 target 目錄都因此小很多。release profile 不受影響。
+
 ## 驗證
 
 ```bash

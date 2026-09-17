@@ -36,10 +36,15 @@ RUN --mount=type=cache,target=/root/.npm npm ci
 COPY frontend/ ./
 RUN npm run build
 
-# Stays on the builder's own architecture and cross-links for the target.
-# Emulating this stage would run a release build of the crate under QEMU, which
-# takes hours; only the runtime stage below is emulated.
-FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS backend-builder
+# Everything Rust starts here: the toolchain and, for arm64, the cross
+# compiler, with no source in the stage. The two builds below add their own
+# system packages and their own dependency layer on top, so neither invalidates
+# the other and neither is invalidated by a source edit.
+#
+# The stage stays on the builder's own architecture and cross-links for the
+# target. Emulating it would run a release build of the crate under QEMU, which
+# takes hours; only the runtime stage at the bottom is emulated.
+FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS backend-base
 ARG TARGETARCH
 # TARGETARCH is Docker's name for the architecture; cargo wants a target triple.
 RUN case "${TARGETARCH}" in \
@@ -58,23 +63,45 @@ RUN case "${TARGETARCH}" in \
 # be named twice: once for cargo, which links, and once for cc, which compiles.
 # Both are ignored on amd64, where nothing is cross compiled.
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CARGO_TERM_COLOR=always \
+    CARGO_INCREMENTAL=0
 WORKDIR /src/backend
+
+FROM backend-base AS backend-builder
+# Compiles the dependency graph on its own, against a placeholder main, so that
+# a source-only change reuses this layer and leaves only km-server itself to
+# build. The registry and the target directory are deliberately not on cache
+# mounts: a registry cache carries layers, and carries nothing that a cache
+# mount holds, so on CI a mounted target directory is empty on every run.
+#
+# The placeholder's own fingerprint and output are deleted afterwards. Without
+# that, cargo can find an up-to-date km-server built from `fn main() {}` and
+# publish the stub as the server.
 COPY backend/Cargo.toml backend/Cargo.lock ./
+RUN triple="$(cat /triple)" \
+    && mkdir -p src \
+    && echo 'fn main() {}' > src/main.rs \
+    && cargo build --locked --release --target "$triple" \
+    && rm -rf src \
+         "target/$triple/release/.fingerprint/km-server-"* \
+         "target/$triple/release/deps/km_server-"* \
+         "target/$triple/release/km-server"
 COPY backend/src ./src
 COPY backend/migrations ./migrations
-# The target directory is keyed by architecture: a multi-platform build runs
-# both platforms concurrently and a shared cache mount would make one cargo
-# wait on the other's lock for the whole build.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=km-target-$TARGETARCH,target=/src/backend/target \
-    cargo build --locked --release --target "$(cat /triple)" \
-    && cp "target/$(cat /triple)/release/km-server" /tmp/km-server
+RUN triple="$(cat /triple)" \
+    && cargo build --locked --release --target "$triple" \
+    && cp "target/$triple/release/km-server" /tmp/km-server
 
 # Explicit verification target. Build with:
 # docker build --target native-test -t ai-km-demo:native-test .
-FROM backend-builder AS native-test
-ARG TARGETARCH
+#
+# It branches off backend-base rather than off backend-builder: the ignored
+# tests run in the test profile and never look at the release binary, so
+# inheriting the release build only meant compiling the crate twice. The layers
+# are ordered widest-lived first -- system packages, then the dependency graph,
+# then the sources -- so an ordinary source change re-runs the last step alone.
+FROM backend-base AS native-test
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates \
@@ -91,9 +118,19 @@ RUN ldconfig
 ENV PDFIUM_LIBRARY_PATH=/usr/local/lib/libpdfium.so \
     LIBREOFFICE_BIN=/usr/bin/libreoffice \
     DOCUMENT_CONVERSION_TIMEOUT_SECS=120
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=km-target-$TARGETARCH,target=/src/backend/target \
-    cargo test --locked --target "$(cat /triple)" -- --ignored --exact --nocapture --test-threads=1 \
+COPY backend/Cargo.toml backend/Cargo.lock ./
+RUN triple="$(cat /triple)" \
+    && mkdir -p src \
+    && echo 'fn main() {}' > src/main.rs \
+    && cargo build --locked --tests --target "$triple" \
+    && rm -rf src \
+         "target/$triple/debug/.fingerprint/km-server-"* \
+         "target/$triple/debug/deps/km_server-"* \
+         "target/$triple/debug/km-server"
+COPY backend/src ./src
+COPY backend/migrations ./migrations
+RUN triple="$(cat /triple)" \
+    && cargo test --locked --target "$triple" -- --ignored --exact --nocapture --test-threads=1 \
       page_artifacts::tests::generated_pdf_and_office_fixtures_preserve_page_order \
       ingest::tests::native_conversion_runs_in_scratch_and_publishes_relative_keys
 

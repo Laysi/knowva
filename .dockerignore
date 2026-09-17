@@ -11,3 +11,10 @@ frontend/dist
 
 *.log
 presentations
+
+# Nothing below is copied into any stage, and example_file alone is 32MB of
+# sample documents that would be sent to the builder on every build.
+example_file
+docs
+*.md
+docker-compose*.yml

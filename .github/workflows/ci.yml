@@ -10,13 +10,71 @@ on:
 
 permissions:
   contents: read
+  # paths-filter reads a pull request's file list through the API instead of
+  # fetching enough history to diff it on the runner.
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are worthless on a runner that is thrown away, and
+  # they make the cache both larger and slower to move.
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
 jobs:
+  # Decides which jobs below have anything to check, so that a documentation or
+  # deployment-only pull request costs one short job instead of three long ones.
+  #
+  # Only pull requests are filtered. That is the event paths-filter answers from
+  # the API, with nothing checked out and no history behind it. Filtering a push
+  # would mean fetching the repository in full on every run of this workflow, to
+  # save time on the one run per merge whose changes the pull request has
+  # already checked -- so a push to main, like a manual dispatch, runs
+  # everything.
+  #
+  # An output is believed only when the filter both ran and succeeded. A step
+  # that writes some of its outputs and then fails would otherwise be taken at
+  # its word, and a filter that cannot tell what changed must never be able to
+  # decide that nothing needs checking. Every way it can go wrong, including
+  # being skipped, ends in the full run this workflow did before.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      backend: ${{ steps.filter.outcome == 'success' && steps.filter.outputs.backend || 'true' }}
+      frontend: ${{ steps.filter.outcome == 'success' && steps.filter.outputs.frontend || 'true' }}
+      native: ${{ steps.filter.outcome == 'success' && steps.filter.outputs.native || 'true' }}
+
+    steps:
+      - name: Detect the changed areas
+        id: filter
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            shared: &shared
+              - '.prototools'
+              - '.github/workflows/ci.yml'
+            backend:
+              - *shared
+              - 'backend/**'
+            frontend:
+              - *shared
+              - 'frontend/**'
+            native:
+              - *shared
+              - 'backend/**'
+              - 'Dockerfile'
+              - '.dockerignore'
+
   backend:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -51,21 +109,35 @@ jobs:
         with:
           auto-install: true
 
+      # Carries the cargo registry and backend/target between runs, which is
+      # nearly everything clippy and the test build would otherwise redo from
+      # scratch. Only main saves: a cache written on a branch is readable by
+      # that branch alone, so letting every pull request save would fill the
+      # repository's cache quota with entries no other run can use, evicting
+      # the one entry all of them do read.
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Check Rust formatting
         run: proto exec rust -- cargo fmt --check
 
       - name: Lint Rust targets
-        run: proto exec rust -- cargo clippy --all-targets -- -D warnings
+        run: proto exec rust -- cargo clippy --locked --all-targets -- -D warnings
 
       # Ignored tests need Pdfium, LibreOffice or real cloud credentials and run
       # in the native-conversion job or manually.
       - name: Test backend
-        run: proto exec rust -- cargo test
+        run: proto exec rust -- cargo test --locked
 
       - name: Validate evaluation fixtures
-        run: proto exec rust -- cargo run -- eval --dry-run
+        run: proto exec rust -- cargo run --locked -- eval --dry-run
 
   frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -81,8 +153,17 @@ jobs:
         with:
           auto-install: true
 
+      # npm's own download cache, which `npm ci` reads before the registry. The
+      # restore-key makes a lockfile change reuse the packages that did not.
+      - name: Cache the npm download cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
       - name: Install dependencies
-        run: proto run npm -- ci
+        run: proto run npm -- ci --prefer-offline --no-audit --no-fund
 
       - name: Lint frontend
         run: proto run npm -- run lint
@@ -94,6 +175,8 @@ jobs:
         run: proto run npm -- run build
 
   native-conversion:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -101,7 +184,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Builds the runtime image layers and runs the ignored Pdfium/LibreOffice
-      # fixture tests inside the image.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Builds the Pdfium/LibreOffice layers and runs the ignored fixture tests
+      # inside them. The image is never used afterwards, so nothing is loaded
+      # into the daemon or pushed: what this produces is the test result and the
+      # layer cache. The cache scope is this job's alone, so it cannot evict
+      # release.yml's, and only main writes it, for the same reason the cargo
+      # cache above is written only there.
       - name: Build native conversion test image
-        run: docker build --target native-test -t ai-km-demo:native-test .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: native-test
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=native-test
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=native-test' || '' }}
