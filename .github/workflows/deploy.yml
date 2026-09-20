@@ -83,11 +83,16 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          # Either the base URL, or all three routes. Both are carried because
+          # the deployed host needs the routes rather than the base: its chat
+          # and embedding calls go to one upstream provider and its reranking to
+          # another, on a path that is not a suffix of either, so there is no
+          # single base to derive all three from.
+          MODEL_BASE_URL: ${{ secrets.MODEL_BASE_URL }}
+          MODEL_CHAT_URL: ${{ secrets.MODEL_CHAT_URL }}
+          MODEL_EMBED_URL: ${{ secrets.MODEL_EMBED_URL }}
+          MODEL_RERANK_URL: ${{ secrets.MODEL_RERANK_URL }}
           MODEL_API_TOKEN: ${{ secrets.MODEL_API_TOKEN }}
-          MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
-          MODEL_CHAT_URL: ${{ vars.MODEL_CHAT_URL }}
-          MODEL_EMBED_URL: ${{ vars.MODEL_EMBED_URL }}
-          MODEL_RERANK_URL: ${{ vars.MODEL_RERANK_URL }}
           GEMMA_4_MODEL_ID: ${{ secrets.GEMMA_4_MODEL_ID }}
           # File storage is chosen once, by the first start against an empty
           # database, and locked there. It lives in repository variables and
@@ -105,6 +110,24 @@ jobs:
           STORAGE_SECRET_ACCESS_KEY: ${{ secrets.STORAGE_SECRET_ACCESS_KEY }}
         run: |
           set -eu
+          # Checked here rather than in the compose file, unlike every other
+          # required setting. Those use ${VAR:?...}, so an empty one stops
+          # compose while it is still resolving and the running containers
+          # survive untouched. These cannot: the backend takes either a base URL
+          # or all three per-capability routes, and compose has no way to
+          # require one of two. So the compose file has to let empty values
+          # through, which means it would replace the running container and only
+          # then fail at startup -- the site is already down by the time anyone
+          # finds out. Whitespace counts as empty here because the backend trims
+          # before deciding a setting is missing, so " " would pass a plain -n
+          # and still reach the host as unset.
+          filled() { [ -n "$(printf '%s' "${1:-}" | tr -d '[:space:]')" ]; }
+          if ! filled "${MODEL_BASE_URL:-}" && ! { filled "${MODEL_CHAT_URL:-}" &&
+              filled "${MODEL_EMBED_URL:-}" && filled "${MODEL_RERANK_URL:-}"; }; then
+              echo "set the MODEL_BASE_URL secret, or all three of" \
+                   "MODEL_CHAT_URL, MODEL_EMBED_URL and MODEL_RERANK_URL"
+              exit 1
+          fi
           # Checked before the host is touched: a backend that refuses its
           # storage settings takes the running site down with it.
           case "${STORAGE_BACKEND:-local}" in
@@ -126,11 +149,11 @@ jobs:
           cat > env.deploy <<EOF
           KNOWVA_VERSION=$KNOWVA_VERSION
           POSTGRES_PASSWORD=$POSTGRES_PASSWORD
-          MODEL_API_TOKEN=$MODEL_API_TOKEN
           MODEL_BASE_URL=$MODEL_BASE_URL
           MODEL_CHAT_URL=$MODEL_CHAT_URL
           MODEL_EMBED_URL=$MODEL_EMBED_URL
           MODEL_RERANK_URL=$MODEL_RERANK_URL
+          MODEL_API_TOKEN=$MODEL_API_TOKEN
           GEMMA_4_MODEL_ID=$GEMMA_4_MODEL_ID
           STORAGE_BACKEND=$STORAGE_BACKEND
           STORAGE_BUCKET=$STORAGE_BUCKET
