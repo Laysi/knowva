@@ -114,3 +114,13 @@ export const ArrowRightIcon = ({ className }: IconProps) => (
     <path d="M12.5 5.5 19 12l-6.5 6.5" />
   </svg>
 );
+
+// A socket with two pins: the MCP settings view is about plugging external
+// tool servers in.
+export const PlugIcon = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <path d="M9 3v5M15 3v5" />
+    <path d="M6.5 8h11v3a5.5 5.5 0 0 1-11 0z" />
+    <path d="M12 16.5V21" />
+  </svg>
+);
