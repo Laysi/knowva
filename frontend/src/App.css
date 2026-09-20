@@ -1,6 +1,6 @@
 /* ============================================================
    Knowva — app shell
-   Deep-space navigation rail against a white workspace.
+   Navy navigation rail against a white workspace.
    ============================================================ */
 .app {
   display: flex;
@@ -16,21 +16,13 @@
   flex-direction: column;
   padding: var(--space-5) var(--space-3) var(--space-4);
   color: var(--color-space-text);
-  /* Deep space, lit from the brand mark's corner and again from below. */
-  background-color: var(--color-space-deep);
-  background-image: radial-gradient(
-      120% 58% at 12% 0%,
-      rgba(109, 74, 255, 0.42),
-      transparent 62%
-    ),
-    radial-gradient(
-      96% 46% at 100% 100%,
-      rgba(58, 96, 224, 0.28),
-      transparent 70%
-    ),
-    linear-gradient(180deg, var(--color-space) 0%, var(--color-space-deep) 100%);
-  box-shadow: 1px 0 0 rgba(16, 20, 42, 0.1),
-    10px 0 28px -14px rgba(16, 20, 42, 0.22);
+  /* One hue, top to bottom — depth without a second color. */
+  background: linear-gradient(
+    180deg,
+    var(--color-space) 0%,
+    var(--color-space-deep) 100%
+  );
+  box-shadow: 1px 0 0 var(--color-space-line);
 }
 
 .brand {
@@ -49,10 +41,9 @@
   justify-content: center;
   font-size: 27px;
   color: #fff;
-  filter: drop-shadow(0 1px 1.5px rgba(26, 8, 72, 0.4));
-  background: var(--gradient-nova);
+  background: var(--gradient-brand);
   border-radius: 13px;
-  box-shadow: var(--gloss-edge), var(--shadow-nova);
+  box-shadow: var(--gloss-edge), var(--shadow-brand);
 }
 
 .brand-text {
@@ -104,16 +95,12 @@
 }
 
 .nav-item.active {
-  background: linear-gradient(
-    90deg,
-    rgba(255, 255, 255, 0.15),
-    rgba(255, 255, 255, 0.05)
-  );
+  background: var(--color-space-active);
   color: #fff;
   font-weight: 600;
 }
 
-/* Nova bar marking the active view. */
+/* Bar marking the active view. */
 .nav-item.active::before {
   content: "";
   position: absolute;
@@ -123,7 +110,7 @@
   width: 3px;
   height: 20px;
   border-radius: var(--radius-full);
-  background: var(--gradient-nova);
+  background: var(--color-space-text);
 }
 
 .nav-icon {
@@ -209,7 +196,6 @@
 }
 
 .welcome-mark {
-  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -217,24 +203,10 @@
   height: 72px;
   font-size: 36px;
   color: var(--color-accent);
-  background: var(--gradient-nova-soft);
+  background: var(--color-accent-weak);
   border: 1px solid var(--color-accent-weak-border);
   border-radius: var(--radius-xl);
   margin-bottom: var(--space-5);
-}
-
-/* The nova's own glow. */
-.welcome-mark::after {
-  content: "";
-  position: absolute;
-  inset: -22px;
-  border-radius: 50%;
-  background: radial-gradient(
-    closest-side,
-    rgba(109, 74, 255, 0.18),
-    transparent 100%
-  );
-  z-index: -1;
 }
 
 .welcome-title {
@@ -296,7 +268,7 @@
 }
 
 .suggestion:hover .suggestion-icon {
-  background: var(--gradient-nova);
+  background: var(--color-accent);
   color: #fff;
 }
 
@@ -340,7 +312,7 @@
   background: var(--color-accent);
   color: #fff;
   border-radius: 18px 18px 6px 18px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26), var(--shadow-xs);
+  box-shadow: var(--gloss-edge), var(--shadow-xs);
   font-size: 16.5px;
   line-height: 1.6;
   white-space: pre-wrap;
@@ -366,8 +338,7 @@
   justify-content: center;
   font-size: 20px;
   color: #fff;
-  filter: drop-shadow(0 1px 1px rgba(26, 8, 72, 0.35));
-  background: var(--gradient-nova);
+  background: var(--gradient-brand);
   border-radius: 11px;
   box-shadow: var(--gloss-edge), var(--shadow-xs);
 }
@@ -496,18 +467,20 @@
   height: 46px;
   border: none;
   border-radius: 15px;
-  background: var(--gradient-nova);
+  background: var(--gradient-brand);
   color: #fff;
   font-size: 22px;
-  box-shadow: var(--gloss-edge), var(--shadow-nova);
-  transition: filter 0.15s ease, translate 0.05s ease, box-shadow 0.15s ease;
+  box-shadow: var(--gloss-edge), var(--shadow-brand);
+  transition: filter 0.15s ease, translate 0.05s ease;
 }
 
+/* Brightness, not a second color: the gradient stays intact through hover. */
 .composer-btn:hover:not(:disabled) {
-  filter: brightness(1.07);
+  filter: brightness(1.08);
 }
 
 .composer-btn:active:not(:disabled) {
+  filter: brightness(0.94);
   translate: 0 1px;
 }
 
@@ -860,7 +833,7 @@
   height: 52px;
   font-size: 25px;
   color: var(--color-accent);
-  background: var(--gradient-nova-soft);
+  background: var(--color-accent-weak);
   border-radius: var(--radius-md);
 }
 
@@ -941,7 +914,7 @@
   font-weight: 700;
   letter-spacing: 0.02em;
   color: var(--color-accent);
-  background: var(--gradient-nova-soft);
+  background: var(--color-accent-weak);
   border: 1px solid var(--color-accent-weak-border);
   border-radius: var(--radius-md);
 }

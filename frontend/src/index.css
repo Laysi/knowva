@@ -1,7 +1,11 @@
 /* ============================================================
    Knowva — design tokens
-   "Nova on light": white workspace, deep-space navigation rail,
-   a violet-to-amber nova as the single accent gradient.
+   "Navy on light": white workspace, navy navigation rail, one
+   corporate blue accent.
+   Baseline is an ordinary modern sRGB display, so fine steps and
+   soft depth are fair game. What is ruled out is decoration that
+   reads as consumer software: multi-hue gradients, colored glows,
+   and any accent so saturated it shifts on a wide-gamut panel.
    ============================================================ */
 :root {
   /* ---- Typography ---- */
@@ -10,74 +14,55 @@
   --font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Courier New",
     monospace;
 
-  /* ---- Nova accent ---- */
-  --color-accent: #6d4aff;
-  --color-accent-hover: #5a37f0;
-  --color-accent-active: #4a2ad6;
-  --color-accent-weak: #efebff;
-  --color-accent-weak-border: #ddd6ff;
-  --color-accent-ring: rgba(109, 74, 255, 0.24);
-  --color-flare: #ff9f1c;
-  /* The specular highlight lives inside the gradient, so every nova surface
-     (brand mark, avatar, send button, active bar) is polished, not flat. */
-  --gradient-nova: radial-gradient(
-      88% 88% at 14% 2%,
-      rgba(255, 255, 255, 0.34),
-      rgba(255, 255, 255, 0) 48%
-    ),
-    linear-gradient(135deg, #6d4aff 0%, #a855f7 52%, #ff9f1c 100%);
-  --gradient-nova-soft: radial-gradient(
-      88% 88% at 16% 2%,
-      rgba(255, 255, 255, 0.6),
-      rgba(255, 255, 255, 0) 52%
-    ),
-    linear-gradient(
-      135deg,
-      rgba(109, 74, 255, 0.24) 0%,
-      rgba(255, 159, 28, 0.24) 100%
-    );
-  /* A lit top edge and a shaded bottom one — the rest of the gloss. */
-  --gloss-edge: inset 0 1px 0 rgba(255, 255, 255, 0.42),
-    inset 0 -1px 0 rgba(12, 6, 40, 0.2);
+  /* ---- Accent ---- */
+  /* 6.7:1 on white, so it carries text and takes white text on top. */
+  --color-accent: #2a54c0;
+  --color-accent-hover: #2247a6;
+  --color-accent-active: #1b3a8c;
+  --color-accent-weak: #ecf1fb;
+  --color-accent-weak-border: #d3def4;
+  --color-accent-ring: rgba(42, 84, 192, 0.28);
+  /* Depth, one hue: a short navy-to-accent ramp plus a lit top edge. */
+  --gradient-brand: linear-gradient(170deg, #3159c8 0%, #2447a4 100%);
+  --gloss-edge: inset 0 1px 0 rgba(255, 255, 255, 0.2);
 
-  /* ---- Deep space (navigation rail) ---- */
-  --color-space: #101436;
-  --color-space-deep: #0a0d26;
-  --color-space-line: rgba(255, 255, 255, 0.09);
-  --color-space-text: #eceefb;
-  --color-space-text-muted: #9aa0c8;
-  --color-space-hover: rgba(255, 255, 255, 0.07);
-  --color-space-active: rgba(255, 255, 255, 0.12);
+  /* ---- Navy (navigation rail) ---- */
+  --color-space: #172c4f;
+  --color-space-deep: #112340;
+  --color-space-line: rgba(255, 255, 255, 0.12);
+  --color-space-text: #eef1f7;
+  --color-space-text-muted: #9dabc4;
+  --color-space-hover: rgba(255, 255, 255, 0.08);
+  --color-space-active: rgba(255, 255, 255, 0.14);
 
   /* ---- Surfaces ---- */
-  --color-canvas: #f7f8fc;
+  --color-canvas: #f6f8fc;
   --color-surface: #ffffff;
-  --color-surface-sunken: #f2f4fa;
-  --color-surface-hover: #eef0f8;
-  --color-surface-zebra: #fafbfe;
+  --color-surface-sunken: #f0f3f9;
+  --color-surface-hover: #eaeef6;
+  --color-surface-zebra: #fafbfd;
 
-  --color-border: #e6e9f2;
-  --color-border-strong: #d5dae8;
+  --color-border: #e3e8f0;
+  --color-border-strong: #ccd4e2;
 
-  --color-text: #10142a;
-  --color-text-secondary: #4c5474;
+  --color-text: #101828;
+  --color-text-secondary: #44516b;
   /* muted carries real body copy, so it clears AA (4.7:1 on the canvas);
-     faint is for icons and placeholders only, at 3.1:1. */
-  --color-text-muted: #686f8a;
-  --color-text-faint: #848ca9;
+     faint is for icons and placeholders only, at 3.4:1. */
+  --color-text-muted: #667085;
+  --color-text-faint: #7d8598;
 
   /* ---- Status ---- */
-  --color-success: #17915e;
-  --color-success-bg: #e6f6ee;
-  --color-success-text: #0f6b45;
-  --color-warning: #b4690e;
-  --color-warning-bg: #fdf1de;
-  --color-warning-text: #8a4f04;
-  --color-danger: #d0384a;
-  --color-danger-bg: #fdecef;
-  --color-danger-border: #f7d2d9;
-  --color-danger-text: #a32236;
-
+  --color-success: #14875f;
+  --color-success-bg: #e4f4ec;
+  --color-success-text: #0d6144;
+  --color-warning: #a96a0e;
+  --color-warning-bg: #fbeeda;
+  --color-warning-text: #824c05;
+  --color-danger: #c53a49;
+  --color-danger-bg: #fceaee;
+  --color-danger-border: #f3ccd4;
+  --color-danger-text: #9c2133;
   /* ---- Spacing scale (4 / 8) ---- */
   --space-1: 4px;
   --space-2: 8px;
@@ -96,12 +81,12 @@
   --radius-xl: 22px;
   --radius-full: 999px;
 
-  /* ---- Elevation ---- */
-  --shadow-xs: 0 1px 2px rgba(16, 20, 42, 0.05);
-  --shadow-sm: 0 1px 2px rgba(16, 20, 42, 0.06), 0 2px 8px rgba(16, 20, 42, 0.05);
-  --shadow-md: 0 6px 18px rgba(16, 20, 42, 0.09);
-  --shadow-lg: 0 18px 44px rgba(16, 20, 42, 0.16);
-  --shadow-nova: 0 6px 20px rgba(109, 74, 255, 0.28);
+  /* ---- Elevation (neutral, except the accent button's own lift) ---- */
+  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.06);
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06), 0 2px 8px rgba(16, 24, 40, 0.05);
+  --shadow-md: 0 6px 18px rgba(16, 24, 40, 0.1);
+  --shadow-lg: 0 18px 44px rgba(16, 24, 40, 0.16);
+  --shadow-brand: 0 3px 10px rgba(30, 64, 160, 0.26);
 
   color-scheme: light;
   font-family: var(--font-sans);
@@ -190,7 +175,7 @@ textarea {
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background: #bcc3d6;
+  background: #b3bccb;
   background-clip: padding-box;
   border: 3px solid transparent;
 }
