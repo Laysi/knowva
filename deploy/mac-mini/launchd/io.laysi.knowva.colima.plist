@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The Linux VM that runs the application and PostgreSQL. Its containers are
+     `restart: unless-stopped`, so starting the VM brings the stack back. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.laysi.knowva.colima</string>
+  <key>UserName</key>
+  <string>knowva</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/knowva/.local/bin/colima</string>
+    <string>start</string>
+    <string>--foreground</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/knowva</string>
+    <key>PATH</key>
+    <string>/Users/knowva/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/knowva/Library/Logs/knowva/colima.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/knowva/Library/Logs/knowva/colima.log</string>
+</dict>
+</plist>

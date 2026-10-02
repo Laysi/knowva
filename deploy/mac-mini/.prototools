@@ -1,0 +1,6 @@
+bun = "1.4.2"
+python = "3.12.15"
+uv = "0.12.22"
+
+[settings]
+detect-strategy = "prefer-prototools"

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Gemma 4 on Metal. A daemon rather than an agent: the Mac boots without a
+     login session, and agents only start inside one. Loopback only; the
+     inference service in front of it is the one the VM talks to. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.laysi.knowva.ollama</string>
+  <key>UserName</key>
+  <string>knowva</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/knowva/knowva-inference/ollama/current/ollama</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/knowva</string>
+    <key>OLLAMA_HOST</key>
+    <string>127.0.0.1:11434</string>
+    <key>OLLAMA_CONTEXT_LENGTH</key>
+    <string>16384</string>
+    <key>OLLAMA_KEEP_ALIVE</key>
+    <string>-1</string>
+    <key>OLLAMA_MAX_LOADED_MODELS</key>
+    <string>1</string>
+    <key>OLLAMA_NUM_PARALLEL</key>
+    <string>1</string>
+    <key>OLLAMA_FLASH_ATTENTION</key>
+    <string>1</string>
+    <!-- Read by the llama-server Ollama spawns. Its prompt cache defaults to
+         8 GB, which put its footprint at 10.8 GB and the machine into swap;
+         2 GB keeps the last couple of prompts for follow-ups at 3.3 GB. -->
+    <key>LLAMA_ARG_CACHE_RAM</key>
+    <string>2048</string>
+    <!-- Gemma 4's sliding-window layers resume only from a checkpoint, 320 MB
+         each, one per prompt; the default of 32 lets one long conversation
+         grow to 10 GB. Resuming needs only the latest, so 4 is ample. -->
+    <key>LLAMA_ARG_CTX_CHECKPOINTS</key>
+    <string>4</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/knowva/Library/Logs/knowva/ollama.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/knowva/Library/Logs/knowva/ollama.log</string>
+</dict>
+</plist>

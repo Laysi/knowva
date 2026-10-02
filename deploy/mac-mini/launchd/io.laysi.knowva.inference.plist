@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Embed VL and Rerank VL on MPS, plus chat passed through to Ollama: the
+     one endpoint the application's MODEL_BASE_URL points at. Weights are read
+     from the verified local snapshots only; nothing is fetched at runtime. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.laysi.knowva.inference</string>
+  <key>UserName</key>
+  <string>knowva</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/knowva/knowva-inference/app/inference</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/knowva/knowva-inference/app/inference/.venv/bin/python</string>
+    <string>server.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/knowva</string>
+    <key>HF_HUB_OFFLINE</key>
+    <string>1</string>
+    <key>KM_EMBED_PATH</key>
+    <string>/Users/knowva/knowva-inference/models/llama-nemotron-embed-vl-1b-v2</string>
+    <key>KM_RERANK_PATH</key>
+    <string>/Users/knowva/knowva-inference/models/llama-nemotron-rerank-vl-1b-v2</string>
+    <key>KM_IDLE_SECS</key>
+    <string>600</string>
+    <key>KM_MAX_TILES</key>
+    <string>6</string>
+    <key>KM_RERANK_TILES</key>
+    <string>1</string>
+    <key>KM_RERANK_INPUT</key>
+    <string>both</string>
+    <key>KM_CHAT_IMAGE_MAX_SIDE</key>
+    <string>1280</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/knowva/Library/Logs/knowva/inference.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/knowva/Library/Logs/knowva/inference.log</string>
+</dict>
+</plist>
