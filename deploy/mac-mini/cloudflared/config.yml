@@ -1,0 +1,20 @@
+# The knowva-mac tunnel, installed to /etc/cloudflared/config.yml by
+# setup/install-tunnel-config.sh. The credentials file it names stays only in
+# /etc/cloudflared (root, 600); the tunnel id itself is public in DNS anyway.
+tunnel: 92fba54d-96ba-4ef3-a392-f3897374008e
+credentials-file: /etc/cloudflared/92fba54d-96ba-4ef3-a392-f3897374008e.json
+# The binary is checksum- and signature-verified at install; upgrades are
+# deliberate rather than pulled in by the daemon.
+no-autoupdate: true
+# QUIC connections on this Wi-Fi time out every ~30 s under sustained load
+# ("no recent network activity"); HTTP/2 over TCP rides that out.
+protocol: http2
+
+ingress:
+  - hostname: knowva-mac-ssh.laysi.io
+    service: ssh://localhost:22
+  # Public on purpose and unauthenticated: Knowva has no login, so anyone with
+  # the URL can upload, delete and ask. Decided by the owner on 2026-10-02.
+  - hostname: knowva-mac.laysi.io
+    service: http://127.0.0.1:8080
+  - service: http_status:404

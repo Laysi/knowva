@@ -1,0 +1,59 @@
+# Knowva on the Mac mini: the application and its database run in Colima's
+# Linux VM; the models run natively on the host so they get the GPU, which a
+# VM cannot reach. The VM sees the host's loopback as host.docker.internal.
+#
+# The published image is the same one docker-compose.prod.yml deploys; only
+# the model endpoint and the port differ. The port is bound to loopback, so
+# the application is reachable from the Mac itself (and the Cloudflare tunnel
+# running there) but not from the LAN.
+#
+#   docker compose -p knowva -f docker-compose.yml --env-file .env up -d
+
+services:
+  app:
+    image: ghcr.io/laysi/knowva:${KNOWVA_VERSION:?set KNOWVA_VERSION}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      DATABASE_URL: postgres://knowva:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/knowva
+      FILES_DIR: /app/backend/data/files
+      PORT: "8080"
+      STORAGE_BACKEND: local
+      # One service on the host carries all three routes: embed and rerank
+      # itself, chat passed through to Ollama with thinking switched off.
+      MODEL_BASE_URL: http://host.docker.internal:9500
+      GEMMA_4_MODEL_ID: ${GEMMA_4_MODEL_ID:?set GEMMA_4_MODEL_ID}
+      NEMOTRON_EMBED_MODEL_ID: nvidia/llama-nemotron-embed-vl-1b-v2
+      NEMOTRON_RERANK_MODEL_ID: nvidia/llama-nemotron-rerank-vl-1b-v2
+      RERANK_CANDIDATE_TOP_K: ${RERANK_CANDIDATE_TOP_K:-50}
+      RERANK_TOP_N: ${RERANK_TOP_N:-6}
+      RERANK_BATCH_SIZE: ${RERANK_BATCH_SIZE:-8}
+      MODEL_REQUEST_TIMEOUT_SECS: ${MODEL_REQUEST_TIMEOUT_SECS:-300}
+      PDF_RENDER_DPI: ${PDF_RENDER_DPI:-180}
+      DOCUMENT_CONVERSION_TIMEOUT_SECS: ${DOCUMENT_CONVERSION_TIMEOUT_SECS:-120}
+    volumes:
+      - app_files:/app/backend/data/files
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: knowva
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: knowva
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U knowva"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  app_files:
+  pgdata:
