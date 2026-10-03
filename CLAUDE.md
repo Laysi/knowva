@@ -62,25 +62,14 @@ Preserve unrelated user changes. Use focused patches, run the backend checks abo
 
 ## Project management (GitHub issues)
 
-Keeping the tracking issue in sync is part of done: when issue-tracked work gets blocked, lands a PR/commit, or completes, update the issue in the same session. Operational details (MCP payloads, issue format, gh fallback) live in `.claude/skills/project-board/SKILL.md`, executed through `github-loop-engineering-skill`; this section only sets policy.
+Keeping the tracking issue in sync is part of done: when issue-tracked work gets blocked, lands a PR/commit, or completes, update the issue in the same session. Issue operations run through the org-distributed `github-loop-engineering:github-loop-engineering-skill`; the rules below are this repo's policy and take precedence over that skill, including its board steps and work-item format.
 
-- No Projects board is linked to this repo. State is open/closed plus comments, and tracker #1's checklist is the progress overview. Do not attach issues to any board.
+- No Projects board is linked to this repo. State is open/closed plus comments, and tracker #1's checklist is the progress overview: a new `[MVP-NN]` issue gets a `- [ ] #N` line there, and the edited #1 body is read back. Do not attach issues to any board.
 - Agent-discovered follow-ups or tech debt are proposals; create an issue only after the user approves. Do not assign anyone unless asked. Reuse existing labels only; ask before adding a new one.
 - Issue titles and bodies are zh-TW and cold-start readable, following the existing format (#8 for `[MVP-NN]` work, #15 for small issues). Acceptance criteria must be independently verifiable and map to the check commands above.
 - Re-read after every write: a 200 response only proves GitHub accepted the request. Close an issue only with a completion comment carrying validation evidence, and tick its #1 checklist entry when it has one.
-- Before handing back or committing a nontrivial change, run the `codex-review` skill. It is review-only; never auto-apply its findings.
+- Before handing back or committing a nontrivial change, run the org-distributed `codex-review:codex-review` skill. It is review-only; never auto-apply its findings.
 
-## Agent routing
+## Agent tooling
 
-Use `deep-reasoner` for architecture, unclear bugs, security, database/API/deployment decisions, design review, and high-risk tradeoffs. It is read-only and should return a decision memo plus implementation plan.
-Use `senior-engineer` for difficult implementation that requires strong engineering judgment and direct code edits, especially Rust, backend logic, APIs, async/concurrency, database integration, state management, complex refactors, or bugs that are too hard for mechanical patching.
-Use `fast-worker` for clear, scoped implementation: small code edits, refactors, file creation, tests, formatting, migrations, and applying an existing plan. Do not use it for architecture or hard engineering judgment.
-Use `ui-rewriter` when the frontend looks ugly, cheap, inconsistent, template-like, or not credible as a B2B SaaS product. It may directly edit frontend files, but should not touch backend architecture.
-For risky architecture: `deep-reasoner` first, then `senior-engineer`, `fast-worker`, or `ui-rewriter`.
-For hard implementation: `senior-engineer`.
-For obvious scoped bugs or mechanical edits: `fast-worker`.
-For frontend visual polish/redesign: `ui-rewriter`.
-Do not let multiple agents independently redesign the same area.
-Do not ask `fast-worker` to invent architecture.
-Do not ask `deep-reasoner` to edit files.
-Do not use Opus agents for routine mechanical edits.
+Skills, MCP servers (GitHub, AWS, Cloudflare) and the codex-review commit gate come from org-distributed Claude Code plugins, so the repo keeps no `.claude/skills`, `.claude/agents` or `.mcp.json` of its own. The GitHub MCP server authenticates with the member's own `GITHUB_PERSONAL_ACCESS_TOKEN` environment variable.
