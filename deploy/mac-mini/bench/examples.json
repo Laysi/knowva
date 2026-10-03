@@ -1,0 +1,258 @@
+{
+  "version": 1,
+  "notes": "Question set over example_file/. An answerable case passes when the expected source was retrieved and the answer cites it. A source is a retrieved unit with that filename and, when pages is given, one of those page numbers (null is a text unit). mustInclude is a list of groups; every group needs one of its alternatives in the answer, compared case-insensitively. mustNotMatch are case-insensitive regular expressions the answer must not match.",
+  "files": [
+    { "filename": "iiot_industry_report.pdf", "pages": 14, "visionPages": [7] },
+    { "filename": "iiot_maintenance_report.docx", "pages": 1, "visionPages": [] },
+    { "filename": "iiot_sensor_inventory.xlsx", "pages": 2, "visionPages": [] },
+    { "filename": "iiot_smart_factory_briefing.pptx", "pages": 1, "visionPages": [] },
+    { "filename": "iiot_factory_robot.jpg", "pages": 1, "visionPages": [1] },
+    { "filename": "iiot_giga_press.png", "pages": 1, "visionPages": [1] },
+    { "filename": "iiot_sensor_alert.eml", "pages": 0, "visionPages": [] },
+    { "filename": "iiot_load_cell_sensor.stp", "pages": 0, "visionPages": [] },
+    { "filename": "iiot_factory_process.mp4", "rejectStatus": 415 },
+    { "filename": "iiot_factory_process.avi", "rejectStatus": 415 }
+  ],
+  "cases": [
+    {
+      "id": "pdf-p1-authors",
+      "category": "pdf-text",
+      "turns": ["IoT4Industry D.1 文件的作者與 QA 負責人是誰？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [1] },
+      "mustInclude": [["Strohmeier"], ["Damjanovic"]]
+    },
+    {
+      "id": "pdf-p2-toc",
+      "category": "pdf-text",
+      "turns": ["IoT4Industry 報告目錄中，3.1 Alternative IoT-Platforms 底下列了哪兩個平台？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [2, 12, 13] },
+      "mustInclude": [["Arduino"], ["RIOT"]]
+    },
+    {
+      "id": "pdf-p3-funding",
+      "category": "pdf-text",
+      "turns": ["IoT4Industry 專案由哪個機構資助？執行到哪一年？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [3] },
+      "mustInclude": [["Austrian Research Promotion Agency", "奧地利"], ["2015"]]
+    },
+    {
+      "id": "pdf-p4-goals",
+      "category": "pdf-text",
+      "turns": ["IoT4Industry Task 1 列出的四個 Goals 是什麼？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [4] },
+      "mustInclude": [["Contiki"], ["JADE"], ["WADE"], ["On-line", "online", "上線", "線上", "在線"], ["communication", "通訊", "溝通", "通信"]]
+    },
+    {
+      "id": "pdf-p5-coap",
+      "category": "pdf-text",
+      "turns": ["報告詞彙表中 CoAP 的全名是什麼？它主要針對哪一類裝置？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [5, 7] },
+      "mustInclude": [["Constrained Application Protocol"], ["感測器", "sensor", "低功耗", "low power"]]
+    },
+    {
+      "id": "pdf-p7-kit",
+      "category": "pdf-vision-page",
+      "turns": ["cc2538 Development Kit 包含哪些元件？各有幾個？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [7] },
+      "mustInclude": [["SmartRF06"], ["Evaluation Module", "評估模組"], ["2", "兩"]]
+    },
+    {
+      "id": "pdf-p7-figure",
+      "category": "pdf-vision-page",
+      "turns": ["報告 Figure 1 的硬體照片中，標示「Router」的那塊電路板在照片的左側還是右側？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [7] },
+      "mustInclude": [["左"]]
+    },
+    {
+      "id": "pdf-p8-dns",
+      "category": "pdf-text",
+      "turns": ["連線 Thingsquare cloud 時為什麼自動註冊失敗？最後手動輸入了哪個 IP？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [8] },
+      "mustInclude": [["8.8.8.8", "防火牆", "firewall", "DNS"], ["54.247.103.86"]]
+    },
+    {
+      "id": "pdf-p10-il050",
+      "category": "pdf-text",
+      "turns": ["伺服器 IL050 上執行了哪些 JADE 服務？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [10] },
+      "mustInclude": [["DF", "Directory Facility"], ["AMS", "Agent Management Service"]]
+    },
+    {
+      "id": "pdf-p12-contract-net",
+      "category": "pdf-text",
+      "turns": ["Contract-Net 範例最後選中哪一個 PrintingFacilityAgent？依據是什麼？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [11, 12] },
+      "mustInclude": [["PrintingFacilityAgent2", "Agent2"], ["35"]]
+    },
+    {
+      "id": "pdf-p13-jiac",
+      "category": "pdf-text",
+      "turns": ["JIAC 提供了哪些開發、設定與監控工具？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [13] },
+      "mustInclude": [["VSDT"], ["Asguard"], ["AWE", "Agent World Editor"], ["Toolipse"]]
+    },
+    {
+      "id": "pdf-p14-reference",
+      "category": "pdf-text",
+      "turns": ["參考文獻 [7] 的 JADE 是由哪個單位發布的？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [14] },
+      "mustInclude": [["Telecom Italia"]]
+    },
+    {
+      "id": "pdf-follow-up",
+      "category": "multi-turn",
+      "turns": [
+        "Contract-Net 範例中，OrderingAgent 把 call for proposals 發給了哪些代理？",
+        "最後是其中哪一個被選中？"
+      ],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [11, 12] },
+      "mustInclude": [["PrintingFacilityAgent2", "Agent2"]]
+    },
+    {
+      "id": "docx-prod",
+      "category": "docx",
+      "turns": ["維護報告表格中，prod 環境的上傳數與失敗數各是多少？"],
+      "source": { "filename": "iiot_maintenance_report.docx", "pages": [1] },
+      "mustInclude": [["812"], ["7"]]
+    },
+    {
+      "id": "docx-staging",
+      "category": "docx",
+      "turns": ["維護報告表格中，staging 環境的上傳數與失敗數各是多少？"],
+      "source": { "filename": "iiot_maintenance_report.docx", "pages": [1] },
+      "mustInclude": [["142"], ["3"]]
+    },
+    {
+      "id": "xlsx-ssd",
+      "category": "xlsx",
+      "turns": ["感測器盤點表裡 Backup SSD 的 SKU 與數量是多少？"],
+      "source": { "filename": "iiot_sensor_inventory.xlsx", "pages": [1] },
+      "mustInclude": [["DB-003"], ["9"]]
+    },
+    {
+      "id": "xlsx-vendor",
+      "category": "xlsx",
+      "turns": ["盤點表的供應商清單中，Contoso 屬於哪個區域、狀態是什麼？"],
+      "source": { "filename": "iiot_sensor_inventory.xlsx", "pages": [2] },
+      "mustInclude": [["EU", "歐"], ["review", "審查", "審核"]]
+    },
+    {
+      "id": "pptx-content",
+      "category": "pptx",
+      "turns": ["智慧工廠簡報 iiot_smart_factory_briefing.pptx 的投影片內容是什麼？"],
+      "source": { "filename": "iiot_smart_factory_briefing.pptx", "pages": [1] },
+      "mustInclude": [["Lorem", "佔位", "預留", "placeholder", "拉丁"]]
+    },
+    {
+      "id": "eml-subject",
+      "category": "eml",
+      "turns": ["設備告警郵件的主旨是什麼？由哪個信箱寄出？"],
+      "source": { "filename": "iiot_sensor_alert.eml", "pages": [null] },
+      "mustInclude": [["Parser regression", "ZIP"], ["support@samplefile.test"]]
+    },
+    {
+      "id": "eml-report",
+      "category": "eml",
+      "turns": ["告警郵件中客戶回報了哪些狀況？"],
+      "source": { "filename": "iiot_sensor_alert.eml", "pages": [null] },
+      "mustInclude": [["Preview", "預覽"], ["manifest"]]
+    },
+    {
+      "id": "eml-attachment",
+      "category": "eml",
+      "turns": ["告警郵件附件的檔名是什麼？"],
+      "source": { "filename": "iiot_sensor_alert.eml", "pages": [null] },
+      "mustInclude": [["incident_summary.csv"]]
+    },
+    {
+      "id": "stp-software",
+      "category": "stp",
+      "turns": ["負載元的 STEP 檔是用什麼 CAD 軟體匯出的？"],
+      "source": { "filename": "iiot_load_cell_sensor.stp", "pages": [null] },
+      "mustInclude": [["SolidWorks"]]
+    },
+    {
+      "id": "stp-part",
+      "category": "stp",
+      "turns": ["負載元 STEP 檔裡的零件名稱是什麼？"],
+      "source": { "filename": "iiot_load_cell_sensor.stp", "pages": [null] },
+      "mustInclude": [["DBBSMM"]]
+    },
+    {
+      "id": "jpg-brand",
+      "category": "image",
+      "turns": ["工廠機器人照片中的橘色機械手臂是哪個品牌？"],
+      "source": { "filename": "iiot_factory_robot.jpg", "pages": [1] },
+      "mustInclude": [["KUKA"]]
+    },
+    {
+      "id": "jpg-task",
+      "category": "image",
+      "turns": ["工廠機器人照片中，機械手臂在搬運什麼東西？"],
+      "source": { "filename": "iiot_factory_robot.jpg", "pages": [1] },
+      "mustInclude": [["麵包", "bread", "箱", "籃", "crate"]]
+    },
+    {
+      "id": "png-logo",
+      "category": "image",
+      "turns": ["壓鑄機照片的廠房牆面上可以看到哪個廠商的標誌？"],
+      "source": { "filename": "iiot_giga_press.png", "pages": [1] },
+      "mustInclude": [["IDRA"]]
+    },
+    {
+      "id": "png-arm-color",
+      "category": "image",
+      "turns": ["壓鑄機照片中的工業機器人手臂是什麼顏色？"],
+      "source": { "filename": "iiot_giga_press.png", "pages": [1] },
+      "mustInclude": [["紅", "red"]]
+    },
+    {
+      "id": "nf-budget",
+      "category": "not-found",
+      "turns": ["IoT4Industry 專案的總預算是多少歐元？"],
+      "notFound": true,
+      "mustNotMatch": ["\\d[\\d,.]*\\s*(萬|歐元|EUR|€)"]
+    },
+    {
+      "id": "nf-vendor-phone",
+      "category": "not-found",
+      "turns": ["供應商 Northwind 的聯絡電話是多少？"],
+      "notFound": true,
+      "mustNotMatch": ["\\d{2,4}[-\\s]\\d{3,4}[-\\s]?\\d{3,4}"]
+    },
+    {
+      "id": "nf-press-tonnage",
+      "category": "not-found",
+      "turns": ["照片中的 Giga Press 壓鑄機鎖模力是多少噸？"],
+      "notFound": true,
+      "mustNotMatch": ["\\d[\\d,]{2,}\\s*(噸|公噸|tons?\\b|t\\b)"]
+    },
+    {
+      "id": "nf-robot-payload",
+      "category": "not-found",
+      "turns": ["照片中 KUKA 機械手臂的最大負載是多少公斤？"],
+      "notFound": true,
+      "mustNotMatch": ["\\d+\\s*(公斤|kg)"]
+    },
+    {
+      "id": "nf-zip-size",
+      "category": "not-found",
+      "turns": ["告警郵件提到的 ZIP 檔案大小是多少 MB？"],
+      "notFound": true,
+      "mustNotMatch": ["\\d+(\\.\\d+)?\\s*(MB|GB|KB)"]
+    },
+    {
+      "id": "nf-out-of-domain",
+      "category": "not-found",
+      "turns": ["台積電 2025 年的營收是多少？"],
+      "notFound": true,
+      "mustNotMatch": ["\\d[\\d,.]*\\s*(億|兆|美元|新台幣)"]
+    },
+    {
+      "id": "catalog",
+      "category": "catalog",
+      "turns": ["知識庫目前有哪些文件？"],
+      "catalog": true
+    }
+  ]
+}

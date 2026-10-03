@@ -54,6 +54,8 @@ rsync -a --exclude .venv deploy/mac-mini/ knowva-mac:knowva-inference/app/
 - 改設定：改 `launchd/*.plist` 後同步過去，再跑一次 `install-services.sh`。
 - 網頁：<https://knowva-mac.laysi.io>，**完全公開、沒有登入**，任何拿到網址的人都能上傳、刪除、提問（擁有者 2026-10-02 決定）。要收回時刪掉 `config.yml` 的那條 ingress 或 DNS 記錄即可。
 - 不經 Cloudflare 時：`ssh -L 8080:127.0.0.1:8080 knowva-mac`，再開 <http://127.0.0.1:8080>。
+- 驗收：把 `example_file/` 複製到這台後跑 `bun bench/examples.ts --files <目錄> --replace --db-container knowva-postgres-1`。它會重新上傳全部範例，新的一份就緒後才刪掉同名的舊上傳（被拒或失敗時保留舊的），檢查頁數與哪些頁送圖，再問 `bench/examples.json` 的題目。每題要取回並引用正確的來源，答案也要有指定的關鍵字；任何一項檢查失敗就以非 0 結束。
+- 真實文件驗收：`bun bench/examples.ts --dataset bench/realistic.json --fetch --files <目錄> --db-container knowva-postgres-1`。`bench/realistic.json` 列的是政府與開源專案公開的 PDF、掃描 PDF、DOCX、XLSX、PPTX、海報與 Markdown，repo 只存網址與 sha256；`--fetch` 會下載缺少的檔案；每個檔案上傳前都會驗 sha256，雜湊不符就停止，上傳的就是驗過的那份內容。
 
 ## 已知問題
 
