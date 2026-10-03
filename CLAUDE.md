@@ -4,7 +4,7 @@ This file provides repository guidance for coding agents.
 
 ## Project
 
-Demo of a general-purpose AI knowledge-management system. For the active MVP, all inference runs on an on-premise service reached over configured HTTP endpoints, and the model families are fixed: Gemma 4 for chat/multimodal reading, `llama-nemotron-embed-vl-1b-v2` for embeddings, and `llama-nemotron-rerank-vl-1b-v2` for reranking. Do not add in-process inference or provider-specific SDK paths; a different service is a URL change.
+General-purpose AI knowledge-management service built for enterprise on-premise deployment. Production inference runs on an on-premise service reached over configured HTTP endpoints; during development and testing the same endpoints may point at a hosted OpenAI-compatible service. The model families are fixed: Gemma 4 for chat/multimodal reading, `llama-nemotron-embed-vl-1b-v2` for embeddings, and `llama-nemotron-rerank-vl-1b-v2` for reranking. Do not add in-process inference or provider-specific SDK paths; a different service is a URL change.
 
 The specification priority is the active GitHub issue, then tracker issue #1, then `docs/mvp-now.md`. Keep implementations simple: no auth, no job queue, and chat history remains in frontend state.
 
@@ -37,7 +37,7 @@ The backend requires a confirmed `GEMMA_4_MODEL_ID` and `MODEL_BASE_URL` (unless
 
 ## Cloud model safety
 
-- Model traffic goes to a self-hosted inference service over the OpenAI-compatible chat/embeddings routes and the NVIDIA ranking route; there are no hosted-provider endpoint defaults. Endpoints are configuration, so no URL is hardcoded and no hosted gateway is required.
+- Model traffic goes to the configured inference service (on-premise in production, optionally hosted during development) over the OpenAI-compatible chat/embeddings routes and the NVIDIA ranking route; there are no hosted-provider endpoint defaults. Endpoints are configuration, so no URL is hardcoded and no hosted gateway is required.
 - `MODEL_API_TOKEN` is optional and sent as a standard `Authorization: Bearer` header; when it is empty no authorization header is sent at all.
 - Parse model configuration before connecting to the database so missing settings/model IDs fail before traffic is accepted.
 - Logs may include endpoint and model ID, never the API token or request auth headers.
