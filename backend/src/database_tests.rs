@@ -232,8 +232,8 @@ async fn insert_text_unit(
 ) -> sqlx::Result<i64> {
     sqlx::query_scalar(
         "INSERT INTO document_units \
-         (document_id, kind, unit_index, content, embedding) \
-         VALUES ($1, 'text', $2, $3, $4) RETURNING id",
+         (document_id, kind, unit_index, content, needs_vision, embedding) \
+         VALUES ($1, 'text', $2, $3, false, $4) RETURNING id",
     )
     .bind(document_id)
     .bind(unit_index)
@@ -253,8 +253,9 @@ async fn insert_page_unit(
 ) -> sqlx::Result<i64> {
     sqlx::query_scalar(
         "INSERT INTO document_units \
-         (document_id, kind, unit_index, page_number, content, image_path, embedding) \
-         VALUES ($1, 'page', $2, $3, $4, $5, $6) RETURNING id",
+         (document_id, kind, unit_index, page_number, content, image_path, needs_vision, \
+          embedding) \
+         VALUES ($1, 'page', $2, $3, $4, $5, true, $6) RETURNING id",
     )
     .bind(document_id)
     .bind(unit_index)
@@ -390,14 +391,220 @@ async fn migration_invalidates_legacy_vectors_but_preserves_documents(
 }
 
 #[sqlx::test]
+async fn page_vision_columns_have_no_default_and_require_text_when_text_only(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    for table in ["page_artifacts", "document_units"] {
+        let (default, nullable): (Option<String>, String) = sqlx::query_as(
+            "SELECT column_default, is_nullable FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1 \
+               AND column_name = 'needs_vision'",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            default, None,
+            "{table}.needs_vision must be stated on every write"
+        );
+        assert_eq!(nullable, "NO");
+    }
+
+    let document_id = insert_document(&pool, "processing").await?;
+    sqlx::query(
+        "INSERT INTO document_artifact_sets \
+         (document_id, source_kind, artifact_dir, manifest_path) \
+         VALUES ($1, 'pdf', '/files/run', '/files/run/manifest.json')",
+    )
+    .bind(document_id)
+    .execute(&pool)
+    .await?;
+    for (statement, accepted) in [
+        (
+            "INSERT INTO page_artifacts (document_id, page_number, image_path, width, height) \
+             VALUES ($1, 1, '/p/1.png', 1, 1)",
+            false,
+        ),
+        (
+            "INSERT INTO page_artifacts \
+             (document_id, page_number, image_path, width, height, needs_vision) \
+             VALUES ($1, 1, '/p/1.png', 1, 1, false)",
+            false,
+        ),
+        (
+            "INSERT INTO page_artifacts \
+             (document_id, page_number, image_path, width, height, extracted_text, needs_vision) \
+             VALUES ($1, 1, '/p/1.png', 1, 1, '  ', false)",
+            false,
+        ),
+        (
+            "INSERT INTO page_artifacts \
+             (document_id, page_number, image_path, width, height, extracted_text, needs_vision) \
+             VALUES ($1, 1, '/p/1.png', 1, 1, 'table text', false)",
+            true,
+        ),
+        (
+            "INSERT INTO page_artifacts \
+             (document_id, page_number, image_path, width, height, needs_vision) \
+             VALUES ($1, 2, '/p/2.png', 1, 1, true)",
+            true,
+        ),
+    ] {
+        let result = sqlx::query(statement)
+            .bind(document_id)
+            .execute(&pool)
+            .await;
+        assert_eq!(result.is_ok(), accepted, "{statement}: {result:?}");
+    }
+
+    let embedding = vector_with(&[(0, 1.0)]);
+    for (statement, accepted) in [
+        (
+            "INSERT INTO document_units (document_id, kind, unit_index, content, embedding) \
+             VALUES ($1, 'text', 0, 'chunk', $2)",
+            false,
+        ),
+        (
+            "INSERT INTO document_units \
+             (document_id, kind, unit_index, content, needs_vision, embedding) \
+             VALUES ($1, 'text', 0, 'chunk', true, $2)",
+            false,
+        ),
+        (
+            "INSERT INTO document_units \
+             (document_id, kind, unit_index, page_number, image_path, needs_vision, embedding) \
+             VALUES ($1, 'page', 0, 1, '/p/1.png', false, $2)",
+            false,
+        ),
+        (
+            "INSERT INTO document_units \
+             (document_id, kind, unit_index, page_number, content, image_path, needs_vision, \
+              embedding) \
+             VALUES ($1, 'page', 0, 1, ' ', '/p/1.png', false, $2)",
+            false,
+        ),
+        (
+            "INSERT INTO document_units \
+             (document_id, kind, unit_index, page_number, content, image_path, needs_vision, \
+              embedding) \
+             VALUES ($1, 'page', 0, 1, 'table text', '/p/1.png', false, $2)",
+            true,
+        ),
+        (
+            "INSERT INTO document_units \
+             (document_id, kind, unit_index, page_number, image_path, needs_vision, embedding) \
+             VALUES ($1, 'page', 1, 2, '/p/2.png', true, $2)",
+            true,
+        ),
+    ] {
+        let result = sqlx::query(statement)
+            .bind(document_id)
+            .bind(&embedding)
+            .execute(&pool)
+            .await;
+        assert_eq!(result.is_ok(), accepted, "{statement}: {result:?}");
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+async fn page_vision_migration_keeps_existing_pages_on_the_image_path(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    for migration in [
+        include_str!("../migrations/0001_init.sql"),
+        include_str!("../migrations/0002_page_units_halfvec.sql"),
+        include_str!("../migrations/0003_ingest_artifacts.sql"),
+        include_str!("../migrations/0004_hybrid_retrieval.sql"),
+        include_str!("../migrations/0005_allow_binary_artifacts.sql"),
+        include_str!("../migrations/0006_storage_settings.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(&pool).await?;
+    }
+
+    let document_id = insert_document(&pool, "ready").await?;
+    sqlx::query(
+        "INSERT INTO document_artifact_sets \
+         (document_id, source_kind, artifact_dir, manifest_path) \
+         VALUES ($1, 'pdf', '/files/run', '/files/run/manifest.json')",
+    )
+    .bind(document_id)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO page_artifacts \
+         (document_id, page_number, image_path, width, height, extracted_text) \
+         VALUES ($1, 1, '/files/run/pages/0001.png', 10, 10, 'legacy page text')",
+    )
+    .bind(document_id)
+    .execute(&pool)
+    .await?;
+    let embedding = vector_with(&[(0, 1.0)]);
+    sqlx::query(
+        "INSERT INTO document_units \
+         (document_id, kind, unit_index, page_number, content, image_path, embedding) \
+         VALUES ($1, 'page', 0, 1, 'legacy page text', '/files/run/pages/0001.png', $2)",
+    )
+    .bind(document_id)
+    .bind(&embedding)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO document_units (document_id, kind, unit_index, content, embedding) \
+         VALUES ($1, 'text', 0, 'legacy chunk', $2)",
+    )
+    .bind(document_id)
+    .bind(&embedding)
+    .execute(&pool)
+    .await?;
+    let stats_before: (i64, i64) = sqlx::query_as(
+        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    sqlx::raw_sql(include_str!("../migrations/0007_page_vision.sql"))
+        .execute(&pool)
+        .await?;
+
+    let page_artifact_vision: bool =
+        sqlx::query_scalar("SELECT needs_vision FROM page_artifacts WHERE document_id = $1")
+            .bind(document_id)
+            .fetch_one(&pool)
+            .await?;
+    assert!(page_artifact_vision);
+    let units: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT kind, needs_vision, retrieval_ready FROM document_units \
+         WHERE document_id = $1 ORDER BY kind",
+    )
+    .bind(document_id)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        units,
+        vec![
+            ("page".to_string(), true, true),
+            ("text".to_string(), false, true),
+        ]
+    );
+    let stats_after: (i64, i64) = sqlx::query_as(
+        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stats_after, stats_before);
+    Ok(())
+}
+
+#[sqlx::test]
 async fn unit_constraints_dimensions_and_cascade_are_enforced(pool: PgPool) -> anyhow::Result<()> {
     let document_id = insert_document(&pool, "processing").await?;
     let embedding = vector_with(&[(0, 1.0)]);
 
     sqlx::query(
         "INSERT INTO document_units \
-         (document_id, kind, unit_index, page_number, image_path, embedding) \
-         VALUES ($1, 'page', 0, 1, '/pages/1.png', $2)",
+         (document_id, kind, unit_index, page_number, image_path, needs_vision, embedding) \
+         VALUES ($1, 'page', 0, 1, '/pages/1.png', true, $2)",
     )
     .bind(document_id)
     .bind(&embedding)
@@ -407,8 +614,8 @@ async fn unit_constraints_dimensions_and_cascade_are_enforced(pool: PgPool) -> a
 
     let page_zero = sqlx::query(
         "INSERT INTO document_units \
-         (document_id, kind, unit_index, page_number, image_path, embedding) \
-         VALUES ($1, 'page', 1, 0, '/pages/0.png', $2)",
+         (document_id, kind, unit_index, page_number, image_path, needs_vision, embedding) \
+         VALUES ($1, 'page', 1, 0, '/pages/0.png', true, $2)",
     )
     .bind(document_id)
     .bind(&embedding)
@@ -418,8 +625,8 @@ async fn unit_constraints_dimensions_and_cascade_are_enforced(pool: PgPool) -> a
 
     let page_without_number = sqlx::query(
         "INSERT INTO document_units \
-         (document_id, kind, unit_index, image_path, embedding) \
-         VALUES ($1, 'page', 1, '/pages/missing-number.png', $2)",
+         (document_id, kind, unit_index, image_path, needs_vision, embedding) \
+         VALUES ($1, 'page', 1, '/pages/missing-number.png', true, $2)",
     )
     .bind(document_id)
     .bind(&embedding)
@@ -429,8 +636,8 @@ async fn unit_constraints_dimensions_and_cascade_are_enforced(pool: PgPool) -> a
 
     let page_without_image = sqlx::query(
         "INSERT INTO document_units \
-         (document_id, kind, unit_index, page_number, embedding) \
-         VALUES ($1, 'page', 1, 2, $2)",
+         (document_id, kind, unit_index, page_number, needs_vision, embedding) \
+         VALUES ($1, 'page', 1, 2, true, $2)",
     )
     .bind(document_id)
     .bind(&embedding)
@@ -440,8 +647,8 @@ async fn unit_constraints_dimensions_and_cascade_are_enforced(pool: PgPool) -> a
 
     let text_without_content = sqlx::query(
         "INSERT INTO document_units \
-         (document_id, kind, unit_index, embedding) \
-         VALUES ($1, 'text', 1, $2)",
+         (document_id, kind, unit_index, needs_vision, embedding) \
+         VALUES ($1, 'text', 1, false, $2)",
     )
     .bind(document_id)
     .bind(&embedding)
@@ -451,8 +658,8 @@ async fn unit_constraints_dimensions_and_cascade_are_enforced(pool: PgPool) -> a
 
     let duplicate_page_number = sqlx::query(
         "INSERT INTO document_units \
-         (document_id, kind, unit_index, page_number, image_path, embedding) \
-         VALUES ($1, 'page', 1, 1, '/pages/duplicate.png', $2)",
+         (document_id, kind, unit_index, page_number, image_path, needs_vision, embedding) \
+         VALUES ($1, 'page', 1, 1, '/pages/duplicate.png', true, $2)",
     )
     .bind(document_id)
     .bind(&embedding)
@@ -466,8 +673,8 @@ async fn unit_constraints_dimensions_and_cascade_are_enforced(pool: PgPool) -> a
     let wrong_dimensions = HalfVector::from_f32_slice(&vec![0.0; 1024]);
     let dimension_error = sqlx::query(
         "INSERT INTO document_units \
-         (document_id, kind, unit_index, content, embedding) \
-         VALUES ($1, 'text', 2, 'wrong dimension', $2)",
+         (document_id, kind, unit_index, content, needs_vision, embedding) \
+         VALUES ($1, 'text', 2, 'wrong dimension', false, $2)",
     )
     .bind(document_id)
     .bind(wrong_dimensions)
@@ -506,18 +713,18 @@ async fn artifact_staging_constraints_are_enforced_without_weakening_halfvec(
     .await?;
     sqlx::query(
         "INSERT INTO page_artifacts \
-         (document_id, page_number, image_path, width, height) \
-         VALUES ($1, 1, '/files/run/pages/0001.png', 100, 200)",
+         (document_id, page_number, image_path, width, height, needs_vision) \
+         VALUES ($1, 1, '/files/run/pages/0001.png', 100, 200, true)",
     )
     .bind(document_id)
     .execute(&pool)
     .await?;
 
     for statement in [
-        "INSERT INTO page_artifacts (document_id, page_number, image_path, width, height) VALUES ($1, 0, '/bad.png', 1, 1)",
-        "INSERT INTO page_artifacts (document_id, page_number, image_path, width, height) VALUES ($1, 2, '', 1, 1)",
-        "INSERT INTO page_artifacts (document_id, page_number, image_path, width, height) VALUES ($1, 2, '/bad.png', 0, 1)",
-        "INSERT INTO page_artifacts (document_id, page_number, image_path, width, height) VALUES ($1, 1, '/duplicate.png', 1, 1)",
+        "INSERT INTO page_artifacts (document_id, page_number, image_path, width, height, needs_vision) VALUES ($1, 0, '/bad.png', 1, 1, true)",
+        "INSERT INTO page_artifacts (document_id, page_number, image_path, width, height, needs_vision) VALUES ($1, 2, '', 1, 1, true)",
+        "INSERT INTO page_artifacts (document_id, page_number, image_path, width, height, needs_vision) VALUES ($1, 2, '/bad.png', 0, 1, true)",
+        "INSERT INTO page_artifacts (document_id, page_number, image_path, width, height, needs_vision) VALUES ($1, 1, '/duplicate.png', 1, 1, true)",
     ] {
         assert!(
             sqlx::query(statement)
@@ -1113,8 +1320,8 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
     .await?;
     sqlx::query(
         "INSERT INTO page_artifacts \
-         (document_id, page_number, image_path, width, height, extracted_text) \
-         VALUES ($1, 1, $2, 640, 480, 'native text')",
+         (document_id, page_number, image_path, width, height, extracted_text, needs_vision) \
+         VALUES ($1, 1, $2, 640, 480, 'native text', true)",
     )
     .bind(document_id)
     .bind(&page_path)
@@ -1124,8 +1331,8 @@ async fn document_list_and_delete_api_use_the_new_schema(pool: PgPool) -> anyhow
     let embedding = vector_with(&[(0, 1.0)]);
     sqlx::query(
         "INSERT INTO document_units \
-         (document_id, kind, unit_index, page_number, image_path, embedding) \
-         VALUES ($1, 'page', 0, 1, $2, $3)",
+         (document_id, kind, unit_index, page_number, image_path, needs_vision, embedding) \
+         VALUES ($1, 'page', 0, 1, $2, true, $3)",
     )
     .bind(document_id)
     .bind(&page_path)
@@ -1585,11 +1792,12 @@ async fn page_image_and_text_are_promoted_to_one_matching_halfvec_unit(
         width: 16,
         height: 9,
         extracted_text: Some("native same-page text".to_string()),
+        needs_vision: true,
     };
     sqlx::query(
         "INSERT INTO page_artifacts \
-         (document_id, page_number, image_path, width, height, extracted_text) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         (document_id, page_number, image_path, width, height, extracted_text, needs_vision) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(document_id)
     .bind(page.page_number)
@@ -1597,6 +1805,7 @@ async fn page_image_and_text_are_promoted_to_one_matching_halfvec_unit(
     .bind(page.width)
     .bind(page.height)
     .bind(&page.extracted_text)
+    .bind(page.needs_vision)
     .execute(&pool)
     .await?;
 
@@ -1644,6 +1853,103 @@ async fn page_image_and_text_are_promoted_to_one_matching_halfvec_unit(
             .expect("mixed input string");
         assert!(input.starts_with("native same-page text\n<img src=\"data:image/png;base64,"));
         assert!(!input.contains(&page_path));
+    }
+
+    server.abort();
+    Ok(())
+}
+
+#[sqlx::test]
+async fn text_only_page_is_promoted_from_text_without_reading_its_image(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    // The page image is deliberately absent: a text-only page must not read it.
+    let storage = Storage::memory();
+    let document_id = Uuid::new_v4();
+    let artifact_dir = format!("{document_id}/artifacts-fixture");
+    let page_path = format!("{artifact_dir}/pages/0001.png");
+    let original_key = format!("{document_id}/original.pdf");
+    storage.put(&original_key, b"fixture".to_vec()).await?;
+    sqlx::query(
+        "INSERT INTO documents \
+         (id, filename, storage_path, mime_type, status, artifact_status) \
+         VALUES ($1, 'tables.pdf', $2, 'application/pdf', 'processing', 'ready')",
+    )
+    .bind(document_id)
+    .bind(&original_key)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO document_artifact_sets \
+         (document_id, source_kind, artifact_dir, manifest_path) \
+         VALUES ($1, 'pdf', $2, $3)",
+    )
+    .bind(document_id)
+    .bind(&artifact_dir)
+    .bind(format!("{artifact_dir}/manifest.json"))
+    .execute(&pool)
+    .await?;
+    let page = crate::page_artifacts::PageArtifact {
+        document_id,
+        page_number: 1,
+        image_path: page_path.clone(),
+        width: 16,
+        height: 9,
+        extracted_text: Some("IL050 deployment table".to_string()),
+        needs_vision: false,
+    };
+    sqlx::query(
+        "INSERT INTO page_artifacts \
+         (document_id, page_number, image_path, width, height, extracted_text, needs_vision) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(document_id)
+    .bind(page.page_number)
+    .bind(&page.image_path)
+    .bind(page.width)
+    .bind(page.height)
+    .bind(&page.extracted_text)
+    .bind(page.needs_vision)
+    .execute(&pool)
+    .await?;
+
+    let (models, mock, server) = spawn_embedding_mock(false).await;
+    let state = test_state(&pool, models, storage);
+    crate::ingest::embed_published_artifacts_for_test(&state, document_id, &[page], &[])
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let status: String = sqlx::query_scalar("SELECT status FROM documents WHERE id = $1")
+        .bind(document_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(status, "ready");
+    let unit: (String, i32, Option<String>, String, bool) = sqlx::query_as(
+        "SELECT kind, page_number, content, image_path, needs_vision \
+         FROM document_units WHERE document_id = $1",
+    )
+    .bind(document_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        unit,
+        (
+            "page".to_string(),
+            1,
+            Some("IL050 deployment table".to_string()),
+            page_path,
+            false
+        )
+    );
+    {
+        let requests = mock.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["input_type"], "passage");
+        assert_eq!(requests[0]["modality"], serde_json::json!(["text"]));
+        assert_eq!(
+            requests[0]["input"],
+            serde_json::json!(["IL050 deployment table"])
+        );
     }
 
     server.abort();

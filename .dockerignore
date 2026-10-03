@@ -13,8 +13,10 @@ frontend/dist
 presentations
 
 # Nothing below is copied into any stage, and example_file alone is 32MB of
-# sample documents that would be sent to the builder on every build.
+# sample documents that would be sent to the builder on every build. The one
+# exception is the report the native-test stage checks page vision against.
 example_file
+!example_file/iiot_industry_report.pdf
 docs
 *.md
 docker-compose*.yml

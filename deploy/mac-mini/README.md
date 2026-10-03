@@ -16,7 +16,7 @@
 
 - **chat 模型 12B QAT**：26B-A4B 單獨就佔 20 GB，超過 GPU 可用的 17.8 GiB；和檢索模型同時存在時，編碼頁圖會 Metal OOM，回答為空。E2B 首字較快，但瓶頸是看圖，12B 只慢幾秒、品質高一級。QAT 比 q4_K_M 解碼慢（17 對 24 tok/s），但它是 Google 針對 int4 訓練的版本，品質較接近原始權重，檔案也較小。
 - **頁圖縮到長邊 1280 再給 Gemma**（`KM_CHAT_IMAGE_MAX_SIDE`）：Gemma 4 的圖片 token 跟像素成正比，後端送的 1600px 一頁約 860 tokens，佔首字延遲三分之二。1280 時一頁約 570 tokens，6 頁的首字延遲從約 22s 降到約 19s；768 已經會把「IL050」讀成「11050」。縮圖是決定性的，相同的 prompt 仍命中 prompt cache。
-- **Rerank 用圖 + 文、1 tile**（`KM_RERANK_TILES=1`）：50 筆候選從 57s（6 tiles）降到 12.6s，最相關的頁仍排第一（只量一題）。只用文字更快（4.9s），但掃描頁與圖表頁會失去影像訊號。
+- **Rerank 用圖 + 文、1 tile**（`KM_RERANK_TILES=1`）：50 筆候選從 57s（6 tiles）降到 12.6s，最相關的頁仍排第一（只量一題）。只用文字更快（4.9s），但掃描頁與圖表頁會失去影像訊號。後端從 #38 起逐頁決定送不送圖（`needs_vision`），文字頁本來就只送文字，所以 `KM_RERANK_INPUT` 維持 `both`；設成 `text` 會連需要看圖的頁也拿掉圖。
 - **Embed / Rerank 閒置 10 分鐘才卸載**（`KM_IDLE_SECS=600`）：每題都卸載實測是虧的。Gemma 常駐時權重會被擠出檔案快取，每次重新載入 embed 4–5s、rerank 約 5s，比省下的 Gemma prefill（4–5s）還多；對話中兩個模型保持載入，第 2、3 輪首字從 39–44s 降到 30s。沒人用 10 分鐘後歸還約 6 GB。
 - **Ollama prompt cache 上限 2 GB**（`LLAMA_ARG_CACHE_RAM`）：預設 8 GB，llama-server 實體佔用 10.8 GB，是 swap 的主因；2 GB 時 3.3 GB，仍保留最近約兩份 prompt 給追問；交替 A/B 量不出速度差。Gemma 4 sliding-window 層的 context checkpoint 每個 320 MB、預設上限 32，同理設 `LLAMA_ARG_CTX_CHECKPOINTS=4`。
 - **Ollama context 16384、flash attention 開、`keep_alive=-1`**：6 頁 prompt 有 7–9K tokens，預設 4096 會截斷；FA 讓 12B 解碼 15.5→17.2 tok/s；模型常駐省掉每題 3s 載入。

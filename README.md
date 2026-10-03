@@ -14,7 +14,7 @@
 | 向量嵌入 | `nvidia/llama-nemotron-embed-vl-1b-v2`，輸出 2048 維 float embedding |
 | 精排 | `nvidia/llama-nemotron-rerank-vl-1b-v2` |
 
-後端保留 OpenAI-compatible `/chat/completions` SSE，並提供 typed embedding 與 reranking client。頁面化 ingestion 先以模型無關的 artifact staging 產生可追蹤頁圖或標題感知文字單元，再用固定 Nemotron Embed VL 建立同一個 `halfvec(2048)` 檢索空間：文字 query 使用 `query/text`，MD/TXT 使用 `passage/text`，無文字層頁面使用 `passage/image`，有同頁文字時使用 `passage/text_image`。查詢會各取 dense 50 筆與文字 BM25 50 筆，再以 deterministic RRF 融合；沒有文字層的掃描頁仍可由 dense 路徑召回。
+後端保留 OpenAI-compatible `/chat/completions` SSE，並提供 typed embedding 與 reranking client。頁面化 ingestion 先以模型無關的 artifact staging 產生可追蹤頁圖或標題感知文字單元，再用固定 Nemotron Embed VL 建立同一個 `halfvec(2048)` 檢索空間：文字 query 使用 `query/text`，MD/TXT 與文字層足以代表整頁的頁面（`needs_vision = false`）使用 `passage/text`，其餘頁面中無文字層者使用 `passage/image`、有同頁文字者使用 `passage/text_image`。每頁要不要送圖只在轉檔時判斷一次，之後 embedding、rerank、回答與摘要都依同一個結果，見「頁面是否送圖」。查詢會各取 dense 50 筆與文字 BM25 50 筆，再以 deterministic RRF 融合；沒有文字層的掃描頁仍可由 dense 路徑召回。
 
 ## 技術架構
 
@@ -161,7 +161,7 @@ docker compose down
 docker compose --profile minio up -d --build
 ```
 
-若要在 build 階段實際驗證 Pdfium 與 LibreOffice 對 PDF、掃描 PDF、DOCX、PPTX、XLSX 的分頁與頁序：
+若要在 build 階段實際驗證 Pdfium 與 LibreOffice 對 PDF、掃描 PDF、DOCX、PPTX、XLSX 的分頁、頁序與每頁是否送圖：
 
 ```bash
 docker build --target native-test -t knowva:native-test .
@@ -256,11 +256,33 @@ data: {"type":"done"}
 
 DB 欄位（`documents.storage_path`、`document_artifact_sets.*_path`／`artifact_dir`、`page_artifacts.image_path`、`document_units.image_path`）與 manifest 內容都存上述相對 key。讀取頁圖時 key 必須位於該文件的 `{document_id}/` 之下、不得含 `..` 或為絕對路徑，且在讀取內文前先檢查大小上限；錯誤訊息不含 key 或路徑。
 
-`page_artifacts` 保存 1-based `page_number`、圖片 key、尺寸與可空的 PDF 文字層；掃描頁沒有文字仍是有效頁面。極端 PDF MediaBox 仍依設定 DPI 縮放，但輸出單邊上限為 8192 px，避免 native bitmap 無界配置。MD/TXT 不製造假頁碼，改存 `text_artifacts`。artifact 發布完成後，每份文件最多同時處理四個 embedding unit；只有所有回應都恰為 2048 維 finite float、artifact 與 unit 計數一致，才在單一 transaction 內替換 `document_units` 並把文件設為 `ready`。任一 unit 失敗時已完成的 artifact 保持 `artifact_status=ready`，文件則為 `failed`，不會留下可搜尋的部分新結果。
+`page_artifacts` 保存 1-based `page_number`、圖片 key、尺寸、可空的 PDF 文字層與 `needs_vision`；掃描頁沒有文字仍是有效頁面。極端 PDF MediaBox 仍依設定 DPI 縮放，但輸出單邊上限為 8192 px，避免 native bitmap 無界配置。MD/TXT 不製造假頁碼，改存 `text_artifacts`。artifact 發布完成後，每份文件最多同時處理四個 embedding unit；只有所有回應都恰為 2048 維 finite float、artifact 與 unit 計數一致，才在單一 transaction 內替換 `document_units` 並把文件設為 `ready`。任一 unit 失敗時已完成的 artifact 保持 `artifact_status=ready`，文件則為 `failed`，不會留下可搜尋的部分新結果。
 
 頁圖只以記憶體中的 PNG/JPEG data URL 送出，不會傳送本機 artifact path；decoded image 上限 25 MiB、整體 embedding request 上限 36 MiB。Embedding 對 408、429、5xx、transport error 與 timeout 最多嘗試三次並使用 exponential backoff + jitter，其他 4xx 立即失敗。HTTP error snippet、API key、Authorization 與 base64 圖片資料都會在記錄前限長或遮蔽。
 
-所有 embedding 完成後，系統會以同一個雲端 Gemma 4 best-effort 產生繁中摘要與 3–6 個標籤：分頁文件固定只取前 3 頁，MD/TXT 固定只取前 3 個文字單元；每個文字單元最多 3000 字，每頁 extracted text 最多 2000 字，頁圖沿用最長邊 1600 px、JPEG quality 80、單一 serialized image part 5 MiB 與完整 chat request 24 MiB 的界線。輸出必須是 typed JSON，摘要非空且最多 500 字，每個唯一標籤非空且最多 30 字；只容許單一 code fence 或單一 JSON object 前後 chatter 的 JSON-aware salvage。暫時性錯誤最多兩次 summary request，malformed JSON 不重試；任一 summary 失敗都只記安全 warning，仍會把完整 embeddings 與 `ready` 在同一 transaction 發布，不會重跑 embedding。
+所有 embedding 完成後，系統會以同一個雲端 Gemma 4 best-effort 產生繁中摘要與 3–6 個標籤：分頁文件固定只取前 3 頁（只有 `needs_vision` 頁附圖），MD/TXT 固定只取前 3 個文字單元；每個文字單元最多 3000 字，每頁 extracted text 最多 2000 字，頁圖沿用最長邊 1600 px、JPEG quality 80、單一 serialized image part 5 MiB 與完整 chat request 24 MiB 的界線。輸出必須是 typed JSON，摘要非空且最多 500 字，每個唯一標籤非空且最多 30 字；只容許單一 code fence 或單一 JSON object 前後 chatter 的 JSON-aware salvage。暫時性錯誤最多兩次 summary request，malformed JSON 不重試；任一 summary 失敗都只記安全 warning，仍會把完整 embeddings 與 `ready` 在同一 transaction 發布，不會重跑 embedding。
+
+## 頁面是否送圖
+
+地端推理的成本幾乎都在圖片：在 Mac mini M6 上 rerank 50 筆候選圖 + 文 12.9s、純文字 4.9s；Gemma 首字附頁圖 21–23s、純文字 7–8.5s（`docs/measurements/README.md` §8）。多數頁面的圖沒有文字層以外的資訊，所以每頁在 Pdfium 轉圖時決定一次 `needs_vision`，存進 `page_artifacts`、`document_units` 與 manifest（migration `0007_page_vision.sql`）。判斷是決定性的、不呼叫模型，PDF 與 Office 轉出的 PDF 用同一套規則，門檻是 `backend/src/page_vision.rs` 的常數。
+
+下列任一成立即需要看圖，其餘頁面一律只送文字層：
+
+- 有效的非空白文字少於 20 字，或 U+FFFD、控制字元、Private Use Area 字元超過 5%（掃描頁、文字轉外框、缺 ToUnicode 的字型）。前後都是空白的單一 U+F000–U+F0FF 字元是 Wingdings／Symbol 的項目符號或圖示，兩邊都不算。
+- 除 Popup 與沒有外觀的 Link 以外的 annotation（印章、手寫、FreeText、表單欄位，以及帶 appearance stream 的 Link 會畫進頁圖但不在文字層）。
+- 每張至少佔頁面 0.5% 的點陣圖合計達 3%（小 logo 不算）。
+- 向量圖形合計達頁面 5% 或達 20 個：只算短邊至少 3pt、小於頁面 90%、不是近白色或透明的填色，以及含曲線、斜線或在旋轉矩陣下畫的筆畫；表格格線、外框、底線與整頁背景都不算。
+- 上面兩項都不算頁面家具：投影片母片的色帶與邊條、信頭、頁尾圖這類每頁都畫一樣的圖。同一份文件中，內容相同（點陣圖比原始串流；向量圖比路徑、變換矩陣、填色與筆畫）且位置相同（四捨五入到 1pt）的圖，出現在至少 3 頁且至少一半的頁面，就是家具候選。內容與位置相同仍可能畫成不同的樣子（`/Decode`、遮罩、裁切、翻轉、stencil 填色、疊在上面的其他圖），所以有候選的頁面會再用 72 dpi 轉一次圖，比對候選範圍內的像素；這些頁面的所有文字框位置先一律塗掉，寫在家具上的頁尾文字才不會讓它變成內容。候選範圍有 95% 以上被塗掉時沒東西可比，照算。看起來也相同的頁面同樣要達到 3 頁且一半的門檻才算家具。每份文件的轉圖與比對最多 3 億像素、文字框最多 200,000 個，超過或轉圖失敗時照算。佔頁面一半以上的點陣圖不會被當成家具，因為重複的整頁背景可能就是內容本身（例如填了不同資料的掃描表單）。
+- 不支援的物件、Pdfium 讀取錯誤、單頁超過 20,000 個物件或 form 巢狀超過 8 層。
+
+面積以 CropBox 為分母，form XObject 內的物件會套上外層矩陣再計算。頁面家具要看完整份文件才知道，所以轉完所有頁才逐頁決定。不確定時一律偏向看圖：誤判成看圖只多一次推理，誤判成文字頁會丟資訊。圖片上傳一律看圖。
+
+- 頁圖照常轉出與儲存（`image_path` 仍是 NOT NULL），只是文字頁不拿它推理，也不讀取它。
+- 文字頁的 embedding 是 `passage/text`；rerank passage 只有 `text`；回答 context 的 block 沒有 `page_image:` 行與圖片 part；摘要只送文字。SSE `sources` 仍是 `kind: page` 加頁碼。
+- Rerank 依「有圖／純文字」分組送 batch，每組內維持 RRF 順序；推論服務對同一個 request 只用一種 processor，混合會讓文字 passage 也付圖片成本。
+- 頁圖讀取失敗時，看圖頁照舊報錯，不會退回只送文字。
+- migration 前的頁面都是 `needs_vision = true`（它們的向量是用頁圖建的），重新處理後才套用新規則；不需要重建索引。
+- 入庫時每份文件記一行 info log（看圖頁數、文字頁數、原因），rerank 與回答也各記錄圖片與文字的筆數。
 
 ## Hybrid retrieval 契約
 
@@ -268,8 +290,8 @@ DB 欄位（`documents.storage_path`、`document_artifact_sets.*_path`／`artifa
 - Lexical 是標準 Okapi BM25，不使用 `ILIKE`、`ts_rank` 或 `ts_rank_cd`。公式參數固定 `k1=1.2`、`b=0.75`；migration `0004_hybrid_retrieval.sql` 以 trigger 維護 ready-only corpus 的文件數、總 token 數與每詞 DF，query 在 PostgreSQL 內計算 TF/IDF/長度正規化，不會把 corpus 載入 Rust。
 - Lexical candidate index 是 non-empty `content` 上的 ready-only partial GIN token-array index。tokenizer 先做 Unicode NFKC、lowercase 與 dash normalization；繁中採 character unigram + adjacent bigram，原因是不用可變字典也能重現、可涵蓋未知企業詞；英文、數字與產品代號保留完整 token，hyphenated code 另產 compact 與 component variants，讓全形／半形或常見標點差異不會讓基本詞失效。
 - RRF 固定 `k=60`，`rrf_score(d) = Σ 1 / (60 + rank_i(d))`。以 `unit_id` 去重；同分依最佳 route rank、`unit_id` 排序。兩路預設各 50，融合預設保留 50，再以固定 `llama-nemotron-rerank-vl-1b-v2` 精排成 top 6（可設 3–8）。
-- Page passage 只讀已發布 artifact：有文字層時送 image+text，掃描頁送 image-only（完全省略 `text`），MD/TXT chunk 送 text-only。物件 key 與本機路徑都不進 payload，圖片以有上限的並行讀取後只以記憶體 data URL 傳送；預設每批 8 筆，API 回應即使重排順序也依每批 local index 映回原 unit。
-- 每筆 `RetrievalCandidate` 直接帶 `unit_id`、0-based `unit_index`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、兩路 rank/score、`rrf_score` 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
+- Page passage 只讀已發布 artifact：`needs_vision` 頁有文字層時送 image+text，掃描頁送 image-only（完全省略 `text`）；文字頁與 MD/TXT chunk 送 text-only，不讀頁圖。物件 key 與本機路徑都不進 payload，圖片以有上限的並行讀取後只以記憶體 data URL 傳送；候選先依有圖／純文字分組，每組依 RRF 順序每批預設 8 筆，API 回應即使重排順序也依每批 local index 映回原 unit。
+- 每筆 `RetrievalCandidate` 直接帶 `unit_id`、0-based `unit_index`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、`needs_vision`、兩路 rank/score、`rrf_score` 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
 - Rerank 每批都嚴格驗證回應筆數、index 唯一且不越界、score finite，再驗證跨批映射。408、429、5xx、transport error 與 timeout 最多嘗試三次；耗盡後以原 RRF top_n 原序回退，且 rerank 欄位保持 null。設定、artifact 或 hosted response contract 錯誤不回退，會回傳可診斷錯誤。Structured log 僅記錄各階段筆數、延遲、fallback 與 model id，不含 query、文件內容、secret 或 base64。
 - context 區塊採追加式排列：`POST /api/chat` 的 `previousSources` 帶回上一輪答案的來源與順序，本輪仍檢索到的來源就留在原位、原順序，本輪新進的來源再依排名接在尾端。推論服務的 prompt cache 是前綴比對，唯有這種排列能把「追問檢索到重疊來源」穩定換成快取命中；來源完全沒變時整段 prompt（連同它後面的對話歷史）都會命中。沒有 `previousSources` 時（第一個問題、catalog、文件摘要）就直接照排名排列——最相關的來源最可能在下一輪續留，把它放在最前面，下一輪能重用的前綴才最長。`[S1]`..`[Sn]` 依版面位置連號並與 SSE `sources` 事件一致；payload 或完整 request 超限時仍是從排名最低的來源開始整筆移除，再重新編號。
 
@@ -380,7 +402,7 @@ proto run npm -- run test
 proto run npm -- run build
 ```
 
-一般測試以本機 mock cloud endpoint 驗證四種 embedding payload、三種 rerank modality、跨批映射、嚴格 response contract、有限重試／fallback 與 transaction/DB 契約，不會呼叫真實雲端。安裝 Pdfium 與 LibreOffice 後，可明確執行 native fixture smoke；它也會確認原生 PDF 使用 image+text embedding、掃描 PDF 使用 image-only embedding：
+一般測試以本機 mock cloud endpoint 驗證四種 embedding payload、三種 rerank modality、依 modality 分組的 batch、跨批映射、嚴格 response contract、有限重試／fallback 與 transaction/DB 契約，不會呼叫真實雲端。安裝 Pdfium 與 LibreOffice 後，可明確執行 native fixture smoke；它也會確認 Pdfium 的 image+text 與 image-only embedding payload，並逐頁檢查 `needs_vision` 判斷（含 `example_file/iiot_industry_report.pdf` 只有第 7 頁看圖）：
 
 ```bash
 cd backend
@@ -388,6 +410,7 @@ PDFIUM_LIBRARY_PATH=/path/to/libpdfium.so \
 LIBREOFFICE_BIN=libreoffice \
 proto exec rust -- cargo test -- --ignored --exact --nocapture --test-threads=1 \
   page_artifacts::tests::generated_pdf_and_office_fixtures_preserve_page_order \
+  page_artifacts::tests::page_vision_decisions_match_fixtures_and_the_example_report \
   ingest::tests::native_conversion_runs_in_scratch_and_publishes_relative_keys
 ```
 

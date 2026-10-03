@@ -4,6 +4,7 @@ mod embedding;
 pub mod evaluation;
 mod ingest;
 mod page_artifacts;
+mod page_vision;
 mod rag_context;
 mod search;
 mod storage;
@@ -461,6 +462,13 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
             return;
         }
     };
+    tracing::info!(
+        stage = "rag_context",
+        source_count = context.sources.len(),
+        image_count = context.image_count(),
+        catalog = catalog_query,
+        "RAG context prepared"
+    );
     let (content, sources) = context.into_parts();
 
     let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel::<SseEvent>(64);

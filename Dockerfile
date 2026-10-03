@@ -129,9 +129,12 @@ RUN triple="$(cat /triple)" \
          "target/$triple/debug/knowva-server"
 COPY backend/src ./src
 COPY backend/migrations ./migrations
+# The page-vision test checks the measured sample report page by page.
+COPY example_file/iiot_industry_report.pdf /src/example_file/iiot_industry_report.pdf
 RUN triple="$(cat /triple)" \
     && cargo test --locked --target "$triple" -- --ignored --exact --nocapture --test-threads=1 \
       page_artifacts::tests::generated_pdf_and_office_fixtures_preserve_page_order \
+      page_artifacts::tests::page_vision_decisions_match_fixtures_and_the_example_report \
       ingest::tests::native_conversion_runs_in_scratch_and_publishes_relative_keys
 
 FROM debian:bookworm-slim AS runtime

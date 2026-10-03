@@ -1,5 +1,9 @@
+use crate::page_vision::{
+    DocumentObservations, FurnitureRenderer, PageVision, VisionReason, assess_document,
+    observe_pdf_page,
+};
 use image::{DynamicImage, ImageDecoder, ImageFormat, Limits, metadata::Orientation};
-use pdfium_render::prelude::{PdfRenderConfig, Pdfium};
+use pdfium_render::prelude::{PdfPageIndex, PdfRenderConfig, Pdfium};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -164,6 +168,15 @@ pub struct PageArtifact {
     pub height: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extracted_text: Option<String>,
+    /// Whether model stages must see the page image; text-only pages are sent
+    /// as their text layer. Manifests written before this field existed were
+    /// built from page images, so they read as `true`.
+    #[serde(default = "manifest_page_needs_vision")]
+    pub needs_vision: bool,
+}
+
+fn manifest_page_needs_vision() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +203,7 @@ pub struct RenderedPage {
     pub width: i32,
     pub height: i32,
     pub extracted_text: Option<String>,
+    pub vision: PageVision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,7 +314,9 @@ fn render_pdf_blocking(
         .set_maximum_height(MAX_PDF_RENDER_DIMENSION)
         .render_form_data(true)
         .render_annotations(true);
-    let mut rendered_pages = Vec::with_capacity(document.pages().len() as usize);
+    let page_count = document.pages().len() as usize;
+    let mut rendered_pages = Vec::with_capacity(page_count);
+    let mut observations = DocumentObservations::with_capacity(page_count);
 
     for (index, page) in document.pages().iter().enumerate() {
         if cancelled.load(Ordering::Relaxed) {
@@ -342,6 +358,7 @@ fn render_pdf_blocking(
             .ok()
             .map(|text| text.all())
             .filter(|text| !text.trim().is_empty());
+        observations.push(observe_pdf_page(&page, extracted_text.as_deref()));
 
         rendered_pages.push(RenderedPage {
             page_number,
@@ -349,7 +366,58 @@ fn render_pdf_blocking(
             width,
             height,
             extracted_text,
+            // Replaced below once every page is observed; the placeholder
+            // fails toward sending the image.
+            vision: PageVision::vision(VisionReason::Unsupported),
         });
+    }
+
+    // Page furniture is only known once the whole document has been seen:
+    // pages that draw a repeated graphic are rendered again at 72 dpi, and
+    // only graphics that look the same on enough pages are furniture. A page
+    // that cannot be read again keeps no appearances, so its graphics count.
+    let repeated = observations.repeated();
+    let mut appearances = vec![Vec::new(); observations.pages().len()];
+    if !repeated.is_empty() {
+        let mut renderer = FurnitureRenderer::new(&observations, &repeated);
+        for (index, observation) in observations.pages().iter().enumerate() {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(ArtifactError::new("pdf-render", "本次處理已取消"));
+            }
+            if !observation.has_any(&repeated) {
+                continue;
+            }
+            let Some(page) = PdfPageIndex::try_from(index)
+                .ok()
+                .and_then(|index| document.pages().get(index).ok())
+            else {
+                continue;
+            };
+            appearances[index] = renderer.appearances(&page, observation, &repeated);
+        }
+    }
+
+    let assessments = assess_document(observations.into_pages(), &appearances);
+    for (page, assessment) in rendered_pages.iter_mut().zip(assessments) {
+        let observation = &assessment.observation;
+        tracing::debug!(
+            page_number = page.page_number,
+            needs_vision = assessment.vision.needs_vision,
+            reason = assessment.vision.reason.map(VisionReason::as_str),
+            valid_chars = observation.text.valid,
+            unreliable_chars = observation.text.unreliable,
+            symbol_chars = observation.text.symbols,
+            raster_ratio = observation.coverage.raster_ratio,
+            vector_ratio = observation.coverage.vector_ratio,
+            vector_count = observation.coverage.vector_count,
+            furniture_raster_ratio = observation.coverage.furniture.raster_ratio,
+            furniture_vector_ratio = observation.coverage.furniture.vector_ratio,
+            furniture_vector_count = observation.coverage.furniture.vector_count,
+            visual_annotation = observation.visual_annotation,
+            objects = observation.objects,
+            "assessed page vision"
+        );
+        page.vision = assessment.vision;
     }
 
     Ok(rendered_pages)
@@ -484,6 +552,7 @@ fn normalize_image_blocking(
         width,
         height,
         extracted_text: None,
+        vision: PageVision::vision(VisionReason::ImageUpload),
     }])
 }
 
@@ -967,6 +1036,85 @@ mod tests {
         }
 
         embedding_server.abort();
+        tokio::fs::remove_dir_all(root).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Pdfium and LibreOffice"]
+    async fn page_vision_decisions_match_fixtures_and_the_example_report() -> anyhow::Result<()> {
+        let root = test_dir("vision-fixtures");
+        let config = ArtifactConfig::from_env()?;
+        let mut failures = Vec::new();
+        let mut check = |label: String, page: &RenderedPage, expected: bool| {
+            eprintln!(
+                "page-vision {label} page {}: needs_vision={} reason={:?}",
+                page.page_number,
+                page.vision.needs_vision,
+                page.vision
+                    .reason
+                    .map(crate::page_vision::VisionReason::as_str)
+            );
+            if page.vision.needs_vision != expected {
+                failures.push(format!(
+                    "{label} page {}: expected {expected}, got {:?}",
+                    page.page_number, page.vision
+                ));
+            }
+        };
+
+        for fixture in crate::test_fixtures::write_vision_fixtures(&root.join("vision"))? {
+            let run_dir = root.join(format!("{}-run", fixture.name));
+            tokio::fs::create_dir(&run_dir).await?;
+            let pages = render_pdf(&config, &fixture.path, &run_dir).await?;
+            assert_eq!(
+                pages.len(),
+                fixture.needs_vision.len(),
+                "{} page count",
+                fixture.name
+            );
+            for (page, expected) in pages.iter().zip(&fixture.needs_vision) {
+                check(fixture.name.to_string(), page, *expected);
+            }
+        }
+
+        let fixtures = crate::test_fixtures::write_all(&root.join("documents"))?;
+        for (label, source, office, expected) in [
+            ("native", &fixtures.native_pdf, false, false),
+            ("scanned", &fixtures.scanned_pdf, false, true),
+            ("docx", &fixtures.docx, true, false),
+            ("pptx", &fixtures.pptx, true, false),
+            ("xlsx", &fixtures.xlsx, true, false),
+        ] {
+            let run_dir = root.join(format!("{label}-run"));
+            tokio::fs::create_dir(&run_dir).await?;
+            let pdf = if office {
+                convert_office_to_pdf(&config, source, &run_dir).await?
+            } else {
+                source.clone()
+            };
+            for page in render_pdf(&config, &pdf, &run_dir).await? {
+                check(label.to_string(), &page, expected);
+            }
+        }
+
+        // The measured 14-page report: only page 7 carries a photo; pages 1, 2
+        // and 4 are tables drawn with thin borders.
+        let report =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../example_file/iiot_industry_report.pdf");
+        let run_dir = root.join("report-run");
+        tokio::fs::create_dir(&run_dir).await?;
+        let pages = render_pdf(&config, &report, &run_dir).await?;
+        assert_eq!(pages.len(), 14);
+        for page in &pages {
+            check(
+                "iiot_industry_report".to_string(),
+                page,
+                page.page_number == 7,
+            );
+        }
+
+        assert!(failures.is_empty(), "{failures:#?}");
         tokio::fs::remove_dir_all(root).await?;
         Ok(())
     }
