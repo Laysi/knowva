@@ -355,3 +355,32 @@ A4B 每輪都在編碼頁圖時 Metal OOM（`kIOGPUCommandBufferCallbackErrorOut
 - KV cache 每格 896 MiB（全域層 256 + sliding-window 層 640）；`/api/ps` 的大小 1／2／3 格為 7.97／8.67／9.41 GB。三組 Ollama log 都沒有 OOM，可用記憶體最低都是 0.1 GiB；測試開始前 swap 已有 1.6 GiB。
 - 60 題答對 59 題。沒過的是 2 格、3 人那輪的 `jpg-brand`（KUKA 答成 KURODA），一格與三格同一題都對。回答請求沒有指定 temperature，用的是 Ollama 的預設取樣，§8.11 也記過圖片題的回答會波動。
 - 這組題目的回答都短，每題時間由 rerank 與 prefill 決定；回答長的時候（同日另一筆 619 tokens 生成 34.6s），多格合批生成的效果沒有在這裡量到。
+
+### 8.13 Gemma 改跑 MLX、拿掉 rerank（2026-10-05）
+
+Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重），QAT 版（`gemma4:12b-it-qat`）走的是 llama.cpp。知識庫、題目與其他設定同 §8.12（一格）。四組依序跑，每組先卸載模型，再跑 `bench/concurrency.ts`（同 §8.12 的 20 題）、`bench/examples.ts` 與 `bench/examples.ts --dataset bench/realistic.json`：
+
+- `mlx-1280`、`mlx-1152`：`GEMMA_4_MODEL_ID=gemma4:12b-mlx`，chat 頁圖長邊 1280／1152。
+- `qat-k6`：QAT、`RERANK_CANDIDATE_TOP_K=6`。rerank 只收到 RRF 前 6 名，等於由 RRF 決定送進 context 的來源，rerank 只重排順序。
+- `qat-base`：QAT 原設定，只跑兩組問答；表中 QAT 的同時處理數字取 §8.12 一格。
+
+切換設定、取樣記憶體、跑完自動還原 `.env` 與推論服務 plist 的腳本（`mlx-e2e.sh`），以及比較各組的 `compare.ts`，和結果放在一起：`knowva-mac:~/knowva-inference/bench-results/mlx-20261005-214342/`。
+
+| | QAT | MLX 1280 | MLX 1152 | QAT、候選 6 |
+| --- | --- | --- | --- | --- |
+| 每分鐘答完（1–4 人） | 2.6–3.1 | 3.2–4.1 | 3.2–3.9 | 3.8–5.2 |
+| 4 人同時，平均／最慢首字 | 59.4／84.3s | 53.4／69.0s | 56.2／77.8s | 36.4／62.4s |
+| 同時處理那 20 題答對 | 20/20 | 20/20 | 19/20 | 12/20 |
+| rerank 平均／最慢（同時處理那 21 題，含排隊） | 22.5／35.9s | 21.6／32.8s | 21.6／32.6s | 4.8／14.2s |
+| examples | 31/34 | 30/34 | 28/34 | 26/34 |
+| realistic | 32/39 | 31/39 | 32/39 | 26/39 |
+| 首字中位數 examples／realistic（一次一題） | 19.4／18.9s | 16.8／16.8s | 17.1／16.3s | 11.3／11.8s |
+| swap 最高 | 2.9 GiB（`qat-base` 3.2） | 12.5 GiB | 12.1 GiB | 2.3 GiB |
+
+- 單次 chat（`bench/chat.ts`，6 頁，每格 3 輪）：MLX prefill 546–566 tok/s、生成 26.8–29.5 tok/s；QAT 384–394、17.7–17.9 tok/s。
+- MLX 的頁圖 token 分 280／560／1120 三檔：長邊 1280 的頁約 1104 token，896–1152 約 539 token；QAT 在 1280 是 570 token。1152 的 token 少一半，但首字與吞吐和 1280 差不多。
+- MLX runner 載入後 `msg=memory held` 是 7.81 GiB，之後隨 prefix cache 一路漲到 15.0–15.4 GiB（peak 17.5 GiB），兩組都一樣；結束時 `/api/ps` 的大小是 16.1 GB（QAT 8.0 GB）。Ollama 0.35.0 的 `OLLAMA_*` 環境變數裡沒有限制它的設定，QAT 那條路有 `LLAMA_ARG_CACHE_RAM=2048`。`mlx-1152` 跑到一半時的 `top`：Ollama MLX runner 16 GB（其中 7.2 GB 被壓縮）、推論服務 10 GB、Colima VM 3.1 GB。四組都沒有 OOM 或 Metal 錯誤，可用記憶體最低 0.06–0.08 GiB。
+- 和 `qat-base` 相比多錯的題目：`mlx-1280` 是 `png-arm-color`、`cross-crane`、`poster-machine-measures`；`mlx-1152` 是 `jpg-brand`（KUKA 讀成 FANUC）、`nf-press-tonnage`、`png-arm-color`、`poster-machine-measures`。反過來，`qat-base` 沒過的 `osha-follow-up` 在兩組 MLX 都通過。
+- `qat-k6` 比 `qat-base` 多錯 14 題（examples 5、realistic 9），其中 11 題是正確來源沒進前 6 名（`not-retrieved`）：圖片與 EML 題、OSHA 單頁題、PPTX 統計與機器人事故題、海報題。它多答對三題 XLSX：`xlsx-deaths-112` 的 6 個來源與順序和 `qat-base` 完全一樣，差在回答本身；`xlsx-peak-month`、`xlsx-construction` 各有一到兩頁來源不同，`xlsx-construction` 的答案引自 `qat-base` 沒選進的第 7 頁。
+- `qat-k6` 一次一題的首字比 `qat-base` 快約 8s：rerank 平均 1.0s（`qat-base` 7.4s），每題 context 的圖片平均 1.7 張（`qat-base` 3.0 張），prefill 也比較短。
+- 一次一題時 rerank 平均 7.4s（`qat-base`，50 筆候選），和 §8.12 一格的 7.3s 相近；多人同時時平均多出約 14s，包含 embed／rerank 共用一把鎖的排隊與同時跑 Gemma 的 GPU 競爭，這次沒有拆開量。
