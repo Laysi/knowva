@@ -404,3 +404,34 @@ Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重）�
   | 上傳壓力：swap 最高、critical | 11.8 GiB、4 個取樣點 | 4.8 GiB、0 次 |
 
   答錯的題目兩組差在 `jpg-brand`（2 GiB 這組在同時處理與 examples 各錯一次）與 `cross-crane`（2 GiB 這組通過）；上傳壓力的第二輪兩組也都錯在 `jpg-brand`。上限 2 GiB 後，追問少了前一輪的重用，但首字時間沒有變。兩組的 log 都沒有錯誤。
+
+### 8.14 Rerank 改跑 MLX（#47，2026-10-06）
+
+把 Nemotron Rerank VL 移植到 MLX 0.32.3（直接讀原始 `model.safetensors`），和推論服務現行的 PyTorch 2.14.1 MPS 比。前處理和模型的 transformers processor 逐 token、逐 pixel 相同（tiles 1 與 6、文字／圖／圖＋文、截斷都比過）。
+
+候選不是 app 實際送出的：擷取那些要暫時改正式 app 的 rerank 路由，這次沒做。改用 `examples.json` 與 `realistic.json` 裡來源是 PDF 或圖片的 34 題（兩題追問的每輪各算一題，共 36 題），以 BM25 從 4 份 PDF（共 53 頁）與 4 張圖片選出每題前 50 名；其中 7 筆帶頁圖（上傳的圖片與 iiot 報告第 7 頁優先，不足依名次補），頁圖是 180 DPI、長邊上限 1600 的 PNG。送進模型的方式照後端與推論服務：同一 modality 一批、每批最多 8 筆、循序，`KM_RERANK_TILES=1`，token 上限依 modality。每組各自一個程序、先跑 1 題暖機；每組開跑前推論服務都沒有載入模型，Gemma（MLX、上限 2 GiB）常駐。這份候選每題 rerank 5.87s，比 §8.13 實際候選的 7.4s 短。
+
+| 每題 50 筆 | 平均 | 與 fp32 參考的 logit 最大差 | 前 6 名集合不同 | 前 6 名順序不同 | GPU 記憶體峰值 |
+| --- | --- | --- | --- | --- | --- |
+| PyTorch MPS fp32（參考） | 18.16s | — | — | — | 9.12 GiB |
+| PyTorch MPS fp16（現行） | 5.87s | 0.0106 | 0/36 | 1 | 4.89 GiB |
+| PyTorch MPS fp16，逐筆不補 padding | 4.43s | 0.0094 | 0/36 | 1 | 3.89 GiB |
+| MLX fp32（`MLX_ENABLE_TF32=0`） | 18.33s | 0.00001 | 0/36 | 0 | 7.69 GiB |
+| MLX bf16 | 5.03s | 0.0776 | 0/36 | 2 | 3.85 GiB |
+| MLX fp16 | 5.09s | 0.0103 | 0/36 | 0 | 3.87 GiB |
+| MLX fp16，逐筆不補 padding | 3.79s | 0.0086 | 0/36 | 0 | 3.83 GiB |
+
+- 同一種批次方式下，MLX fp16 比 PyTorch MPS fp16 快 1.15 倍（補 padding）與 1.17 倍（不補）。最快的 MLX 比現行快 1.55 倍，其中 1.33 倍來自不補 padding，PyTorch 也做得到（#48）。#47 的門檻是 2 倍。
+- 這台的 PyTorch MPS 與 MLX 跑 matmul 一樣快（TFLOPS，`nemotron-vl-mlx/tools/matmul_peak.py`）：
+
+  | M×K×N | MLX fp16 | MPS fp16 | MLX bf16 | MPS bf16 |
+  | --- | --- | --- | --- | --- |
+  | 4096×4096×4096 | 18.0 | 18.7 | 19.1 | 18.7 |
+  | 19200×2048×8192 | 18.2 | 18.8 | 19.6 | 18.8 |
+  | 600×2048×8192 | 13.6 | 16.7 | 13.8 | 15.6 |
+  | 600×8192×2048 | 10.2 | 13.4 | 12.1 | 13.0 |
+
+  每題有效 token 約 2.0 萬、補齊後約 3.2 萬（有效 63%），約 79 TFLOP；PyTorch MPS fp16 每題 5.87s 相當於約 13.5 TFLOPS。
+- 精度：PyTorch MPS fp32 和 CPU fp32 在 4 個固定批次上差 1e-5，MLX fp32 和它們也差 1e-5。MLX 在 M6 上預設讓 float32 matmul 走 TF32（`MLX_ENABLE_TF32`），沒關掉時差 0.0036，比 PyTorch fp16 還大。
+- 記憶體：程序 RSS 最高 PyTorch fp16 6.80 GiB、MLX fp16 3.60 GiB。MLX 第一版載入時同時持有 bf16 原檔與 fp16 副本，可用記憶體一度剩 0.15 GiB、記憶體壓力 critical 2 秒、swap 增加 2.3 GiB；改成逐個 tensor 轉換後，之後三組壓力都維持 normal。
+- 移植與量測工具在 `knowva-mac:~/knowva-inference/nemotron-vl-mlx/`（`tools/knowva/build_sets.py` 組候選、`bench_sets.py` 量時間與 logit、`compare_runs.py` 比較、`run-sets.sh` 依序執行並取樣記憶體），結果在 `knowva-mac:~/knowva-inference/bench-results/rerank-sets-20261006-015536/` 與 `rerank-sets2-20261006-023640/`。
