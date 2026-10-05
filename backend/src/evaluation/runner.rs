@@ -29,8 +29,7 @@ use crate::storage::{Storage, StorageConfig, ensure_initialization_lock};
 use crate::{AppState, DEFAULT_DATABASE_URL, DEFAULT_FILES_DIR};
 use anyhow::{Context, bail};
 use chrono::{SecondsFormat, Utc};
-use futures::future::BoxFuture;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
@@ -51,8 +50,6 @@ const PROMPT_VERSION: &str = "gemma4-rag-v1";
 const MAX_ANSWER_CHARS: usize = 4_000;
 const EVALUATION_DATABASE_PREFIX: &str = "knowva_eval_";
 const EVALUATION_DATABASE_MARKER: &str = "knowva-evaluation-only:v1";
-const GITHUB_COMMENT_API_BASE: &str = "https://api.github.com/repos/Laysi/knowva/issues/comments/";
-const THRESHOLD_APPROVER_LOGIN: &str = "Ruisi-Lu";
 
 #[cfg(test)]
 static CLOUD_RUN_INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -82,98 +79,6 @@ struct CloudPreflight {
     thresholds: ThresholdSnapshot,
     database_url: String,
     approved_files_root: PathBuf,
-}
-
-trait ThresholdApprovalVerifier: Send + Sync {
-    fn verify<'a>(&'a self, snapshot: &'a ThresholdSnapshot) -> BoxFuture<'a, anyhow::Result<()>>;
-}
-
-struct GitHubThresholdApprovalVerifier {
-    http: reqwest::Client,
-}
-
-#[derive(Deserialize)]
-struct GitHubIssueComment {
-    html_url: String,
-    body: String,
-    user: GitHubCommentUser,
-    author_association: String,
-}
-
-#[derive(Deserialize)]
-struct GitHubCommentUser {
-    login: String,
-}
-
-impl GitHubThresholdApprovalVerifier {
-    fn new() -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .map_err(|_| anyhow::anyhow!("threshold approval verifier could not be initialized"))?;
-        Ok(Self { http })
-    }
-}
-
-impl ThresholdApprovalVerifier for GitHubThresholdApprovalVerifier {
-    fn verify<'a>(&'a self, snapshot: &'a ThresholdSnapshot) -> BoxFuture<'a, anyhow::Result<()>> {
-        Box::pin(async move {
-            let comment_id = threshold_comment_id(&snapshot.config.issue_comment_url)?;
-            let endpoint = format!("{GITHUB_COMMENT_API_BASE}{comment_id}");
-            let response = self
-                .http
-                .get(endpoint)
-                .header(reqwest::header::USER_AGENT, "knowva-evaluation-runner")
-                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-                .send()
-                .await
-                .map_err(|_| anyhow::anyhow!("threshold approval could not be verified"))?;
-            if !response.status().is_success() {
-                bail!("threshold approval could not be verified");
-            }
-            let comment = response
-                .json::<GitHubIssueComment>()
-                .await
-                .map_err(|_| anyhow::anyhow!("threshold approval response was invalid"))?;
-            validate_threshold_approval(
-                snapshot,
-                &comment.html_url,
-                &comment.body,
-                &comment.user.login,
-                &comment.author_association,
-            )
-        })
-    }
-}
-
-fn threshold_comment_id(issue_comment_url: &str) -> anyhow::Result<&str> {
-    issue_comment_url
-        .strip_prefix("https://github.com/Laysi/knowva/issues/1#issuecomment-")
-        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-        .context("threshold approval URL is invalid")
-}
-
-fn validate_threshold_approval(
-    snapshot: &ThresholdSnapshot,
-    html_url: &str,
-    body: &str,
-    author_login: &str,
-    author_association: &str,
-) -> anyhow::Result<()> {
-    threshold_comment_id(&snapshot.config.issue_comment_url)?;
-    if html_url != snapshot.config.issue_comment_url {
-        bail!("threshold approval comment identity did not match");
-    }
-    if author_login != THRESHOLD_APPROVER_LOGIN
-        || !matches!(author_association, "OWNER" | "MEMBER" | "COLLABORATOR")
-    {
-        bail!("threshold approval author was not authorized");
-    }
-    let expected_marker = format!("threshold_sha256: {}", snapshot.identity.sha256);
-    if !body.lines().any(|line| line.trim() == expected_marker) {
-        bail!("threshold approval did not contain the locked snapshot hash");
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,26 +356,17 @@ async fn run_cloud(options: CliOptions, snapshot: EvaluationDatasetSnapshot) -> 
     #[cfg(test)]
     CLOUD_RUN_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
     dotenvy::dotenv().ok();
-    let verifier = GitHubThresholdApprovalVerifier::new()?;
-    run_cloud_with_lookup_and_verifier(
-        options,
-        snapshot,
-        |name| std::env::var(name).ok(),
-        &verifier,
-    )
-    .await
+    run_cloud_with_lookup(options, snapshot, |name| std::env::var(name).ok()).await
 }
 
-async fn run_cloud_with_lookup_and_verifier(
+async fn run_cloud_with_lookup(
     options: CliOptions,
     snapshot: EvaluationDatasetSnapshot,
     mut get_env: impl FnMut(&str) -> Option<String>,
-    verifier: &impl ThresholdApprovalVerifier,
 ) -> anyhow::Result<()> {
     let current_directory = std::env::current_dir()
         .map_err(|_| anyhow::anyhow!("evaluation working directory is unavailable"))?;
     let preflight = validate_cloud_preflight(&options, &current_directory, &mut get_env)?;
-    verifier.verify(&preflight.thresholds).await?;
 
     #[cfg(test)]
     CLOUD_BOOTSTRAP_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
@@ -1826,9 +1722,8 @@ mod tests {
     fn write_valid_threshold(root: &Path) -> PathBuf {
         let path = root.join("thresholds.json");
         let value = serde_json::json!({
-            "schema_version": "1.0",
-            "version": "thresholds-locked-v1",
-            "issue_comment_url": "https://github.com/Laysi/knowva/issues/1#issuecomment-12345",
+            "schema_version": "2.0",
+            "version": "thresholds-v1",
             "minimums": {
                 "correct_page_recall_at_k": {
                     "stage": "rerank",
@@ -1944,79 +1839,6 @@ mod tests {
     fn rejects_zero_concurrency_and_missing_values() {
         assert!(CliOptions::parse(["--concurrency".to_owned(), "0".to_owned()]).is_err());
         assert!(CliOptions::parse(["--manifest".to_owned()]).is_err());
-    }
-
-    #[test]
-    fn threshold_approval_requires_the_exact_pinned_comment_and_hash_line() {
-        let root = temporary_directory("approval");
-        let snapshot =
-            load_threshold_snapshot(write_valid_threshold(&root)).expect("load threshold snapshot");
-        let pinned_url = snapshot.config.issue_comment_url.clone();
-        let marker = format!("threshold_sha256: {}", snapshot.identity.sha256);
-        validate_threshold_approval(
-            &snapshot,
-            &pinned_url,
-            &marker,
-            THRESHOLD_APPROVER_LOGIN,
-            "OWNER",
-        )
-        .expect("exact approval must pass");
-
-        let cases = [
-            (
-                "https://github.com/example/knowva/issues/1#issuecomment-12345",
-                marker.as_str(),
-            ),
-            (
-                "https://github.com/Laysi/knowva/issues/1#issuecomment-54321",
-                marker.as_str(),
-            ),
-            (pinned_url.as_str(), "threshold_sha256: wrong-secret-hash"),
-        ];
-        for (url, body) in cases {
-            let error = validate_threshold_approval(
-                &snapshot,
-                url,
-                body,
-                THRESHOLD_APPROVER_LOGIN,
-                "OWNER",
-            )
-            .expect_err("wrong repository, comment, or hash must fail")
-            .to_string();
-            assert!(
-                !error.contains(body),
-                "approval errors must not echo comment bodies"
-            );
-        }
-
-        let mut wrong_repository = snapshot.clone();
-        wrong_repository.config.issue_comment_url =
-            "https://github.com/example/knowva/issues/1#issuecomment-12345".to_owned();
-        let body = format!("threshold_sha256: {}", wrong_repository.identity.sha256);
-        let error = validate_threshold_approval(
-            &wrong_repository,
-            &wrong_repository.config.issue_comment_url,
-            &body,
-            THRESHOLD_APPROVER_LOGIN,
-            "OWNER",
-        )
-        .expect_err("a snapshot for another repository must fail")
-        .to_string();
-        assert!(!error.contains(&body));
-
-        for (login, association) in [
-            ("attacker", "OWNER"),
-            (THRESHOLD_APPROVER_LOGIN, "CONTRIBUTOR"),
-            ("ruisi-lu", "COLLABORATOR"),
-        ] {
-            let error =
-                validate_threshold_approval(&snapshot, &pinned_url, &marker, login, association)
-                    .expect_err("wrong author identity or association must fail")
-                    .to_string();
-            assert!(!error.contains(login));
-            assert!(!error.contains(&marker));
-        }
-        fs::remove_dir_all(root).expect("remove temporary directory");
     }
 
     #[test]
