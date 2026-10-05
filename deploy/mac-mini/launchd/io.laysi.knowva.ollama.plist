@@ -30,7 +30,15 @@
     <string>1</string>
     <key>OLLAMA_FLASH_ATTENTION</key>
     <string>1</string>
-    <!-- Read by the llama-server Ollama spawns. Its prompt cache defaults to
+    <!-- Read by the MLX runner of the patched build (setup/install-ollama.sh).
+         Upstream holds 8 GiB of prompt snapshots, putting the runner at
+         16 GB and the machine 12 GiB into swap; the knowledge-base prompts
+         share only the system prompt, so 2 GiB answers as fast at 9.8 GB. -->
+    <key>OLLAMA_MLX_MAX_PAGED_OUT_BYTES</key>
+    <string>2147483648</string>
+    <!-- The two below apply only to llama.cpp models such as
+         gemma4:12b-it-qat, the fallback to MLX.
+         Read by the llama-server Ollama spawns. Its prompt cache defaults to
          8 GB, which put its footprint at 10.8 GB and the machine into swap;
          2 GB keeps the last couple of prompts for follow-ups at 3.3 GB. -->
     <key>LLAMA_ARG_CACHE_RAM</key>
