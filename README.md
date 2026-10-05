@@ -2,7 +2,7 @@
 
 > 點亮你的知識星系 — Your knowledge supernova
 
-通用企業 AI 知識管理系統 demo：保存使用者文件、建立檢索資料，並以 SSE 串流回答問題與附上來源。MVP 的所有模型推論只呼叫雲端託管 API。
+通用企業 AI 知識管理系統，以企業地端部署為目標：保存使用者文件、建立檢索資料，並以 SSE 串流回答問題與附上來源。正式環境的模型推論都在企業地端推論服務執行；開發與測試時，同一組端點設定也可以指向雲端託管的 OpenAI 相容服務。換服務只需要改 URL。
 
 ## 已鎖定的模型契約
 
@@ -10,7 +10,7 @@
 
 | 能力 | 固定契約 |
 |---|---|
-| 回答／多模態閱讀 | 雲端 chat endpoint；model 由 `GEMMA_4_MODEL_ID` 放入 request body |
+| 回答／多模態閱讀 | OpenAI 相容 chat endpoint（正式環境為地端服務）；model 由 `GEMMA_4_MODEL_ID` 放入 request body |
 | 向量嵌入 | `nvidia/llama-nemotron-embed-vl-1b-v2`，輸出 2048 維 float embedding |
 | 精排 | `nvidia/llama-nemotron-rerank-vl-1b-v2` |
 
@@ -23,7 +23,7 @@
 | 前端 | React + Vite + assistant-ui（純 CSS、繁中介面） |
 | 後端 | Rust（axum + tokio + sqlx），單一 binary |
 | 資料庫 | PostgreSQL 17 + pgvector |
-| 模型呼叫 | 單一 cloud-model HTTP client；Gemma 4 + Nemotron Embed/Rerank VL |
+| 模型呼叫 | 單一模型服務 HTTP client（`cloud_models.rs`，地端與雲端端點共用）；Gemma 4 + Nemotron Embed/Rerank VL |
 | 檔案儲存 | 初始化時選定本機 `FILES_DIR` 或 S3 相容物件儲存（`object_store`）；DB 只存 `{document_id}/...` 相對 key，原檔與每次完整 artifact run 分開保存 |
 
 ## 前置需求
@@ -142,7 +142,7 @@ STORAGE_SECRET_ACCESS_KEY=<r2-secret-access-key>
 
 ```bash
 cp .env.example .env
-# 編輯 .env，填入必要的雲端模型設定
+# 編輯 .env，填入模型服務端點與 GEMMA_4_MODEL_ID
 docker compose up -d --build
 docker compose ps
 curl http://localhost:8080/api/health
@@ -260,7 +260,7 @@ DB 欄位（`documents.storage_path`、`document_artifact_sets.*_path`／`artifa
 
 頁圖只以記憶體中的 PNG/JPEG data URL 送出，不會傳送本機 artifact path；decoded image 上限 25 MiB、整體 embedding request 上限 36 MiB。Embedding 對 408、429、5xx、transport error 與 timeout 最多嘗試三次並使用 exponential backoff + jitter，其他 4xx 立即失敗。HTTP error snippet、API key、Authorization 與 base64 圖片資料都會在記錄前限長或遮蔽。
 
-所有 embedding 完成後，系統會以同一個雲端 Gemma 4 best-effort 產生繁中摘要與 3–6 個標籤：分頁文件固定只取前 3 頁（只有 `needs_vision` 頁附圖），MD/TXT 固定只取前 3 個文字單元；每個文字單元最多 3000 字，每頁 extracted text 最多 2000 字，頁圖沿用最長邊 1600 px、JPEG quality 80、單一 serialized image part 5 MiB 與完整 chat request 24 MiB 的界線。輸出必須是 typed JSON，摘要非空且最多 500 字，每個唯一標籤非空且最多 30 字；只容許單一 code fence 或單一 JSON object 前後 chatter 的 JSON-aware salvage。暫時性錯誤最多兩次 summary request，malformed JSON 不重試；任一 summary 失敗都只記安全 warning，仍會把完整 embeddings 與 `ready` 在同一 transaction 發布，不會重跑 embedding。
+所有 embedding 完成後，系統會以同一個 Gemma 4 chat 端點 best-effort 產生繁中摘要與 3–6 個標籤：分頁文件固定只取前 3 頁（只有 `needs_vision` 頁附圖），MD/TXT 固定只取前 3 個文字單元；每個文字單元最多 3000 字，每頁 extracted text 最多 2000 字，頁圖沿用最長邊 1600 px、JPEG quality 80、單一 serialized image part 5 MiB 與完整 chat request 24 MiB 的界線。輸出必須是 typed JSON，摘要非空且最多 500 字，每個唯一標籤非空且最多 30 字；只容許單一 code fence 或單一 JSON object 前後 chatter 的 JSON-aware salvage。暫時性錯誤最多兩次 summary request，malformed JSON 不重試；任一 summary 失敗都只記安全 warning，仍會把完整 embeddings 與 `ready` 在同一 transaction 發布，不會重跑 embedding。
 
 ## 頁面是否送圖
 
@@ -292,7 +292,7 @@ DB 欄位（`documents.storage_path`、`document_artifact_sets.*_path`／`artifa
 - RRF 固定 `k=60`，`rrf_score(d) = Σ 1 / (60 + rank_i(d))`。以 `unit_id` 去重；同分依最佳 route rank、`unit_id` 排序。兩路預設各 50，融合預設保留 50，再以固定 `llama-nemotron-rerank-vl-1b-v2` 精排成 top 6（可設 3–8）。
 - Page passage 只讀已發布 artifact：`needs_vision` 頁有文字層時送 image+text，掃描頁送 image-only（完全省略 `text`）；文字頁與 MD/TXT chunk 送 text-only，不讀頁圖。物件 key 與本機路徑都不進 payload，圖片以有上限的並行讀取後只以記憶體 data URL 傳送；候選先依有圖／純文字分組，每組依 RRF 順序每批預設 8 筆，API 回應即使重排順序也依每批 local index 映回原 unit。
 - 每筆 `RetrievalCandidate` 直接帶 `unit_id`、0-based `unit_index`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、`needs_vision`、兩路 rank/score、`rrf_score` 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
-- Rerank 每批都嚴格驗證回應筆數、index 唯一且不越界、score finite，再驗證跨批映射。408、429、5xx、transport error 與 timeout 最多嘗試三次；耗盡後以原 RRF top_n 原序回退，且 rerank 欄位保持 null。設定、artifact 或 hosted response contract 錯誤不回退，會回傳可診斷錯誤。Structured log 僅記錄各階段筆數、延遲、fallback 與 model id，不含 query、文件內容、secret 或 base64。
+- Rerank 每批都嚴格驗證回應筆數、index 唯一且不越界、score finite，再驗證跨批映射。408、429、5xx、transport error 與 timeout 最多嘗試三次；耗盡後以原 RRF top_n 原序回退，且 rerank 欄位保持 null。設定、artifact 或模型服務 response contract 錯誤不回退，會回傳可診斷錯誤。Structured log 僅記錄各階段筆數、延遲、fallback 與 model id，不含 query、文件內容、secret 或 base64。
 - context 區塊採追加式排列：`POST /api/chat` 的 `previousSources` 帶回上一輪答案的來源與順序，本輪仍檢索到的來源就留在原位、原順序，本輪新進的來源再依排名接在尾端。推論服務的 prompt cache 是前綴比對，唯有這種排列能把「追問檢索到重疊來源」穩定換成快取命中；來源完全沒變時整段 prompt（連同它後面的對話歷史）都會命中。沒有 `previousSources` 時（第一個問題、catalog、文件摘要）就直接照排名排列——最相關的來源最可能在下一輪續留，把它放在最前面，下一輪能重用的前綴才最長。`[S1]`..`[Sn]` 依版面位置連號並與 SSE `sources` 事件一致；payload 或完整 request 超限時仍是從排名最低的來源開始整筆移除，再重新編號。
 
 ## A/B 評測
@@ -303,7 +303,7 @@ DB 欄位（`documents.storage_path`、`document_artifact_sets.*_path`／`artifa
 cd backend && proto exec rust -- cargo run -- eval --dry-run
 ```
 
-dry-run 只讀取並驗證 fixture，不連資料庫、不載入 native converter，也不呼叫雲端模型。它會檢查 dataset schema/version、未知欄位、唯一 document/query/unit id、安全相對路徑、檔案類型與副檔名、SHA-256、非空 license/source、預期 page/unit inventory，以及 query scope、expected source、required facts、answerable/not-found 等契約。所有內附文件都是 deterministic synthetic CC0 fixture，不含客戶或正式環境內容；涵蓋繁中原生 PDF、純影像掃描 PDF、PPTX、表格／圖表 PDF、PNG、Markdown 與純文字，也涵蓋同名文件隔離、相鄰頁干擾、多頁來源、無頁碼文字與 visual-only facts。完整來源與 coverage 見 [backend/eval/fixtures/README.md](backend/eval/fixtures/README.md)。
+dry-run 只讀取並驗證 fixture，不連資料庫、不載入 native converter，也不呼叫任何模型端點。它會檢查 dataset schema/version、未知欄位、唯一 document/query/unit id、安全相對路徑、檔案類型與副檔名、SHA-256、非空 license/source、預期 page/unit inventory，以及 query scope、expected source、required facts、answerable/not-found 等契約。所有內附文件都是 deterministic synthetic CC0 fixture，不含客戶或正式環境內容；涵蓋繁中原生 PDF、純影像掃描 PDF、PPTX、表格／圖表 PDF、PNG、Markdown 與純文字，也涵蓋同名文件隔離、相鄰頁干擾、多頁來源、無頁碼文字與 visual-only facts。完整來源與 coverage 見 [backend/eval/fixtures/README.md](backend/eval/fixtures/README.md)。
 
 可重複使用 `--document <document_key>` 與 `--query <query_id>` 選 subset；指定 document 時，只會選取其 `document_scope` 全部落在所選 documents 的 queries。dry-run 的 JSON 會列出實際選到的 documents/queries，未知或空 subset 會 fail closed。例如：
 
@@ -314,40 +314,38 @@ proto exec rust -- cargo run -- eval --dry-run \
   --query markdown-escalation
 ```
 
-### 正式 cloud A/B run
+### 正式 A/B run（`--cloud`）
 
-Cloud run 是明確 opt-in，會 ingest fixtures 並實際呼叫 embedding、rerank 與 generation endpoint，因此會產生雲端費用；CI 與一般測試絕不自動執行。A 是 dense-only control，B 共用 A 的同一批 dense candidates，再執行 BM25、RRF 與固定 VL reranker。兩組固定使用相同 embedding 與 Gemma 4 generation model id、相同 prompt version、相同 query、相同 context top_n 與 deterministic retry policy，只有 retrieval path 不同。provider 不支援 seed 時會在 run manifest 明確記為 false。為確保 telemetry 可歸因，目前 cloud run 強制 `--concurrency 1`。
+正式 run 是明確 opt-in，會 ingest fixtures 並實際呼叫設定好的 embedding、rerank 與 generation endpoint。端點是雲端服務時會產生費用，是地端服務時會佔用推論主機；CI 與一般測試絕不自動執行。A 是 dense-only control，B 共用 A 的同一批 dense candidates，再執行 BM25、RRF 與固定 VL reranker。兩組固定使用相同 embedding 與 Gemma 4 generation model id、相同 prompt version、相同 query、相同 context top_n 與 deterministic retry policy，只有 retrieval path 不同。provider 不支援 seed 時會在 run manifest 明確記為 false。為確保 telemetry 可歸因，目前正式 run 強制 `--concurrency 1`。
 
 執行前必須完成下列事項：
 
-1. 由固定核准者 GitHub login **`Ruisi-Lu`** 先在 `Laysi/knowva` issue #1 建立一則留言，鎖定 correct-page recall 的 stage、k、minimum，citation precision/recall、answer facts recall，以及 B 相對 A improvement 的實際數值。GitHub API 回傳的 comment author 必須精確為 `Ruisi-Lu`，且 `author_association` 必須為 `OWNER`、`MEMBER` 或 `COLLABORATOR`；login 大小寫不同、其他作者或僅為 `CONTRIBUTOR` 都不會通過。所有 minimum 必須是 0 到 1 的 JSON number，k 必須是正整數；不要由執行者臨時決定門檻。先取得該留言固定的 `https://github.com/Laysi/knowva/issues/1#issuecomment-<id>` permalink，再把它寫入本機 threshold JSON 的 `issue_comment_url`。下列只是 schema 示意；尖括號欄位必須換成留言已鎖定的真實內容，不能直接執行，也不要填一個看似可通過的假 URL 或猜測值：
+1. 準備一份本機門檻 JSON，寫下 correct-page recall 的 stage、k、minimum，citation precision／recall、answer facts recall，以及 B 相對 A improvement 的數值。所有 minimum 必須是 0 到 1 的 JSON number，k 必須是正整數，`version` 是自訂的門檻版本名稱。報告的 `run-manifest.json` 會記錄這份檔案的 `version` 與 SHA-256。要比較的幾次 run 請用同一份檔案，並在執行前就決定好數值，不要看完結果才調整。下列只是 schema 示意，尖括號欄位必須換成實際數值：
 
    ```text
    {
-     "schema_version": "1.0",
-     "version": "<owner-locked-version>",
-     "issue_comment_url": "<real-Laysi/knowva-issue-1-comment-permalink>",
+     "schema_version": "2.0",
+     "version": "<threshold-version>",
      "minimums": {
        "correct_page_recall_at_k": {
          "stage": "<dense|bm25|rrf|rerank>",
-         "k": <owner-locked-positive-integer>,
-         "minimum": <owner-locked-number-0-to-1>
+         "k": <positive-integer>,
+         "minimum": <number-0-to-1>
        },
-       "citation_precision": <owner-locked-number-0-to-1>,
-       "citation_recall": <owner-locked-number-0-to-1>,
-       "answer_facts_recall": <owner-locked-number-0-to-1>,
-       "b_relative_improvement": <owner-locked-number-0-to-1>
+       "citation_precision": <number-0-to-1>,
+       "citation_recall": <number-0-to-1>,
+       "answer_facts_recall": <number-0-to-1>,
+       "b_relative_improvement": <number-0-to-1>
      }
    }
    ```
 
-2. 完成 threshold JSON 的所有欄位與排版後，對**最終檔案 bytes**計算 SHA-256（例如 `sha256sum /absolute/path/to/thresholds.json`；之後只要檔案有任何 byte 改動就必須重算）。由同一位 owner 編輯上一步的同一則留言，加入獨立一行 `threshold_sha256: <sha256sum 輸出的 64 字元雜湊>`；編輯留言不會改變 permalink。runner 會從 GitHub 讀取該固定 URL，並要求 URL 與 hash line 都精確符合本機 snapshot。
-3. 由 PostgreSQL 管理者建立一個名稱以 `knowva_eval_` 開頭的全新空 database，以及名稱可辨識用途的專用登入角色（例如組織自訂的 `knowva_eval_runner_<識別碼>`；尖括號內容必須換成真實且唯一的值）。以該角色作為 database owner，讓它能執行 migration；接著在任何 migration 前，以 database owner 連線並執行 `COMMENT ON DATABASE <實際的 knowva_eval_ database 名稱> IS 'knowva-evaluation-only:v1';`。最後把使用該專用角色與 database 的連線字串設為 `EVAL_DATABASE_URL`。runner 會檢查 current database 名稱、connect role 身分與精確 marker；它也會拒絕 production `DATABASE_URL`、repository 預設 DB，以及 migration 後含有任何 document 的 DB。不要把 placeholder、示意密碼或假 marker 當成正式設定。
-4. 準備專用且為空的 `EVAL_FILES_DIR`。它不可等於、包含或位於 production `FILES_DIR` 或預設 `./data/files` 之下；失敗後會保留完整隔離 run 供診斷，下次不可重用非空目錄。
-5. 設定地端推論服務與確認過的 Gemma 4 model id：至少提供 `MODEL_BASE_URL` 與 `GEMMA_4_MODEL_ID`；各能力分屬不同主機時改設 `MODEL_CHAT_URL`、`MODEL_EMBED_URL`、`MODEL_RERANK_URL`，服務需認證時另設 `MODEL_API_TOKEN`。確認服務已載入固定的 Nemotron embedding/rerank models。
-6. 主機安裝 Pdfium 與 LibreOffice/CJK 字型，並以 `PDFIUM_LIBRARY_PATH`、`LIBREOFFICE_BIN` 指向可用 binary/library，讓 PDF、掃描頁與 PPTX fixtures 能完整 ingest。
+2. 由 PostgreSQL 管理者建立一個名稱以 `knowva_eval_` 開頭的全新空 database，以及名稱可辨識用途的專用登入角色（例如組織自訂的 `knowva_eval_runner_<識別碼>`；尖括號內容必須換成真實且唯一的值）。以該角色作為 database owner，讓它能執行 migration；接著在任何 migration 前，以 database owner 連線並執行 `COMMENT ON DATABASE <實際的 knowva_eval_ database 名稱> IS 'knowva-evaluation-only:v1';`。最後把使用該專用角色與 database 的連線字串設為 `EVAL_DATABASE_URL`。runner 會檢查 current database 名稱、connect role 身分與精確 marker；它也會拒絕 production `DATABASE_URL`、repository 預設 DB，以及 migration 後含有任何 document 的 DB。不要把 placeholder、示意密碼或假 marker 當成正式設定。
+3. 準備專用且為空的 `EVAL_FILES_DIR`。它不可等於、包含或位於 production `FILES_DIR` 或預設 `./data/files` 之下；失敗後會保留完整隔離 run 供診斷，下次不可重用非空目錄。
+4. 設定地端推論服務與確認過的 Gemma 4 model id：至少提供 `MODEL_BASE_URL` 與 `GEMMA_4_MODEL_ID`；各能力分屬不同主機時改設 `MODEL_CHAT_URL`、`MODEL_EMBED_URL`、`MODEL_RERANK_URL`，服務需認證時另設 `MODEL_API_TOKEN`。確認服務已載入固定的 Nemotron embedding/rerank models。
+5. 主機安裝 Pdfium 與 LibreOffice/CJK 字型，並以 `PDFIUM_LIBRARY_PATH`、`LIBREOFFICE_BIN` 指向可用 binary/library，讓 PDF、掃描頁與 PPTX fixtures 能完整 ingest。
 
-完成上述前置作業後，從 `backend/` 以單一 cloud command 執行完整資料集；以下所有尖括號都必須替換為真實的隔離環境設定：
+完成上述前置作業後，從 `backend/` 以單一 `eval --cloud` command 執行完整資料集；以下所有尖括號都必須替換為真實的隔離環境設定：
 
 ```bash
 cd backend
@@ -365,7 +363,7 @@ proto exec rust -- cargo run -- eval --cloud \
   --concurrency 1
 ```
 
-正式 run 也接受上述 `--document` / `--query` subset flags。成功寫檔後，stdout 會回傳 `passed` 與路徑；每次輸出位於 `<output>/<run_id>/report.json`、`report.csv`、`report.md`、`run-manifest.json`。`passed: true` 只有在至少一組有效 A/B pair，且 correct-page、citation precision/recall、answer facts recall、B 相對 A improvement 全部達到 owner 鎖定門檻時成立；command 本身完成不代表門檻通過。`report.*` 會列出各 query 的 improvement/same/regression/failure、分數與 failure reasons，`run-manifest.json` 則保存 locked model ids、prompt/top_n、dataset/threshold hash、git revision、subsets、retry/latency/request/fallback telemetry 與安全化失敗案例。preflight、native conversion、cloud contract 或 DB isolation 錯誤會以非零狀態停止；已開始寫入後不會局部清掉 DB/files，以免破壞診斷一致性。
+正式 run 也接受上述 `--document` / `--query` subset flags。成功寫檔後，stdout 會回傳 `passed` 與路徑；每次輸出位於 `<output>/<run_id>/report.json`、`report.csv`、`report.md`、`run-manifest.json`。`passed: true` 只有在至少一組有效 A/B pair，且 correct-page、citation precision/recall、answer facts recall、B 相對 A improvement 全部達到門檻檔的數值時成立；command 本身完成不代表門檻通過。`report.*` 會列出各 query 的 improvement/same/regression/failure、分數與 failure reasons，`run-manifest.json` 則保存 locked model ids、prompt/top_n、dataset/threshold hash、git revision、subsets、retry/latency/request/fallback telemetry 與安全化失敗案例。preflight、native conversion、模型服務 contract 或 DB isolation 錯誤會以非零狀態停止；已開始寫入後不會局部清掉 DB/files，以免破壞診斷一致性。
 
 Threshold JSON 只應保存在本機安全位置：不得提交本機 threshold 檔、API token、`.env` secret 或任何 customer/production 文件。fixture 只能使用 repository 內已審核、標明來源與 license 的 synthetic files。
 
@@ -402,7 +400,7 @@ proto run npm -- run test
 proto run npm -- run build
 ```
 
-一般測試以本機 mock cloud endpoint 驗證四種 embedding payload、三種 rerank modality、依 modality 分組的 batch、跨批映射、嚴格 response contract、有限重試／fallback 與 transaction/DB 契約，不會呼叫真實雲端。安裝 Pdfium 與 LibreOffice 後，可明確執行 native fixture smoke；它也會確認 Pdfium 的 image+text 與 image-only embedding payload，並逐頁檢查 `needs_vision` 判斷（含 `example_file/iiot_industry_report.pdf` 只有第 7 頁看圖）：
+一般測試以本機 mock 模型端點驗證四種 embedding payload、三種 rerank modality、依 modality 分組的 batch、跨批映射、嚴格 response contract、有限重試／fallback 與 transaction/DB 契約，不會呼叫真實的模型服務。安裝 Pdfium 與 LibreOffice 後，可明確執行 native fixture smoke；它也會確認 Pdfium 的 image+text 與 image-only embedding payload，並逐頁檢查 `needs_vision` 判斷（含 `example_file/iiot_industry_report.pdf` 只有第 7 頁看圖）：
 
 ```bash
 cd backend
@@ -416,7 +414,7 @@ proto exec rust -- cargo test -- --ignored --exact --nocapture --test-threads=1 
 
 fixture 的來源、預期頁數與涵蓋範圍見 [backend/tests/fixtures/README.md](backend/tests/fixtures/README.md)。
 
-一般測試已用本機目錄與 in-memory store 跑完上傳 → ready → 問答（頁圖 rerank 與 RAG）→ 刪除。S3 模式另有 opt-in 的 MinIO smoke：它以真的 MinIO 跑同一條流程並確認刪除後文件前綴為空，同時驗證錯誤帳密與不存在的 bucket 會失敗且錯誤訊息不含 secret 或簽章；模型一律走本機 mock endpoint，不需雲端憑證，資料庫沿用 `.env` 的 `DATABASE_URL`（`sqlx::test` 會建立並刪除獨立的測試 DB）：
+一般測試已用本機目錄與 in-memory store 跑完上傳 → ready → 問答（頁圖 rerank 與 RAG）→ 刪除。S3 模式另有 opt-in 的 MinIO smoke：它以真的 MinIO 跑同一條流程並確認刪除後文件前綴為空，同時驗證錯誤帳密與不存在的 bucket 會失敗且錯誤訊息不含 secret 或簽章；模型一律走本機 mock endpoint，不需模型服務憑證，資料庫沿用 `.env` 的 `DATABASE_URL`（`sqlx::test` 會建立並刪除獨立的測試 DB）：
 
 ```bash
 docker compose --profile minio run --rm minio-init   # 啟動 MinIO，建好 bucket 才返回

@@ -9,9 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
-pub const SYSTEM_PROMPT: &str =
-    "你是企業內部的 AI 知識管理助理,依據知識庫內容協助回答問題與整理資訊。一律使用繁體中文回答。";
-
 pub const EMBED_MODEL_FAMILY: &str = "llama-nemotron-embed-vl-1b-v2";
 pub const RERANK_MODEL_FAMILY: &str = "llama-nemotron-rerank-vl-1b-v2";
 pub const DEFAULT_EMBED_MODEL_ID: &str = "nvidia/llama-nemotron-embed-vl-1b-v2";
@@ -1037,16 +1034,6 @@ impl CloudModelClient {
                 return Err(chat_request_too_large(payload.len(), maximum_bytes));
             }
         }
-    }
-
-    pub async fn stream_chat(&self, messages: Vec<ChatMessage>, tx: Sender<SseEvent>) {
-        self.stream_chat_with_context(
-            SYSTEM_PROMPT.to_string(),
-            ApiChatContent::Parts(Vec::new()),
-            messages,
-            tx,
-        )
-        .await;
     }
 
     pub async fn stream_chat_with_context(
@@ -2525,7 +2512,9 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         client
-            .stream_chat(
+            .stream_chat_with_context(
+                "fixed system prompt".to_owned(),
+                ApiChatContent::Parts(Vec::new()),
                 vec![ChatMessage {
                     role: "user".to_string(),
                     content: "問題".to_string(),
