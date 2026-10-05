@@ -411,7 +411,7 @@ Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重）�
 
 候選不是 app 實際送出的：擷取那些要暫時改正式 app 的 rerank 路由，這次沒做。改用 `examples.json` 與 `realistic.json` 裡來源是 PDF 或圖片的 34 題（兩題追問的每輪各算一題，共 36 題），以 BM25 從 4 份 PDF（共 53 頁）與 4 張圖片選出每題前 50 名；其中 7 筆帶頁圖（上傳的圖片與 iiot 報告第 7 頁優先，不足依名次補），頁圖是 180 DPI、長邊上限 1600 的 PNG。送進模型的方式照後端與推論服務：同一 modality 一批、每批最多 8 筆、循序，`KM_RERANK_TILES=1`，token 上限依 modality。每組各自一個程序、先跑 1 題暖機；每組開跑前推論服務都沒有載入模型，Gemma（MLX、上限 2 GiB）常駐。這份候選每題 rerank 5.87s，比 §8.13 實際候選的 7.4s 短。
 
-| 每題 50 筆 | 平均 | 與 fp32 參考的 logit 最大差 | 前 6 名集合不同 | 前 6 名順序不同 | GPU 記憶體峰值 |
+| 每題 50 筆 | 平均 | 與 fp32 參考的 logit 最大差 | 前 6 名集合不同 | 前 6 名順序不同 | 使用中記憶體峰值（不含快取） |
 | --- | --- | --- | --- | --- | --- |
 | PyTorch MPS fp32（參考） | 18.16s | — | — | — | 9.12 GiB |
 | PyTorch MPS fp16（現行） | 5.87s | 0.0106 | 0/36 | 1 | 4.89 GiB |
@@ -433,5 +433,24 @@ Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重）�
 
   每題有效 token 約 2.0 萬、補齊後約 3.2 萬（有效 63%），約 79 TFLOP；PyTorch MPS fp16 每題 5.87s 相當於約 13.5 TFLOPS。
 - 精度：PyTorch MPS fp32 和 CPU fp32 在 4 個固定批次上差 1e-5，MLX fp32 和它們也差 1e-5。MLX 在 M6 上預設讓 float32 matmul 走 TF32（`MLX_ENABLE_TF32`），沒關掉時差 0.0036，比 PyTorch fp16 還大。
-- 記憶體：程序 RSS 最高 PyTorch fp16 6.80 GiB、MLX fp16 3.60 GiB。MLX 第一版載入時同時持有 bf16 原檔與 fp16 副本，可用記憶體一度剩 0.15 GiB、記憶體壓力 critical 2 秒、swap 增加 2.3 GiB；改成逐個 tensor 轉換後，之後三組壓力都維持 normal。
-- 移植與量測工具在 `knowva-mac:~/knowva-inference/nemotron-vl-mlx/`（`tools/knowva/build_sets.py` 組候選、`bench_sets.py` 量時間與 logit、`compare_runs.py` 比較、`run-sets.sh` 依序執行並取樣記憶體），結果在 `knowva-mac:~/knowva-inference/bench-results/rerank-sets-20261006-015536/` 與 `rerank-sets2-20261006-023640/`。
+- 記憶體要看程序的 phys_footprint（`top` 的 MEM）：macOS 的 RSS 不算 GPU buffer，`mx.get_peak_memory()` 不算 MLX 的 buffer cache。MLX 的 buffer cache 預設沒有實際上限，每筆長度不同，釋放的 buffer 被留著重用，36 題後長到 13.8 GiB。單獨跑 rerank、逐筆不補 padding、fp16（`rerank-cache-20261006-030622/`）：
+
+  | | 每題 | 程序 footprint |
+  | --- | --- | --- |
+  | MLX，預設 cache | 3.80s | 17 GB |
+  | MLX，cache 上限 0 | 3.99s | 3.6 GB |
+  | MLX，cache 上限 256 MB | 3.88s | 3.8 GB |
+  | MLX，cache 上限 1 GB | 3.88s | 4.6 GB |
+  | PyTorch MPS | 4.34s | 5.0 GB |
+
+- 推論服務本身（`server.py` 加 `KM_RERANK_BACKEND`，在 9502 埠另跑一份，正式服務沒動）：先 embed 一次查詢讓 embed 常駐，等同有人在問的狀態，再用 HTTP 照後端格式送 36 題（`tools/knowva/server-test.sh`）。
+
+  | `KM_RERANK_BACKEND` | 每題 rerank | footprint 峰值 | 跑完時 footprint | 記憶體壓力 |
+  | --- | --- | --- | --- | --- |
+  | torch | 5.90s | 10.0 GB | 9.2 GB | normal |
+  | mlx，`KM_MLX_CACHE_MB=256` | 3.96s | 9.9 GB | 8.4 GB | normal |
+  | mlx，沒設上限 | 4.08s | 23 GB | — | warn，swap 增加 4.1 GB |
+
+  embed 仍跑 PyTorch，程序裡還是有 PyTorch runtime 與 MPS 快取，所以峰值幾乎一樣。結果在 `rerank-server2-20261006-025831/`（沒設上限）與 `rerank-server3-20261006-031952/`。
+- MLX 第一版載入時同時持有 bf16 原檔與 fp16 副本，可用記憶體一度剩 0.15 GiB、記憶體壓力 critical 2 秒、swap 增加 2.3 GiB；改成逐個 tensor 轉換後沒有再出現。
+- 移植與量測工具在 `knowva-mac:~/knowva-inference/nemotron-vl-mlx/`（`tools/knowva/build_sets.py` 組候選、`bench_sets.py` 量時間與 logit、`compare_runs.py` 比較、`run-sets.sh` 依序執行並取樣記憶體、`cache-sweep.sh` 與 `server-test.sh`）。以上結果都在 `knowva-mac:~/knowva-inference/bench-results/` 底下，36 題的比較在 `rerank-sets-20261006-015536/` 與 `rerank-sets2-20261006-023640/`。
