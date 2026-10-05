@@ -333,3 +333,25 @@ A4B 每輪都在編碼頁圖時 Metal OOM（`kIOGPUCommandBufferCallbackErrorOut
 - Machine Guarding 五題都通過；四題的第一名來源與 §8.10 相同，`pptx-guard-types` 原本的第一名第 23 頁仍在前三。
 - 沒過的題目都在 §8.9、§8.10 列過：realistic 的 XLSX 四題數字對錯欄（#40）、海報三題讀不出小字；examples 的 PPTX 一題（只有 Lorem ipsum，檔名不在檢索內容裡，#41）與 `png-logo`、`png-arm-color`。examples 的 `jpg-task` 這次通過，但圖片上傳本來就一律看圖、送進模型的內容沒變，只是回答本身有波動。
 - `--replace` 刪舊 STP 時，`UPDATE documents SET status = 'failed'` 的慢查詢警告是刪除流程先把文件撤出檢索；245 個 unit 的 BM25 統計要 2.7s，不是錯誤。
+
+### 8.12 Gemma 同時處理數（2026-10-05）
+
+`dev-page-vision-20261003-2`、知識庫同 §8.11 的 17 份文件，其餘設定同 README（`KM_IDLE_SECS=600`、rerank 1 tile、chat 頁圖長邊 1280）。`bench/parallel-sweep.sh` 依序把 `OLLAMA_NUM_PARALLEL` 設成 1、2、3（三組都 `LLAMA_ARG_CTX_CHECKPOINTS=2`），每組重啟 Ollama、暖機一題，再跑 `bench/concurrency.ts`：1–4 人同時送出單輪問題，每種人數兩輪，共 20 題、題題不同，三組問同一批題目、同樣的組合。每 2 秒記一次 swap 與記憶體，app 與 Ollama 的 log 拆出各階段時間。
+
+全部答完的時間（括號內是平均／最慢的首字）：
+
+| 同時人數 | 1 格 | 2 格 | 3 格 |
+| --- | --- | --- | --- |
+| 1 | 19.1s（16.4／16.4s） | 19.3s（17.0／17.8s） | 20.8s（18.4／19.1s） |
+| 2 | 38.9s（29.7／37.2s） | 40.1s（36.3／38.5s） | 48.0s（44.2／48.4s） |
+| 3 | 69.3s（45.5／65.7s） | 67.6s（47.7／64.0s） | 85.1s（72.3／76.8s） |
+| 4 | 85.3s（59.4／84.3s） | 86.3s（64.3／86.0s） | 104.3s（83.9／100.2s） |
+| 每分鐘答完（2–4 人） | 2.6–3.1 題 | 2.7–3.0 題 | 2.1–2.5 題 |
+| swap 最高 | 2.9 GiB | 4.7 GiB | 7.0 GiB |
+
+- 一格時每題的 GPU 時間：rerank 7.3s（50 筆候選、平均 7 筆圖片 passage）、prefill 8.2s（3.3K tokens，約 400 tok/s）、生成 40–90 tokens 約 3–5s。推論服務的 embed／rerank 共用一把鎖，一次只做一題，4 人同時時 rerank 平均 29s、最慢 36s。
+- 2 格：兩題同時 prefill 時每題 236 tok/s，合計和一格相同；生成每題 13 tok/s。吞吐沒有增加，首字反而平均晚一些，因為兩題一起做完而不是先做完一題。
+- 3 格：swap 到 7.0 GiB，生成每題 8.7–9.3 tok/s，3–4 人同時時 rerank 平均 32–38s，吞吐比一格少約 20%。
+- KV cache 每格 896 MiB（全域層 256 + sliding-window 層 640）；`/api/ps` 的大小 1／2／3 格為 7.97／8.67／9.41 GB。三組 Ollama log 都沒有 OOM，可用記憶體最低都是 0.1 GiB；測試開始前 swap 已有 1.6 GiB。
+- 60 題答對 59 題。沒過的是 2 格、3 人那輪的 `jpg-brand`（KUKA 答成 KURODA），一格與三格同一題都對。回答請求沒有指定 temperature，用的是 Ollama 的預設取樣，§8.11 也記過圖片題的回答會波動。
+- 這組題目的回答都短，每題時間由 rerank 與 prefill 決定；回答長的時候（同日另一筆 619 tokens 生成 34.6s），多格合批生成的效果沒有在這裡量到。

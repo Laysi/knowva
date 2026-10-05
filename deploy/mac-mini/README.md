@@ -20,6 +20,7 @@
 - **Embed / Rerank 閒置 10 分鐘才卸載**（`KM_IDLE_SECS=600`）：每題都卸載實測是虧的。Gemma 常駐時權重會被擠出檔案快取，每次重新載入 embed 4–5s、rerank 約 5s，比省下的 Gemma prefill（4–5s）還多；對話中兩個模型保持載入，第 2、3 輪首字從 39–44s 降到 30s。沒人用 10 分鐘後歸還約 6 GB。
 - **Ollama prompt cache 上限 2 GB**（`LLAMA_ARG_CACHE_RAM`）：預設 8 GB，llama-server 實體佔用 10.8 GB，是 swap 的主因；2 GB 時 3.3 GB，仍保留最近約兩份 prompt 給追問；交替 A/B 量不出速度差。Gemma 4 sliding-window 層的 context checkpoint 每個 320 MB、預設上限 32，同理設 `LLAMA_ARG_CTX_CHECKPOINTS=4`。
 - **Ollama context 16384、flash attention 開、`keep_alive=-1`**：6 頁 prompt 有 7–9K tokens，預設 4096 會截斷；FA 讓 12B 解碼 15.5→17.2 tok/s；模型常駐省掉每題 3s 載入。
+- **Ollama 一次只答一題**（`OLLAMA_NUM_PARALLEL=1`）：每題的 rerank 與 prefill 已經用滿 GPU，1–4 人同時提問時一格每分鐘答完 2.6–3.1 題；2 格吞吐相同、swap 多 1.8 GiB，3 格 swap 到 7 GiB、吞吐少約 20%。多人同時用時，排隊最久的是推論服務裡一次只做一題的 rerank（4 人同時平均 29s）。
 
 ## 從零安裝
 
