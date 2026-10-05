@@ -8,7 +8,7 @@
 
 | 分類 | 內容 |
 | --- | --- |
-| 應做 | 文件上傳、原檔保存、頁面化前處理(PDF/Office/圖片逐頁轉圖 + Embed VL 嵌入,見 §6)、md/txt 標題感知 chunk、pgvector、文字層 hybrid search、Rerank VL、AI 回答(Gemma 直讀來源頁圖)、來源引用(檔名+頁碼)。 |
+| 應做 | 文件上傳、原檔保存、頁面化前處理(PDF/Office/圖片逐頁轉圖 + Embed VL 嵌入,見 §6)、md/txt 標題感知 chunk、pgvector、文字層 hybrid search、Rerank VL、AI 回答(Gemma 直讀需要看圖的來源頁圖,其餘頁只讀文字層;見 #38)、來源引用(檔名+頁碼)。 |
 | 可做但限縮 | 文字層加值:PDF 內嵌文字抽出供 BM25/引用片段/「圖+文」嵌入;掃描頁 MVP 先走純圖嵌入(OCR 列選配),不承諾所有格式完美。 |
 | 不做(非目標 — 本產品不是 SaaS) | 多租戶、雲端帳號體系、計費。 |
 | 先不做(留給未來方案或視客戶需求) | SSO/複雜權限繼承、GraphRAG、agent workflow、知識圖譜、完整 admin 後台、部署器、維運監控、標準欄位全填(bbox/confidence)。 |
@@ -55,7 +55,7 @@
 
 1. **原檔保存**(不變)。
 2. **頁面化**:PDF 以 pdfium 逐頁轉圖(約 150-200 DPI);圖片檔視為單頁;DOCX/PPTX/XLSX 先經 LibreOffice headless 轉 PDF 再轉圖(容器含 CJK 字型);md/txt 不轉圖,沿用標題感知 chunk。
-3. **嵌入**:頁圖與文字 chunk 都用 llama-nemotron-embed-vl-1b-v2,同一 2048 維空間、同一索引(pgvector `halfvec(2048)` + HNSW);有 PDF 文字層時用「圖+文」合併嵌入(官方評測三種輸入中命中率最高)。
+3. **嵌入**:頁圖與文字 chunk 都用 llama-nemotron-embed-vl-1b-v2,同一 2048 維空間、同一索引(pgvector `halfvec(2048)` + HNSW);需要看圖的頁(`needs_vision`)有 PDF 文字層時用「圖+文」合併嵌入(官方評測三種輸入中命中率最高),文字層足以代表整頁的頁只用文字嵌入。2026-10-02 起由 #38 取代原本「有文字層一律圖+文」的規格:地端推理的成本幾乎都在圖片,而多數頁面的圖沒有文字層以外的資訊。
 4. **文字層(加值,非關鍵路徑)**:PDF 內嵌文字直接抽出填 `content` — 供 BM25、引用片段、摘要;掃描頁 MVP 先純圖嵌入,OCR/VLM 轉錄列選配,缺文字層不阻擋入庫。
 5. **ready 契約**:每文件 bounded concurrency 呼叫 embedding;每個回應必須恰為 2048 維 finite float。所有 unit 成功後才在單一 transaction 內替換 `document_units`、核對 artifact/unit 計數並設為 ready。摘要/標籤目前不在關鍵路徑產生。
 6. **查詢與回答**:query 使用同模型的 text query embedding；dense top-50 與文字 BM25 top-50 已用 RRF(k=60) 合併，既有 chat 暫取融合前 8 筆。Rerank VL 與 Gemma 4 直讀召回頁圖由後續 issue 串接。

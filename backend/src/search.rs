@@ -3,6 +3,7 @@ use crate::cloud_models::{
     CloudModelClient, CloudModelError, CloudModelResult, MAX_EMBED_IMAGE_BYTES, RerankPassage,
     RerankResponse,
 };
+use crate::page_vision::page_uses_image;
 use crate::storage::{IO_CONCURRENCY, Storage, StorageError};
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -33,6 +34,7 @@ pub struct CandidateMetadata {
     pub page_number: Option<i32>,
     pub image_path: Option<String>,
     pub content: Option<String>,
+    pub needs_vision: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +56,9 @@ pub struct RetrievalCandidate {
     pub page_number: Option<i32>,
     pub image_path: Option<String>,
     pub content: Option<String>,
+    /// Set when model stages must see the page image; text-only pages are
+    /// reranked and answered from `content` alone.
+    pub needs_vision: bool,
     pub dense_rank: Option<usize>,
     pub dense_score: Option<f64>,
     pub bm25_rank: Option<usize>,
@@ -61,6 +66,13 @@ pub struct RetrievalCandidate {
     pub rrf_score: f64,
     pub rerank_score: Option<f64>,
     pub rerank_rank: Option<usize>,
+}
+
+impl RetrievalCandidate {
+    /// Whether model stages send this candidate's page image.
+    pub fn uses_page_image(&self) -> bool {
+        self.kind == "page" && page_uses_image(self.needs_vision, self.content.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,6 +410,7 @@ pub async fn catalog_candidates(pool: &sqlx::PgPool) -> anyhow::Result<Vec<Retri
                 page_number: None,
                 image_path: None,
                 content: Some(content),
+                needs_vision: false,
                 dense_rank: None,
                 dense_score: None,
                 bm25_rank: None,
@@ -570,6 +583,7 @@ struct CandidateRow {
     page_number: Option<i32>,
     image_path: Option<String>,
     content: Option<String>,
+    needs_vision: bool,
     score: f64,
 }
 
@@ -585,6 +599,7 @@ impl CandidateRow {
                 page_number: self.page_number,
                 image_path: self.image_path,
                 content: self.content,
+                needs_vision: self.needs_vision,
             },
             rank,
             score: self.score,
@@ -601,7 +616,7 @@ pub(crate) async fn dense_candidates_from_pool(
     let rows = sqlx::query_as::<_, CandidateRow>(
         "WITH nearest AS MATERIALIZED ( \
            SELECT u.id AS unit_id, u.unit_index, u.document_id, u.kind, u.page_number, \
-                  u.image_path, u.content, \
+                  u.image_path, u.content, u.needs_vision, \
                   (u.embedding <=> $1)::double precision AS distance \
            FROM document_units AS u \
            WHERE u.retrieval_ready \
@@ -609,7 +624,7 @@ pub(crate) async fn dense_candidates_from_pool(
            LIMIT $2 \
          ) \
          SELECT nearest.unit_id, nearest.unit_index, nearest.document_id, d.filename, nearest.kind, \
-                nearest.page_number, nearest.image_path, nearest.content, \
+                nearest.page_number, nearest.image_path, nearest.content, nearest.needs_vision, \
                 (1.0 - nearest.distance)::double precision AS score \
          FROM nearest \
          JOIN documents AS d ON d.id = nearest.document_id \
@@ -645,7 +660,8 @@ pub(crate) async fn bm25_candidates_from_pool(
            FROM query_terms \
          ), candidate_units AS MATERIALIZED ( \
            SELECT u.id AS unit_id, u.unit_index, u.document_id, u.kind, \
-                  u.page_number, u.image_path, u.content, u.bm25_tokens, u.bm25_length \
+                  u.page_number, u.image_path, u.content, u.needs_vision, u.bm25_tokens, \
+                  u.bm25_length \
            FROM document_units AS u \
            CROSS JOIN query_token_array AS query \
            WHERE u.retrieval_ready \
@@ -655,7 +671,7 @@ pub(crate) async fn bm25_candidates_from_pool(
          ), scored AS ( \
            SELECT candidate.unit_id, candidate.unit_index, candidate.document_id, document.filename, \
                   candidate.kind, candidate.page_number, candidate.image_path, \
-                  candidate.content, \
+                  candidate.content, candidate.needs_vision, \
                   sum( \
                     ln(1.0 + ( \
                       (greatest(corpus.document_count - term_stats.document_frequency, 0)::double precision + 0.5) \
@@ -686,9 +702,10 @@ pub(crate) async fn bm25_candidates_from_pool(
              AND frequency.tf > 0 \
            GROUP BY candidate.unit_id, candidate.unit_index, candidate.document_id, document.filename, \
                     candidate.kind, candidate.page_number, candidate.image_path, \
-                    candidate.content \
+                    candidate.content, candidate.needs_vision \
          ) \
-         SELECT unit_id, unit_index, document_id, filename, kind, page_number, image_path, content, score \
+         SELECT unit_id, unit_index, document_id, filename, kind, page_number, image_path, content, \
+                needs_vision, score \
          FROM scored \
          ORDER BY score DESC, unit_id \
          LIMIT $2",
@@ -1057,13 +1074,23 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
     }
 
     let started = Instant::now();
-    let batch_count = candidates.len().div_ceil(config.batch_size);
+    let batches = modality_batches(candidates, config.batch_size);
+    let batch_count = batches.len();
+    let image_passage_count = candidates
+        .iter()
+        .filter(|candidate| candidate.uses_page_image())
+        .count();
+    let text_passage_count = candidates.len() - image_passage_count;
     let mut scores = vec![None; candidates.len()];
     let mut request_count = 0_u32;
 
-    for (batch_index, batch) in candidates.chunks(config.batch_size).enumerate() {
+    for (batch_index, batch) in batches.iter().enumerate() {
         let batch_started = Instant::now();
-        let passages = prepare_rerank_passages(batch, storage).await?;
+        let batch_candidates = batch
+            .iter()
+            .map(|index| &candidates[*index])
+            .collect::<Vec<_>>();
+        let passages = prepare_rerank_passages(&batch_candidates, storage).await?;
         request_count = request_count.saturating_add(1);
         let response = match backend.rerank(query, &passages).await {
             Ok(response) => response,
@@ -1085,6 +1112,8 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
                     tracing::info!(
                         stage = "rerank",
                         candidate_count = candidates.len(),
+                        image_passage_count,
+                        text_passage_count,
                         output_count = fallback.len(),
                         batch_count,
                         latency_ms = started.elapsed().as_millis() as u64,
@@ -1103,13 +1132,9 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
         };
         validate_batch_rankings(&response, batch.len(), batch_index)?;
 
-        let batch_start = batch_index * config.batch_size;
         for ranking in response.rankings {
-            let global_index = batch_start.checked_add(ranking.index).ok_or_else(|| {
-                RerankStageError::Mapping(format!(
-                    "batch {batch_index} ranking index overflowed the candidate list"
-                ))
-            })?;
+            // Validation above guarantees the index is inside this batch.
+            let global_index = batch[ranking.index];
             let slot = scores.get_mut(global_index).ok_or_else(|| {
                 RerankStageError::Mapping(format!(
                     "batch {batch_index} mapped outside the candidate list"
@@ -1166,6 +1191,8 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
     tracing::info!(
         stage = "rerank",
         candidate_count = candidates.len(),
+        image_passage_count,
+        text_passage_count,
         output_count = reranked.len(),
         batch_count,
         latency_ms = started.elapsed().as_millis() as u64,
@@ -1178,6 +1205,31 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
         request_count,
         fallback: false,
     })
+}
+
+/// Splits candidates into batches of one modality, each listing candidate
+/// indices in RRF order. A rerank request is processed as a single modality,
+/// so mixing would make text passages pay the image cost and let their scores
+/// depend on batch-mates. Groups follow the order of their first candidate, so
+/// a single-modality list batches exactly as plain chunking would.
+fn modality_batches(candidates: &[RetrievalCandidate], batch_size: usize) -> Vec<Vec<usize>> {
+    let mut groups: Vec<(bool, Vec<usize>)> = Vec::with_capacity(2);
+    for (index, candidate) in candidates.iter().enumerate() {
+        let uses_image = candidate.uses_page_image();
+        match groups.iter_mut().find(|(group, _)| *group == uses_image) {
+            Some((_, indices)) => indices.push(index),
+            None => groups.push((uses_image, vec![index])),
+        }
+    }
+    groups
+        .into_iter()
+        .flat_map(|(_, indices)| {
+            indices
+                .chunks(batch_size)
+                .map(<[usize]>::to_vec)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn validate_batch_rankings(
@@ -1219,7 +1271,7 @@ fn validate_batch_rankings(
 /// Prepares one batch with bounded concurrent page reads. `buffered` keeps the
 /// original candidate order and reports the first failure in that order.
 async fn prepare_rerank_passages(
-    candidates: &[RetrievalCandidate],
+    candidates: &[&RetrievalCandidate],
     storage: &Storage,
 ) -> Result<Vec<RerankPassage>, RerankStageError> {
     // Futures are built eagerly (they stay lazy until polled) so the stream type
@@ -1243,6 +1295,13 @@ async fn prepare_rerank_passage(
         message,
     };
     match candidate.kind.as_str() {
+        "page" if !candidate.uses_page_image() => candidate
+            .content
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(RerankPassage::text)
+            .ok_or_else(|| invalid("text-only page is missing non-empty content".to_string())),
         "page" => {
             let key = candidate
                 .image_path
@@ -1292,6 +1351,7 @@ fn ranked_route_candidates(candidates: &[RankedCandidate], dense: bool) -> Vec<R
             page_number: ranked.metadata.page_number,
             image_path: ranked.metadata.image_path.clone(),
             content: ranked.metadata.content.clone(),
+            needs_vision: ranked.metadata.needs_vision,
             dense_rank: dense.then_some(ranked.rank),
             dense_score: dense.then_some(ranked.score),
             bm25_rank: (!dense).then_some(ranked.rank),
@@ -1366,6 +1426,7 @@ pub fn reciprocal_rank_fusion(
                         page_number: ranked.metadata.page_number,
                         image_path: ranked.metadata.image_path.clone(),
                         content: ranked.metadata.content.clone(),
+                        needs_vision: ranked.metadata.needs_vision,
                         dense_rank: None,
                         dense_score: None,
                         bm25_rank: None,
@@ -1432,6 +1493,7 @@ mod tests {
             page_number: Some(unit_id as i32),
             image_path: Some(format!("/pages/{unit_id}.png")),
             content: Some(format!("content {unit_id}")),
+            needs_vision: true,
         }
     }
 
@@ -1466,6 +1528,7 @@ mod tests {
             page_number: (kind == "page").then_some(unit_id as i32),
             image_path,
             content: content.map(str::to_string),
+            needs_vision: kind == "page",
             dense_rank: Some(unit_id as usize),
             dense_score: Some(1.0 / unit_id as f64),
             bm25_rank: None,
@@ -1604,6 +1667,7 @@ mod tests {
             "pageNumber",
             "imagePath",
             "content",
+            "needsVision",
             "denseRank",
             "denseScore",
             "bm25Rank",
@@ -1641,11 +1705,20 @@ mod tests {
         );
     }
 
+    fn text_only_page(unit_id: i64, image_path: String, content: &str) -> RetrievalCandidate {
+        RetrievalCandidate {
+            needs_vision: false,
+            ..retrieval_candidate(unit_id, "page", Some(image_path), Some(content))
+        }
+    }
+
     #[tokio::test]
-    async fn rerank_payload_covers_image_text_image_only_and_text_only() {
+    async fn rerank_payload_covers_every_modality_in_single_modality_batches() {
         let storage = Storage::memory();
         let mixed_image = format!("{}/artifacts-run/pages/0001.png", Uuid::from_u128(101));
         let image_only = format!("{}/artifacts-run/pages/0002.png", Uuid::from_u128(102));
+        // Never stored: a text-only page must not read its image.
+        let text_page_image = format!("{}/artifacts-run/pages/0004.png", Uuid::from_u128(104));
         let png = b"\x89PNG\r\n\x1a\nmock-rerank-page";
         storage
             .put(&mixed_image, png.to_vec())
@@ -1659,6 +1732,7 @@ mod tests {
             retrieval_candidate(1, "page", Some(mixed_image.clone()), Some("same-page text")),
             retrieval_candidate(2, "page", Some(image_only.clone()), None),
             retrieval_candidate(3, "text", None, Some("markdown chunk")),
+            text_only_page(4, text_page_image.clone(), "  text-only page  "),
         ];
         let reranker = FakeReranker::new(Vec::new());
         let result = rerank_candidates(
@@ -1666,11 +1740,11 @@ mod tests {
             "query",
             &candidates,
             &storage,
-            RerankConfig::new(3, 3, 3).expect("config"),
+            RerankConfig::new(4, 4, 4).expect("config"),
         )
         .await
         .expect("rerank all modalities");
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 4);
         for candidate in &result {
             let original = candidates
                 .iter()
@@ -1681,26 +1755,36 @@ mod tests {
             assert_eq!(candidate.page_number, original.page_number);
             assert_eq!(candidate.image_path, original.image_path);
             assert_eq!(candidate.content, original.content);
+            assert_eq!(candidate.needs_vision, original.needs_vision);
         }
 
         {
             let requests = reranker.requests.lock().expect("requests lock");
-            assert_eq!(requests.len(), 1);
-            let passages = requests[0].as_array().expect("passages array");
-            assert_eq!(passages[0]["text"], "same-page text");
+            // One request per modality, even though all four fit one batch.
+            assert_eq!(requests.len(), 2);
+            let image_passages = requests[0].as_array().expect("image passages array");
+            assert_eq!(image_passages.len(), 2);
+            assert_eq!(image_passages[0]["text"], "same-page text");
             assert!(
-                passages[0]["image"]
+                image_passages[0]["image"]
                     .as_str()
                     .is_some_and(|image| image.starts_with("data:image/png;base64,"))
             );
-            assert!(passages[1].get("text").is_none());
+            assert!(image_passages[1].get("text").is_none());
             assert!(
-                passages[1]["image"]
+                image_passages[1]["image"]
                     .as_str()
                     .is_some_and(|image| image.starts_with("data:image/png;base64,"))
             );
-            assert_eq!(passages[2], serde_json::json!({ "text": "markdown chunk" }));
-            assert!(passages.iter().all(|passage| {
+            let text_passages = requests[1].as_array().expect("text passages array");
+            assert_eq!(
+                text_passages,
+                &vec![
+                    serde_json::json!({ "text": "markdown chunk" }),
+                    serde_json::json!({ "text": "text-only page" }),
+                ]
+            );
+            assert!(image_passages.iter().all(|passage| {
                 !passage
                     .get("image")
                     .and_then(serde_json::Value::as_str)
@@ -1709,6 +1793,127 @@ mod tests {
                     })
             }));
         }
+    }
+
+    #[tokio::test]
+    async fn interleaved_modalities_map_scores_back_to_their_candidates() {
+        let storage = Storage::memory();
+        let png = b"\x89PNG\r\n\x1a\nmock-rerank-page";
+        let mut candidates = Vec::new();
+        for unit_id in 1..=4 {
+            let image_path = format!(
+                "{}/artifacts-run/pages/{unit_id:04}.png",
+                Uuid::from_u128(unit_id as u128 + 100)
+            );
+            let content = format!("page {unit_id}");
+            if unit_id % 2 == 1 {
+                storage
+                    .put(&image_path, png.to_vec())
+                    .await
+                    .expect("store vision page image");
+                candidates.push(retrieval_candidate(
+                    unit_id,
+                    "page",
+                    Some(image_path),
+                    Some(&content),
+                ));
+            } else {
+                candidates.push(text_only_page(unit_id, image_path, &content));
+            }
+        }
+        // RRF order is [1 vision, 2 text, 3 vision, 4 text]; batches are [1, 3]
+        // then [2, 4]. Batch-local index 0 of the second batch is unit 2.
+        let responses = vec![
+            Ok(RerankResponse {
+                rankings: vec![
+                    RerankResult {
+                        index: 0,
+                        logit: 0.1,
+                    },
+                    RerankResult {
+                        index: 1,
+                        logit: 0.7,
+                    },
+                ],
+            }),
+            Ok(RerankResponse {
+                rankings: vec![
+                    RerankResult {
+                        index: 1,
+                        logit: 0.4,
+                    },
+                    RerankResult {
+                        index: 0,
+                        logit: 0.9,
+                    },
+                ],
+            }),
+        ];
+        let reranker = FakeReranker::new(responses);
+        let result = rerank_candidates(
+            &reranker,
+            "query",
+            &candidates,
+            &storage,
+            RerankConfig::new(4, 4, 2).expect("config"),
+        )
+        .await
+        .expect("rerank interleaved modalities");
+
+        assert_eq!(
+            result
+                .iter()
+                .map(|candidate| (candidate.unit_id, candidate.rerank_score))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, Some(0.9)),
+                (3, Some(0.7)),
+                (4, Some(0.4)),
+                (1, Some(0.1))
+            ]
+        );
+        let requests = reranker.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .as_array()
+                .expect("vision batch")
+                .iter()
+                .all(|passage| passage.get("image").is_some())
+        );
+        assert_eq!(
+            requests[1],
+            serde_json::json!([{ "text": "page 2" }, { "text": "page 4" }])
+        );
+    }
+
+    #[test]
+    fn single_modality_lists_batch_like_plain_chunking() {
+        let pages = (1..=5)
+            .map(|unit_id| retrieval_candidate(unit_id, "page", None, Some("text")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            modality_batches(&pages, 2),
+            vec![vec![0, 1], vec![2, 3], vec![4]]
+        );
+        let mixed = vec![
+            retrieval_candidate(1, "text", None, Some("chunk")),
+            retrieval_candidate(2, "page", None, Some("text")),
+            retrieval_candidate(3, "text", None, Some("chunk")),
+        ];
+        // Groups follow the RRF position of their first member.
+        assert_eq!(modality_batches(&mixed, 8), vec![vec![0, 2], vec![1]]);
+    }
+
+    #[test]
+    fn blank_text_only_pages_still_use_their_image() {
+        let blank = RetrievalCandidate {
+            needs_vision: false,
+            ..retrieval_candidate(1, "page", None, Some("   "))
+        };
+        assert!(blank.uses_page_image());
+        assert!(!text_only_page(2, "page.png".to_string(), "text").uses_page_image());
+        assert!(!retrieval_candidate(3, "text", None, Some("chunk")).uses_page_image());
     }
 
     #[tokio::test]

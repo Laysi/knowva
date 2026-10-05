@@ -1,0 +1,348 @@
+{
+  "version": 1,
+  "notes": "Real public documents, fetched by url and pinned by sha256 (bun bench/examples.ts --dataset bench/realistic.json --fetch --files <dir>). They are not redistributed in this repository; check each source's terms before using them elsewhere. Scoring fields are the same as examples.json.",
+  "files": [
+    {
+      "filename": "智慧機械產業推動方案.pdf",
+      "url": "https://www.ey.gov.tw/File/B4E09F46D06F3F56",
+      "sha256": "756b106e93f1f906cdc56169a30c4addfa8c588b7f64da893fc545b5510269e0",
+      "source": "行政院第 3507 次會議（105-07-21）經濟部報告簡報，行政院全球資訊網",
+      "pages": 6
+    },
+    {
+      "filename": "OSHA 3080 Hand and Power Tools.pdf",
+      "url": "https://www.osha.gov/sites/default/files/publications/OSHA3080.pdf",
+      "sha256": "f1cfa8f10e7603d0ffebf6548dd9d65ca9067c380f3643bdb9b0b964be0c1ae0",
+      "source": "U.S. OSHA publication 3080 (2002 revised); U.S. federal government work",
+      "pages": 32
+    },
+    {
+      "filename": "NASA Tech Brief 68-10383.pdf",
+      "url": "https://ntrs.nasa.gov/api/citations/19680000383/downloads/19680000383.pdf",
+      "sha256": "29227ce6ecd7b8d5ce961814853b2a32867f6e8a33aa8eddea18114034b1db75",
+      "source": "NASA Technical Reports Server, scanned 1968 tech brief with an OCR text layer; U.S. federal government work",
+      "pages": 1
+    },
+    {
+      "filename": "固定式起重機每月自動檢查紀錄表.docx",
+      "url": "https://orgws.kcg.gov.tw/001/KcgOrgUploadFiles/405/relfile/73920/206261/5484f128-12fd-482b-bbf5-4eec0463409c.docx",
+      "sha256": "e1d62e62ce481422066a83c14df1123243eb4ecaa8f1129d40a6ac41127450b7",
+      "source": "高雄市政府勞工局勞動檢查處公開的參考表單"
+    },
+    {
+      "filename": "112年重大職災分析.xlsx",
+      "url": "https://www.osha.gov.tw/media/31goibwr/7_%E9%87%8D%E5%A4%A7%E8%81%B7%E7%81%BD%E5%88%86%E6%9E%90-%E8%A1%A87-1%E8%87%B37-3.xlsx?mediaDL=true",
+      "sha256": "817e916cd172a5b5a15156f9ea66090439a1b65e0d4673ea0602884355debc2e",
+      "source": "勞動部職業安全衛生署 112 年勞動檢查統計年報，表 7-1 至 7-3"
+    },
+    {
+      "filename": "Machine Guarding.pptx",
+      "url": "https://www.osha.gov/sites/default/files/2021-05/Machine%20Guarding.pptx",
+      "sha256": "10a8930cf4069555d0beaf48ef5618e1c31233c5d4fb30141b7f57c6e745438d",
+      "source": "OSHA Susan Harwood Training Grant SH-05029-SH8 (Pueblo Community College) training deck, published on osha.gov",
+      "pages": 75
+    },
+    {
+      "filename": "機械災害預防海報.jpg",
+      "url": "https://www.osha.gov.tw/media/zqefwr51/.jpg?mediaDL=true",
+      "sha256": "ace4683b55d2e4c1810abaca4e29ca462c2d8149e64dde2440f87d0f6a59d7d9",
+      "source": "勞動部職業安全衛生署宣導海報「機械災害預防」",
+      "pages": 1,
+      "visionPages": [1]
+    },
+    {
+      "filename": "起重吊掛危害預防海報.jpg",
+      "url": "https://www.osha.gov.tw/media/hdbbfs2z/.jpg?mediaDL=true",
+      "sha256": "13d3bfb1fe3720d64f6e5ac204dc57eaec5b66db1ec24b63152b7461e5a82f25",
+      "source": "勞動部職業安全衛生署宣導海報「起重吊掛危害預防」",
+      "pages": 1,
+      "visionPages": [1]
+    },
+    {
+      "filename": "open62541 README.md",
+      "url": "https://raw.githubusercontent.com/open62541/open62541/fc0bf5614e92ab149cd4351cb7f3fdbeba391e0a/README.md",
+      "sha256": "96db6ac9e868e72e8a7e03aaad6bb78e2ffd658aa7b53169fbd3dd935a4f394e",
+      "source": "open62541 README at commit fc0bf56; MPL-2.0",
+      "pages": 0,
+      "visionPages": []
+    }
+  ],
+  "cases": [
+    {
+      "id": "ey-p1-meeting",
+      "category": "pdf-zh",
+      "turns": ["智慧機械產業推動方案是在行政院第幾次會議提出、由誰報告？"],
+      "source": { "filename": "智慧機械產業推動方案.pdf", "pages": [1] },
+      "mustInclude": [["3507"], ["吳明機", "吳局長"]]
+    },
+    {
+      "id": "ey-p3-technologies",
+      "category": "pdf-zh",
+      "turns": ["智慧機械產業生態體系圖中，「智慧技術」包含哪些項目？"],
+      "source": { "filename": "智慧機械產業推動方案.pdf", "pages": [3] },
+      "mustInclude": [["機器人"], ["物聯網"], ["大數據"], ["感測器"]]
+    },
+    {
+      "id": "ey-p3-industries",
+      "category": "pdf-zh",
+      "turns": ["智慧機械產業生態體系中，國內應用產業練兵包含哪些產業？"],
+      "source": { "filename": "智慧機械產業推動方案.pdf", "pages": [3] },
+      "mustInclude": [["航太"], ["半導體"]]
+    },
+    {
+      "id": "ey-p4-strategies",
+      "category": "pdf-zh",
+      "turns": ["智慧機械產業推動方案的三大推動策略是什麼？"],
+      "source": { "filename": "智慧機械產業推動方案.pdf", "pages": [4] },
+      "mustInclude": [["連結在地"], ["連結未來"], ["連結國際"]]
+    },
+    {
+      "id": "ey-p5-controllers",
+      "category": "pdf-zh",
+      "turns": ["智慧機械產業推動方案中，中高階控制器出口占比 4 年內與 8 年後的目標各是多少？"],
+      "source": { "filename": "智慧機械產業推動方案.pdf", "pages": [5] },
+      "mustInclude": [["18"], ["30"]]
+    },
+    {
+      "id": "osha-p9-circular-saw",
+      "category": "pdf-en",
+      "turns": ["依 OSHA 3080，手提圓鋸的刀片直徑大於多少就必須隨時裝有護罩？"],
+      "source": { "filename": "OSHA 3080 Hand and Power Tools.pdf", "pages": [9] },
+      "mustInclude": [["2 inch", "2 吋", "2 英吋", "2英吋", "2吋", "5.08"]]
+    },
+    {
+      "id": "osha-p12-air-hose",
+      "category": "pdf-en",
+      "turns": ["OSHA 3080 規定空氣軟管直徑超過多少時，必須在氣源處安裝安全過流閥？"],
+      "source": { "filename": "OSHA 3080 Hand and Power Tools.pdf", "pages": [12] },
+      "mustInclude": [["½", "1/2", "0.5", "12.7", "半英吋"]]
+    },
+    {
+      "id": "osha-p14-misfire",
+      "category": "pdf-en",
+      "turns": ["依 OSHA 3080，火藥擊發工具（powder-actuated tool）啞火時，使用者要維持在操作位置多久才能再擊發？"],
+      "source": { "filename": "OSHA 3080 Hand and Power Tools.pdf", "pages": [14] },
+      "mustInclude": [["30 秒", "30秒", "30 seconds", "30-second", "三十秒"]]
+    },
+    {
+      "id": "osha-p16-jack",
+      "category": "pdf-en",
+      "turns": ["依 OSHA 3080，在同一工地持續使用的千斤頂多久要檢查一次？"],
+      "source": { "filename": "OSHA 3080 Hand and Power Tools.pdf", "pages": [16] },
+      "mustInclude": [["6 個月", "6個月", "六個月", "6 months", "six months", "半年"]]
+    },
+    {
+      "id": "osha-p22-phone",
+      "category": "pdf-en",
+      "turns": ["要向 OSHA 通報緊急狀況或提出申訴，可以打哪支電話？"],
+      "source": { "filename": "OSHA 3080 Hand and Power Tools.pdf", "pages": [22] },
+      "mustInclude": [["321-OSHA", "321-6742"]]
+    },
+    {
+      "id": "osha-follow-up",
+      "category": "multi-turn",
+      "turns": [
+        "OSHA 3080 對氣動工具（pneumatic tools）有哪些安全要求？",
+        "那空氣軟管多粗以上要加裝安全過流閥？"
+      ],
+      "source": { "filename": "OSHA 3080 Hand and Power Tools.pdf", "pages": [12] },
+      "mustInclude": [["½", "1/2", "0.5", "12.7", "半英吋"]]
+    },
+    {
+      "id": "nasa-crack-depth",
+      "category": "pdf-scanned",
+      "turns": ["NASA Tech Brief 68-10383 中，6061 鋁合金 TIG 焊接熱影響區的裂紋通常多深？"],
+      "source": { "filename": "NASA Tech Brief 68-10383.pdf", "pages": [1] },
+      "mustInclude": [["0.015"]]
+    },
+    {
+      "id": "nasa-crack-cause",
+      "category": "pdf-scanned",
+      "turns": ["NASA Tech Brief 68-10383 指出 6061 鋁合金焊件產生裂紋的原因是什麼？"],
+      "source": { "filename": "NASA Tech Brief 68-10383.pdf", "pages": [1] },
+      "mustInclude": [["高頻", "high frequency", "high-frequency"]]
+    },
+    {
+      "id": "docx-wire-rope",
+      "category": "docx-zh",
+      "turns": ["固定式起重機每月自動檢查時，鋼索直徑磨損達公稱直徑的多少百分比就不合格？"],
+      "source": { "filename": "固定式起重機每月自動檢查紀錄表.docx" },
+      "mustInclude": [["7%", "7％", "7 %", "百分之七"]]
+    },
+    {
+      "id": "docx-chain",
+      "category": "docx-zh",
+      "turns": ["固定式起重機每月自動檢查時，吊鏈的伸長率與斷面直徑減少各不得超過多少？"],
+      "source": { "filename": "固定式起重機每月自動檢查紀錄表.docx" },
+      "mustInclude": [["5%", "5％", "5 %", "百分之五"], ["10%", "10％", "10 %", "百分之十"]]
+    },
+    {
+      "id": "docx-overwind",
+      "category": "docx-zh",
+      "turns": ["固定式起重機每月自動檢查時，過捲預防裝置要確認具備什麼機能？"],
+      "source": { "filename": "固定式起重機每月自動檢查紀錄表.docx" },
+      "mustInclude": [["遮斷"], ["制動"]]
+    },
+    {
+      "id": "xlsx-deaths-112",
+      "category": "xlsx-zh",
+      "turns": ["112 年職業安全衛生法重大職業災害的死亡人數合計是多少？"],
+      "source": { "filename": "112年重大職災分析.xlsx" },
+      "mustInclude": [["300"]]
+    },
+    {
+      "id": "xlsx-manufacturing",
+      "category": "xlsx-zh",
+      "turns": ["112 年製造業重大職災的死亡人數與死亡千人率各是多少？"],
+      "source": { "filename": "112年重大職災分析.xlsx" },
+      "mustInclude": [["78"], ["0.027", "0.0268"]]
+    },
+    {
+      "id": "xlsx-peak-month",
+      "category": "xlsx-zh",
+      "turns": ["112 年哪一個月的重大職災死亡人數最多？有幾人？"],
+      "source": { "filename": "112年重大職災分析.xlsx" },
+      "mustInclude": [["7 月", "7月", "七月"], ["36"]]
+    },
+    {
+      "id": "xlsx-construction",
+      "category": "xlsx-zh",
+      "turns": ["112 年營建工程業的重大職災死亡人數是多少？"],
+      "source": { "filename": "112年重大職災分析.xlsx" },
+      "mustInclude": [["151"]]
+    },
+    {
+      "id": "pptx-statistics",
+      "category": "pptx-en",
+      "turns": ["Machine Guarding 簡報提到，美國每年操作與維護機械的勞工約發生多少截肢等傷害、多少人死亡？"],
+      "source": { "filename": "Machine Guarding.pptx", "pages": [8] },
+      "mustInclude": [["18,000", "18000", "1.8 萬", "1.8萬"], ["800"]]
+    },
+    {
+      "id": "pptx-guard-types",
+      "category": "pptx-en",
+      "turns": ["Machine Guarding 簡報把護罩（guards）分成哪四種？"],
+      "source": { "filename": "Machine Guarding.pptx" },
+      "mustInclude": [["Fixed", "固定"], ["Interlock", "連鎖", "互鎖", "聯鎖"], ["Adjustable", "可調"], ["Self-adjusting", "自動調整", "自調"]]
+    },
+    {
+      "id": "pptx-hand-speed",
+      "category": "pptx-en",
+      "turns": ["Machine Guarding 簡報中，安全距離公式 D = 63 in/s × Ts 的 63 in/s 代表什麼？"],
+      "source": { "filename": "Machine Guarding.pptx", "pages": [55] },
+      "mustInclude": [["手速", "手部", "hand speed", "手的速度", "手移動"]]
+    },
+    {
+      "id": "pptx-robot-accidents",
+      "category": "pptx-en",
+      "turns": ["Machine Guarding 簡報指出，機器人事故多半不是在正常運轉時發生，而是在哪些作業期間？"],
+      "source": { "filename": "Machine Guarding.pptx", "pages": [70] },
+      "mustInclude": [["程式", "programming", "編程"], ["維修", "保養", "maintenance"]]
+    },
+    {
+      "id": "pptx-accident-2018",
+      "category": "pptx-en",
+      "turns": ["Machine Guarding 簡報列出的 OSHA 事故中，2018 年 1 月 26 日發生了什麼事？"],
+      "source": { "filename": "Machine Guarding.pptx", "pages": [6] },
+      "mustInclude": [["輪胎", "tire"], ["粉碎", "破碎", "shredder", "切碎"]]
+    },
+    {
+      "id": "poster-machine-causes",
+      "category": "image-zh",
+      "turns": ["機械災害預防海報列出哪些機械作業災害發生原因？"],
+      "source": { "filename": "機械災害預防海報.jpg", "pages": [1] },
+      "mustInclude": [["安全防護"], ["警告標示"], ["程序"]]
+    },
+    {
+      "id": "poster-machine-measures",
+      "category": "image-zh",
+      "turns": ["機械災害預防海報建議哪些防止對策？"],
+      "source": { "filename": "機械災害預防海報.jpg", "pages": [1] },
+      "mustInclude": [["防護設施"], ["教育訓練"], ["安全作業標準", "工作守則"]]
+    },
+    {
+      "id": "poster-hoisting-slogan",
+      "category": "image-zh",
+      "turns": ["起重吊掛危害預防海報的標語是什麼？"],
+      "source": { "filename": "起重吊掛危害預防海報.jpg", "pages": [1] },
+      "mustInclude": [["淨空"], ["訓練"]]
+    },
+    {
+      "id": "poster-hoisting-hazards",
+      "category": "image-zh",
+      "turns": ["起重吊掛危害預防海報列出哪些高危險情境？"],
+      "source": { "filename": "起重吊掛危害預防海報.jpg", "pages": [1] },
+      "mustInclude": [["載人"], ["鋼索"], ["撐座", "外伸"]]
+    },
+    {
+      "id": "cross-crane",
+      "category": "cross-document",
+      "turns": ["起重吊掛危害預防海報建議的安全對策中，哪些也是固定式起重機每月自動檢查紀錄表的檢查項目？"],
+      "source": { "filename": "固定式起重機每月自動檢查紀錄表.docx" },
+      "mustInclude": [["過捲", "防脫", "脫落"]]
+    },
+    {
+      "id": "md-port",
+      "category": "markdown-en",
+      "turns": ["open62541 的範例 server 預設監聽哪個 port？"],
+      "source": { "filename": "open62541 README.md", "pages": [null] },
+      "mustInclude": [["4840"]]
+    },
+    {
+      "id": "md-license",
+      "category": "markdown-en",
+      "turns": ["open62541 採用什麼授權？可以和閉源軟體一起散布嗎？"],
+      "source": { "filename": "open62541 README.md", "pages": [null] },
+      "mustInclude": [["MPL", "Mozilla Public License"], ["可以", "可與", "能與", "允許", "can be combined", "can be distributed"]],
+      "mustNotMatch": ["不(可以|能|允許|得)(和|與|跟|搭配)?(閉源|專有|私有)"]
+    },
+    {
+      "id": "md-certification",
+      "category": "markdown-en",
+      "turns": ["用 open62541 哪個版本建的範例 server 通過 OPC Foundation 認證？是什麼 profile？"],
+      "source": { "filename": "open62541 README.md", "pages": [null] },
+      "mustInclude": [["1.4"], ["Standard Server 2017"]]
+    },
+    {
+      "id": "md-install",
+      "category": "markdown-en",
+      "turns": ["在 Debian 或 Ubuntu 上要怎麼安裝 open62541？"],
+      "source": { "filename": "open62541 README.md", "pages": [null] },
+      "mustInclude": [["libopen62541-1.4-dev"]]
+    },
+    {
+      "id": "nf-ey-budget",
+      "category": "not-found",
+      "turns": ["智慧機械產業推動方案的總經費預算是多少億元？"],
+      "notFound": true,
+      "mustNotMatch": ["\\d[\\d,.]*\\s*億"]
+    },
+    {
+      "id": "nf-fines",
+      "category": "not-found",
+      "turns": ["112 年重大職業災害的罰鍰總金額是多少？"],
+      "notFound": true,
+      "mustNotMatch": ["\\d[\\d,.]*\\s*(萬|億|元)"]
+    },
+    {
+      "id": "nf-open62541-date",
+      "category": "not-found",
+      "turns": ["open62541 1.4 版是哪一天發布的？"],
+      "notFound": true,
+      "mustNotMatch": ["20\\d\\d\\s*年\\s*\\d{1,2}\\s*月", "20\\d\\d[-/]\\d{1,2}[-/]\\d{1,2}"]
+    },
+    {
+      "id": "nf-crane-capacity",
+      "category": "not-found",
+      "turns": ["固定式起重機每月自動檢查紀錄表裡，這台起重機的吊升荷重是幾公噸？"],
+      "notFound": true,
+      "mustNotMatch": ["\\d+(\\.\\d+)?\\s*公噸"]
+    },
+    {
+      "id": "catalog",
+      "category": "catalog",
+      "turns": ["知識庫目前有哪些文件？"],
+      "catalog": true
+    }
+  ]
+}

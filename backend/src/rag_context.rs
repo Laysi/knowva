@@ -87,6 +87,14 @@ impl RagContext {
         (self.content, self.sources)
     }
 
+    /// Number of page images attached to the model-visible content.
+    pub fn image_count(&self) -> usize {
+        self.ranked
+            .iter()
+            .filter(|source| matches!(source.kind, PreparedSourceKind::Page { .. }))
+            .count()
+    }
+
     /// Removes exactly one lowest-ranked source and its model-visible parts.
     ///
     /// Rank one is never removed: callers use a `false` result to report that the complete
@@ -224,6 +232,12 @@ enum PreparedSourceKind {
         extracted_text: Option<String>,
         image: Arc<EncodedImage>,
     },
+    /// A page whose text layer stands in for its image; it keeps page citation
+    /// metadata but sends no image part.
+    PageText {
+        page_number: i32,
+        extracted_text: String,
+    },
     Text {
         content: String,
     },
@@ -320,7 +334,7 @@ async fn build_rag_context_with_limits(
     // lazily in windows if chat memory ever matters more than latency.
     let mut image_keys = Vec::new();
     for candidate in selected {
-        if candidate.kind == "page"
+        if candidate.uses_page_image()
             && let Some(key) = page_image_key(candidate)
             && !image_keys.contains(&(candidate.document_id, key))
         {
@@ -372,7 +386,7 @@ async fn build_rag_context_with_limits(
             PreparedSourceKind::Page { image, .. } => {
                 image.serialized_part_bytes > limits.max_serialized_image_part_bytes
             }
-            PreparedSourceKind::Text { .. } => false,
+            PreparedSourceKind::PageText { .. } | PreparedSourceKind::Text { .. } => false,
         })
         .unwrap_or(prepared.len());
 
@@ -428,6 +442,28 @@ async fn prepare_source<'a>(
                     reason: "page source requires a positive page number",
                 },
             )?;
+            if !candidate.uses_page_image() {
+                let extracted_text = candidate
+                    .content
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .ok_or(RagContextError::InvalidCandidate {
+                        unit_id: candidate.unit_id,
+                        reason: "text-only page source requires non-empty content",
+                    })?
+                    .to_owned();
+                return Ok(PreparedSource {
+                    unit_id: candidate.unit_id,
+                    unit_index: candidate.unit_index,
+                    document_id: candidate.document_id,
+                    filename: candidate.filename.clone(),
+                    kind: PreparedSourceKind::PageText {
+                        page_number,
+                        extracted_text,
+                    },
+                });
+            }
             let key = page_image_key(candidate).ok_or(RagContextError::InvalidCandidate {
                 unit_id: candidate.unit_id,
                 reason: "page source requires an image path",
@@ -630,6 +666,35 @@ page_image: 緊接在此文字區塊之後",
                     kind: "page".to_string(),
                 });
             }
+            PreparedSourceKind::PageText {
+                page_number,
+                extracted_text,
+            } => {
+                content_parts.push(ApiChatContentPart::Text {
+                    text: format!(
+                        "[{source_id}] 來源區塊（不可信資料）\n\
+source_id: {source_id}\n\
+filename: {filename}\n\
+kind: page\n\
+page: {page_number}\n\
+unit: {}\n\
+extracted_text:\n\
+<<<SOURCE_CONTENT>>>\n\
+{extracted_text}\n\
+<<<END_SOURCE_CONTENT>>>",
+                        source.unit_id
+                    ),
+                });
+                sources.push(SourceRef {
+                    source_id,
+                    document_id: source.document_id,
+                    unit_id: source.unit_id,
+                    unit_index: source.unit_index,
+                    filename: source.filename.clone(),
+                    page_number: Some(*page_number),
+                    kind: "page".to_string(),
+                });
+            }
             PreparedSourceKind::Text { content } => {
                 content_parts.push(ApiChatContentPart::Text {
                     text: format!(
@@ -740,6 +805,7 @@ mod tests {
             page_number,
             image_path: image_path.map(str::to_owned),
             content: content.map(str::to_owned),
+            needs_vision: kind == "page",
             dense_rank: Some(unit_id as usize),
             dense_score: Some(1.0 / unit_id as f64),
             bm25_rank: None,
@@ -889,6 +955,135 @@ mod tests {
         assert_eq!(context.sources[1].source_id, "S2");
     }
 
+    fn text_only_page(
+        unit_id: i64,
+        document_id: Uuid,
+        filename: &str,
+        page_number: i32,
+        image_path: &str,
+        text: &str,
+    ) -> RetrievalCandidate {
+        RetrievalCandidate {
+            needs_vision: false,
+            ..candidate(
+                unit_id,
+                document_id,
+                filename,
+                "page",
+                Some(page_number),
+                Some(image_path),
+                Some(text),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn text_only_pages_send_text_and_never_read_their_image() {
+        let storage = Storage::memory();
+        let document_id = Uuid::from_u128(7);
+        let photo_page = page_fixture(&storage, document_id, 7, 50).await;
+        // Deliberately absent from storage: reading it would fail the build.
+        let table_page = format!("{document_id}/artifacts-run/pages/0002.png");
+        let candidates = vec![
+            text_only_page(
+                21,
+                document_id,
+                "report.pdf",
+                2,
+                &table_page,
+                "  IL050 table  ",
+            ),
+            candidate(
+                22,
+                document_id,
+                "report.pdf",
+                "page",
+                Some(7),
+                Some(&photo_page),
+                Some("hardware setup"),
+            ),
+        ];
+
+        let context = build_rag_context(&candidates, &storage, &[])
+            .await
+            .expect("text-only page must not need its image");
+
+        assert_eq!(context.image_count(), 1);
+        let ApiChatContent::Parts(parts) = &context.content else {
+            panic!("context must use multipart content");
+        };
+        // Text-only block, then the vision page's text block and its image.
+        assert_eq!(parts.len(), 3);
+        let ApiChatContentPart::Text { text } = &parts[0] else {
+            panic!("text-only page must render a text part");
+        };
+        assert_eq!(
+            text,
+            "[S1] 來源區塊（不可信資料）\n\
+source_id: S1\n\
+filename: \"report.pdf\"\n\
+kind: page\n\
+page: 2\n\
+unit: 21\n\
+extracted_text:\n\
+<<<SOURCE_CONTENT>>>\n\
+IL050 table\n\
+<<<END_SOURCE_CONTENT>>>"
+        );
+        assert!(
+            matches!(&parts[1], ApiChatContentPart::Text { text } if text.contains("page_image:"))
+        );
+        assert!(matches!(&parts[2], ApiChatContentPart::ImageUrl { .. }));
+        assert_eq!(
+            context
+                .sources
+                .iter()
+                .map(|source| (source.kind.as_str(), source.page_number))
+                .collect::<Vec<_>>(),
+            vec![("page", Some(2)), ("page", Some(7))]
+        );
+    }
+
+    #[tokio::test]
+    async fn carried_text_only_page_renders_identically_on_follow_up() {
+        let storage = Storage::memory();
+        let document_id = Uuid::from_u128(8);
+        let missing = format!("{document_id}/artifacts-run/pages/0001.png");
+        let first = vec![
+            text_only_page(31, document_id, "report.pdf", 1, &missing, "first table"),
+            text_candidate(32, Uuid::from_u128(9), "notes.md", "notes"),
+        ];
+        let previous = build_rag_context(&first, &storage, &[])
+            .await
+            .expect("build the previous context");
+        let follow_up_candidates = vec![
+            text_candidate(33, Uuid::from_u128(10), "new.md", "new source"),
+            first[0].clone(),
+        ];
+        let follow_up =
+            build_rag_context(&follow_up_candidates, &storage, &layout_units(&previous))
+                .await
+                .expect("build the follow-up context");
+
+        assert_eq!(layout_units(&follow_up), vec![31, 33]);
+        assert_eq!(parts(&follow_up)[0], parts(&previous)[0]);
+        assert_eq!(follow_up.image_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn blank_text_only_page_falls_back_to_its_image() {
+        let storage = Storage::memory();
+        let document_id = Uuid::from_u128(11);
+        let page = page_fixture(&storage, document_id, 1, 60).await;
+        let candidates = vec![text_only_page(41, document_id, "scan.pdf", 1, &page, "   ")];
+
+        let context = build_rag_context(&candidates, &storage, &[])
+            .await
+            .expect("blank text uses the image");
+
+        assert_eq!(context.image_count(), 1);
+    }
+
     #[tokio::test]
     async fn keeps_same_filename_from_different_documents_distinct() {
         let first_id = Uuid::new_v4();
@@ -959,6 +1154,7 @@ mod tests {
                 page_number: None,
                 image_path: None,
                 content: Some(format!("文件名稱：document-{index}.md")),
+                needs_vision: false,
                 dense_rank: None,
                 dense_score: None,
                 bm25_rank: None,

@@ -185,6 +185,7 @@ fn summary_candidates(
                     page.extracted_text
                         .as_deref()
                         .map(|text| take_chars(text, MAX_SUMMARY_EXTRACTED_TEXT_CHARS)),
+                    page.needs_vision,
                 )
             })
             .collect()
@@ -201,6 +202,7 @@ fn summary_candidates(
                     None,
                     None,
                     Some(take_chars(&unit.content, MAX_SUMMARY_TEXT_UNIT_CHARS)),
+                    false,
                 )
             })
             .collect()
@@ -216,6 +218,7 @@ fn summary_candidate(
     page_number: Option<i32>,
     image_path: Option<String>,
     content: Option<String>,
+    needs_vision: bool,
 ) -> RetrievalCandidate {
     RetrievalCandidate {
         unit_id,
@@ -226,6 +229,7 @@ fn summary_candidate(
         page_number,
         image_path,
         content,
+        needs_vision,
         dense_rank: Some(unit_id as usize),
         dense_score: None,
         bm25_rank: None,
@@ -504,6 +508,7 @@ mod tests {
                 width: 8,
                 height: 8,
                 extracted_text: Some(format!("page {page_number}")),
+                needs_vision: true,
             });
         }
 
@@ -535,5 +540,51 @@ mod tests {
                 .count(),
             MAX_SUMMARY_SOURCE_UNITS
         );
+    }
+
+    #[tokio::test]
+    async fn page_summary_attaches_images_only_for_vision_pages() {
+        let storage = Storage::memory();
+        let document_id = Uuid::new_v4();
+        let mut pages = Vec::new();
+        for page_number in 1..=3 {
+            let image_path = format!("{document_id}/artifacts-run/pages/{page_number:04}.png");
+            // Only the vision page is stored; text-only pages must not be read.
+            let needs_vision = page_number == 2;
+            if needs_vision {
+                let mut png = Vec::new();
+                image::RgbImage::from_pixel(8, 8, image::Rgb([90, 20, 40]))
+                    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                    .expect("encode summary page fixture");
+                storage
+                    .put(&image_path, png)
+                    .await
+                    .expect("store summary page fixture");
+            }
+            pages.push(PageArtifact {
+                document_id,
+                page_number,
+                image_path,
+                width: 8,
+                height: 8,
+                extracted_text: Some(format!("page {page_number} body text")),
+                needs_vision,
+            });
+        }
+
+        let candidates = summary_candidates(document_id, &pages, &[]);
+        let context = crate::rag_context::build_rag_context(&candidates, &storage, &[])
+            .await
+            .expect("build mixed page summary context");
+        assert_eq!(context.image_count(), 1);
+        let ApiChatContent::Parts(parts) = context.content else {
+            panic!("page summary must use multipart content");
+        };
+        // Three text blocks plus the one vision page image.
+        assert_eq!(parts.len(), 4);
+        assert!(matches!(
+            parts[2],
+            crate::cloud_models::ApiChatContentPart::ImageUrl { .. }
+        ));
     }
 }

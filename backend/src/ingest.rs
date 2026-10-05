@@ -3,6 +3,7 @@ use crate::cloud_models::{CloudModelClient, CloudModelError, MAX_EMBED_IMAGE_BYT
 use crate::page_artifacts::{
     ArtifactError, ArtifactManifest, PageArtifact, SourceKind, TextArtifact,
 };
+use crate::page_vision::{VisionReason, page_uses_image};
 use crate::storage::{IO_CONCURRENCY, Storage};
 use axum::Json;
 use axum::extract::{Multipart, Path as AxumPath, State};
@@ -11,7 +12,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use pgvector::HalfVector;
 use serde::Serialize;
 use sqlx::{Postgres, Transaction};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
@@ -163,6 +164,9 @@ struct EmbeddedUnit {
     page_number: Option<i32>,
     content: Option<String>,
     image_path: Option<String>,
+    /// Whether the embedding was built from the page image; later stages
+    /// send the image exactly when this is set.
+    needs_vision: bool,
     embedding: HalfVector,
 }
 
@@ -698,12 +702,22 @@ async fn prepare_artifact_set(
     };
 
     let mut pages = Vec::with_capacity(rendered_pages.len());
+    let mut vision_reasons = BTreeMap::<&'static str, usize>::new();
     for page in rendered_pages {
         let key = format!(
             "{run_prefix}/{}",
             page.relative_image_path.to_string_lossy()
         );
         files.push((run_dir.join(&page.relative_image_path), key.clone()));
+        let needs_vision =
+            page_uses_image(page.vision.needs_vision, page.extracted_text.as_deref());
+        if needs_vision {
+            let reason = page
+                .vision
+                .reason
+                .map_or("blank-text", VisionReason::as_str);
+            *vision_reasons.entry(reason).or_default() += 1;
+        }
         pages.push(PageArtifact {
             document_id,
             page_number: page.page_number,
@@ -711,7 +725,20 @@ async fn prepare_artifact_set(
             width: page.width,
             height: page.height,
             extracted_text: page.extracted_text,
+            needs_vision,
         });
+    }
+    if !pages.is_empty() {
+        let vision_pages = vision_reasons.values().sum::<usize>();
+        tracing::info!(
+            %document_id,
+            source_kind = source_kind.as_str(),
+            pages = pages.len(),
+            vision_pages,
+            text_pages = pages.len() - vision_pages,
+            reasons = ?vision_reasons,
+            "classified page vision"
+        );
     }
 
     let text_units = if source_kind == SourceKind::Text {
@@ -948,6 +975,7 @@ async fn embed_artifact_unit(
                 page_number: None,
                 content: Some(text.content),
                 image_path: None,
+                needs_vision: false,
                 embedding,
             })
         }
@@ -961,26 +989,33 @@ async fn embed_artifact_unit(
                     "page number must be one-based",
                 )
             })?;
-            validate_embed_image_dimensions(&page, unit_index)?;
-            let image = storage
-                .get(page.document_id, &page.image_path, MAX_EMBED_IMAGE_BYTES)
-                .await
-                .map_err(|error| {
-                    EmbeddingStageError::unit(
-                        "embedding-image-read",
-                        "page",
-                        unit_index,
-                        Some(page.page_number),
-                        format!("cannot read page image artifact: {error}"),
-                    )
-                })?;
-            let embedding = match page
+            let text = page
                 .extracted_text
                 .as_deref()
-                .filter(|text| !text.trim().is_empty())
-            {
-                Some(text) => models.embed_image_text_passage(text, &image).await,
-                None => models.embed_image_passage(&image).await,
+                .filter(|text| !text.trim().is_empty());
+            let needs_vision = page_uses_image(page.needs_vision, text);
+            let embedding = match text.filter(|_| !needs_vision) {
+                // A text-only page never touches its stored image.
+                Some(text) => models.embed_passage(text).await,
+                None => {
+                    validate_embed_image_dimensions(&page, unit_index)?;
+                    let image = storage
+                        .get(page.document_id, &page.image_path, MAX_EMBED_IMAGE_BYTES)
+                        .await
+                        .map_err(|error| {
+                            EmbeddingStageError::unit(
+                                "embedding-image-read",
+                                "page",
+                                unit_index,
+                                Some(page.page_number),
+                                format!("cannot read page image artifact: {error}"),
+                            )
+                        })?;
+                    match text {
+                        Some(text) => models.embed_image_text_passage(text, &image).await,
+                        None => models.embed_image_passage(&image).await,
+                    }
+                }
             }
             .map_err(|error| {
                 embedding_model_error("page", unit_index, Some(page.page_number), error)
@@ -1000,6 +1035,7 @@ async fn embed_artifact_unit(
                 page_number: Some(page.page_number),
                 content: page.extracted_text,
                 image_path: Some(page.image_path),
+                needs_vision,
                 embedding,
             })
         }
@@ -1110,8 +1146,9 @@ async fn persist_embedded_units(
     for unit in units {
         sqlx::query(
             "INSERT INTO document_units \
-             (document_id, kind, unit_index, page_number, content, image_path, embedding) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (document_id, kind, unit_index, page_number, content, image_path, needs_vision, \
+              embedding) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(document_id)
         .bind(unit.kind)
@@ -1119,6 +1156,7 @@ async fn persist_embedded_units(
         .bind(unit.page_number)
         .bind(&unit.content)
         .bind(&unit.image_path)
+        .bind(unit.needs_vision)
         .bind(&unit.embedding)
         .execute(&mut *transaction)
         .await
@@ -1187,8 +1225,8 @@ async fn insert_pages(
     for page in pages {
         sqlx::query(
             "INSERT INTO page_artifacts \
-             (document_id, page_number, image_path, width, height, extracted_text) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (document_id, page_number, image_path, width, height, extracted_text, needs_vision) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(page.document_id)
         .bind(page.page_number)
@@ -1196,6 +1234,7 @@ async fn insert_pages(
         .bind(page.width)
         .bind(page.height)
         .bind(&page.extracted_text)
+        .bind(page.needs_vision)
         .execute(&mut **transaction)
         .await
         .map_err(artifact_db_error)?;
@@ -1407,12 +1446,13 @@ mod tests {
             document_locks: DocumentLocks::default(),
         };
 
-        for (extension, source, kind, page_count) in [
-            ("pdf", &fixtures.native_pdf, SourceKind::Pdf, 2),
-            ("pdf", &fixtures.scanned_pdf, SourceKind::Pdf, 1),
-            ("docx", &fixtures.docx, SourceKind::Office, 2),
-            ("pptx", &fixtures.pptx, SourceKind::Office, 2),
-            ("xlsx", &fixtures.xlsx, SourceKind::Office, 1),
+        // Only the scan has no text layer; every other fixture page is text-only.
+        for (extension, source, kind, page_count, needs_vision) in [
+            ("pdf", &fixtures.native_pdf, SourceKind::Pdf, 2, false),
+            ("pdf", &fixtures.scanned_pdf, SourceKind::Pdf, 1, true),
+            ("docx", &fixtures.docx, SourceKind::Office, 2, false),
+            ("pptx", &fixtures.pptx, SourceKind::Office, 2, false),
+            ("xlsx", &fixtures.xlsx, SourceKind::Office, 1, false),
         ] {
             let document_id = Uuid::new_v4();
             let storage_key = format!("{document_id}/original.{extension}");
@@ -1443,6 +1483,11 @@ mod tests {
                     format!("{run_prefix}/pages/{:04}.png", index + 1)
                 );
                 assert!(stored.contains(&page.image_path), "{stored:?}");
+                assert_eq!(
+                    page.needs_vision, needs_vision,
+                    "{extension} page {} vision decision",
+                    page.page_number
+                );
             }
             assert!(stored.contains(&prepared.manifest_path));
             assert_eq!(
@@ -1493,6 +1538,7 @@ mod tests {
             width: 1,
             height: 1,
             extracted_text: None,
+            needs_vision: true,
         }];
         assert!(validate_page_sequence(&pages).is_err());
     }
@@ -1506,6 +1552,7 @@ mod tests {
             width,
             height,
             extracted_text: None,
+            needs_vision: true,
         };
         assert!(validate_embed_image_dimensions(&page(8_192, 16_384), 0).is_ok());
         assert!(validate_embed_image_dimensions(&page(16_384, 8_192), 0).is_ok());
