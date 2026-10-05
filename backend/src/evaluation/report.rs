@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const REPORT_SCHEMA_VERSION: &str = "1.0";
-pub const THRESHOLD_SCHEMA_VERSION: &str = "1.0";
+pub const THRESHOLD_SCHEMA_VERSION: &str = "2.0";
 static NEXT_STAGING_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +76,6 @@ pub struct ThresholdMinimums {
 pub struct ThresholdConfig {
     pub schema_version: String,
     pub version: String,
-    pub issue_comment_url: String,
     pub minimums: ThresholdMinimums,
 }
 
@@ -372,7 +371,6 @@ pub fn validate_threshold_config(config: &ThresholdConfig) -> ReportResult<()> {
         ));
     }
     validate_safe_value(&config.version, "$.version")?;
-    validate_issue_comment_url(&config.issue_comment_url)?;
     if config.minimums.correct_page_recall_at_k.k == 0 {
         return Err(ReportError::new(
             "threshold_k_invalid",
@@ -411,25 +409,6 @@ pub fn validate_threshold_config(config: &ThresholdConfig) -> ReportResult<()> {
         }
     }
     Ok(())
-}
-
-fn validate_issue_comment_url(value: &str) -> ReportResult<()> {
-    let valid = value
-        .strip_prefix("https://github.com/Laysi/knowva/issues/1#issuecomment-")
-        .is_some_and(|comment_id| {
-            !comment_id.is_empty()
-                && !comment_id.starts_with('0')
-                && comment_id.bytes().all(|byte| byte.is_ascii_digit())
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(ReportError::new(
-            "threshold_comment_url_invalid",
-            "$.issue_comment_url",
-            "threshold provenance must be a comment URL for the locked repository issue 1",
-        ))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1517,8 +1496,6 @@ mod tests {
         ThresholdConfig {
             schema_version: THRESHOLD_SCHEMA_VERSION.to_owned(),
             version: "thresholds-2026-07-13".to_owned(),
-            issue_comment_url: "https://github.com/Laysi/knowva/issues/1#issuecomment-123456789"
-                .to_owned(),
             minimums: ThresholdMinimums {
                 correct_page_recall_at_k: CorrectPageRecallThreshold {
                     stage: RetrievalStage::Rerank,
@@ -1704,23 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn threshold_validation_rejects_wrong_provenance_and_values() {
-        for invalid in [
-            "https://github.com/example/knowva/issues/1#issuecomment-123",
-            "https://github.com/laysi/knowva/issues/1#issuecomment-123",
-            "https://github.com/Laysi/knowva/issues/2#issuecomment-123",
-            "https://github.example/Laysi/knowva/issues/1#issuecomment-123",
-            "https://github.com/Laysi/knowva/issues/1#issuecomment-123?token=secret",
-            "https://github.com/Laysi/knowva/issues/1#issuecomment-0",
-        ] {
-            let mut config = threshold_config();
-            config.issue_comment_url = invalid.to_owned();
-            assert_eq!(
-                validate_threshold_config(&config).unwrap_err().code,
-                "threshold_comment_url_invalid"
-            );
-        }
-
+    fn threshold_validation_rejects_invalid_values() {
         let mut config = threshold_config();
         config.minimums.citation_precision = f64::NAN;
         assert_eq!(

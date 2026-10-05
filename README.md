@@ -298,32 +298,30 @@ proto exec rust -- cargo run -- eval --dry-run \
 
 執行前必須完成下列事項：
 
-1. 由固定核准者 GitHub login **`Ruisi-Lu`** 先在 `Laysi/knowva` issue #1 建立一則留言，鎖定 correct-page recall 的 stage、k、minimum，citation precision/recall、answer facts recall，以及 B 相對 A improvement 的實際數值。GitHub API 回傳的 comment author 必須精確為 `Ruisi-Lu`，且 `author_association` 必須為 `OWNER`、`MEMBER` 或 `COLLABORATOR`；login 大小寫不同、其他作者或僅為 `CONTRIBUTOR` 都不會通過。所有 minimum 必須是 0 到 1 的 JSON number，k 必須是正整數；不要由執行者臨時決定門檻。先取得該留言固定的 `https://github.com/Laysi/knowva/issues/1#issuecomment-<id>` permalink，再把它寫入本機 threshold JSON 的 `issue_comment_url`。下列只是 schema 示意；尖括號欄位必須換成留言已鎖定的真實內容，不能直接執行，也不要填一個看似可通過的假 URL 或猜測值：
+1. 準備一份本機門檻 JSON，寫下 correct-page recall 的 stage、k、minimum，citation precision／recall、answer facts recall，以及 B 相對 A improvement 的數值。所有 minimum 必須是 0 到 1 的 JSON number，k 必須是正整數，`version` 是自訂的門檻版本名稱。報告的 `run-manifest.json` 會記錄這份檔案的 `version` 與 SHA-256。要比較的幾次 run 請用同一份檔案，並在執行前就決定好數值，不要看完結果才調整。下列只是 schema 示意，尖括號欄位必須換成實際數值：
 
    ```text
    {
-     "schema_version": "1.0",
-     "version": "<owner-locked-version>",
-     "issue_comment_url": "<real-Laysi/knowva-issue-1-comment-permalink>",
+     "schema_version": "2.0",
+     "version": "<threshold-version>",
      "minimums": {
        "correct_page_recall_at_k": {
          "stage": "<dense|bm25|rrf|rerank>",
-         "k": <owner-locked-positive-integer>,
-         "minimum": <owner-locked-number-0-to-1>
+         "k": <positive-integer>,
+         "minimum": <number-0-to-1>
        },
-       "citation_precision": <owner-locked-number-0-to-1>,
-       "citation_recall": <owner-locked-number-0-to-1>,
-       "answer_facts_recall": <owner-locked-number-0-to-1>,
-       "b_relative_improvement": <owner-locked-number-0-to-1>
+       "citation_precision": <number-0-to-1>,
+       "citation_recall": <number-0-to-1>,
+       "answer_facts_recall": <number-0-to-1>,
+       "b_relative_improvement": <number-0-to-1>
      }
    }
    ```
 
-2. 完成 threshold JSON 的所有欄位與排版後，對**最終檔案 bytes**計算 SHA-256（例如 `sha256sum /absolute/path/to/thresholds.json`；之後只要檔案有任何 byte 改動就必須重算）。由同一位 owner 編輯上一步的同一則留言，加入獨立一行 `threshold_sha256: <sha256sum 輸出的 64 字元雜湊>`；編輯留言不會改變 permalink。runner 會從 GitHub 讀取該固定 URL，並要求 URL 與 hash line 都精確符合本機 snapshot。
-3. 由 PostgreSQL 管理者建立一個名稱以 `knowva_eval_` 開頭的全新空 database，以及名稱可辨識用途的專用登入角色（例如組織自訂的 `knowva_eval_runner_<識別碼>`；尖括號內容必須換成真實且唯一的值）。以該角色作為 database owner，讓它能執行 migration；接著在任何 migration 前，以 database owner 連線並執行 `COMMENT ON DATABASE <實際的 knowva_eval_ database 名稱> IS 'knowva-evaluation-only:v1';`。最後把使用該專用角色與 database 的連線字串設為 `EVAL_DATABASE_URL`。runner 會檢查 current database 名稱、connect role 身分與精確 marker；它也會拒絕 production `DATABASE_URL`、repository 預設 DB，以及 migration 後含有任何 document 的 DB。不要把 placeholder、示意密碼或假 marker 當成正式設定。
-4. 準備專用且為空的 `EVAL_FILES_DIR`。它不可等於、包含或位於 production `FILES_DIR` 或預設 `./data/files` 之下；失敗後會保留完整隔離 run 供診斷，下次不可重用非空目錄。
-5. 設定地端推論服務與確認過的 Gemma 4 model id：至少提供 `MODEL_BASE_URL` 與 `GEMMA_4_MODEL_ID`；各能力分屬不同主機時改設 `MODEL_CHAT_URL`、`MODEL_EMBED_URL`、`MODEL_RERANK_URL`，服務需認證時另設 `MODEL_API_TOKEN`。確認服務已載入固定的 Nemotron embedding/rerank models。
-6. 主機安裝 Pdfium 與 LibreOffice/CJK 字型，並以 `PDFIUM_LIBRARY_PATH`、`LIBREOFFICE_BIN` 指向可用 binary/library，讓 PDF、掃描頁與 PPTX fixtures 能完整 ingest。
+2. 由 PostgreSQL 管理者建立一個名稱以 `knowva_eval_` 開頭的全新空 database，以及名稱可辨識用途的專用登入角色（例如組織自訂的 `knowva_eval_runner_<識別碼>`；尖括號內容必須換成真實且唯一的值）。以該角色作為 database owner，讓它能執行 migration；接著在任何 migration 前，以 database owner 連線並執行 `COMMENT ON DATABASE <實際的 knowva_eval_ database 名稱> IS 'knowva-evaluation-only:v1';`。最後把使用該專用角色與 database 的連線字串設為 `EVAL_DATABASE_URL`。runner 會檢查 current database 名稱、connect role 身分與精確 marker；它也會拒絕 production `DATABASE_URL`、repository 預設 DB，以及 migration 後含有任何 document 的 DB。不要把 placeholder、示意密碼或假 marker 當成正式設定。
+3. 準備專用且為空的 `EVAL_FILES_DIR`。它不可等於、包含或位於 production `FILES_DIR` 或預設 `./data/files` 之下；失敗後會保留完整隔離 run 供診斷，下次不可重用非空目錄。
+4. 設定地端推論服務與確認過的 Gemma 4 model id：至少提供 `MODEL_BASE_URL` 與 `GEMMA_4_MODEL_ID`；各能力分屬不同主機時改設 `MODEL_CHAT_URL`、`MODEL_EMBED_URL`、`MODEL_RERANK_URL`，服務需認證時另設 `MODEL_API_TOKEN`。確認服務已載入固定的 Nemotron embedding/rerank models。
+5. 主機安裝 Pdfium 與 LibreOffice/CJK 字型，並以 `PDFIUM_LIBRARY_PATH`、`LIBREOFFICE_BIN` 指向可用 binary/library，讓 PDF、掃描頁與 PPTX fixtures 能完整 ingest。
 
 完成上述前置作業後，從 `backend/` 以單一 `eval --cloud` command 執行完整資料集；以下所有尖括號都必須替換為真實的隔離環境設定：
 
@@ -343,7 +341,7 @@ proto exec rust -- cargo run -- eval --cloud \
   --concurrency 1
 ```
 
-正式 run 也接受上述 `--document` / `--query` subset flags。成功寫檔後，stdout 會回傳 `passed` 與路徑；每次輸出位於 `<output>/<run_id>/report.json`、`report.csv`、`report.md`、`run-manifest.json`。`passed: true` 只有在至少一組有效 A/B pair，且 correct-page、citation precision/recall、answer facts recall、B 相對 A improvement 全部達到 owner 鎖定門檻時成立；command 本身完成不代表門檻通過。`report.*` 會列出各 query 的 improvement/same/regression/failure、分數與 failure reasons，`run-manifest.json` 則保存 locked model ids、prompt/top_n、dataset/threshold hash、git revision、subsets、retry/latency/request/fallback telemetry 與安全化失敗案例。preflight、native conversion、模型服務 contract 或 DB isolation 錯誤會以非零狀態停止；已開始寫入後不會局部清掉 DB/files，以免破壞診斷一致性。
+正式 run 也接受上述 `--document` / `--query` subset flags。成功寫檔後，stdout 會回傳 `passed` 與路徑；每次輸出位於 `<output>/<run_id>/report.json`、`report.csv`、`report.md`、`run-manifest.json`。`passed: true` 只有在至少一組有效 A/B pair，且 correct-page、citation precision/recall、answer facts recall、B 相對 A improvement 全部達到門檻檔的數值時成立；command 本身完成不代表門檻通過。`report.*` 會列出各 query 的 improvement/same/regression/failure、分數與 failure reasons，`run-manifest.json` 則保存 locked model ids、prompt/top_n、dataset/threshold hash、git revision、subsets、retry/latency/request/fallback telemetry 與安全化失敗案例。preflight、native conversion、模型服務 contract 或 DB isolation 錯誤會以非零狀態停止；已開始寫入後不會局部清掉 DB/files，以免破壞診斷一致性。
 
 Threshold JSON 只應保存在本機安全位置：不得提交本機 threshold 檔、API token、`.env` secret 或任何 customer/production 文件。fixture 只能使用 repository 內已審核、標明來源與 license 的 synthetic files。
 
