@@ -333,3 +333,74 @@ A4B 每輪都在編碼頁圖時 Metal OOM（`kIOGPUCommandBufferCallbackErrorOut
 - Machine Guarding 五題都通過；四題的第一名來源與 §8.10 相同，`pptx-guard-types` 原本的第一名第 23 頁仍在前三。
 - 沒過的題目都在 §8.9、§8.10 列過：realistic 的 XLSX 四題數字對錯欄（#40）、海報三題讀不出小字；examples 的 PPTX 一題（只有 Lorem ipsum，檔名不在檢索內容裡，#41）與 `png-logo`、`png-arm-color`。examples 的 `jpg-task` 這次通過，但圖片上傳本來就一律看圖、送進模型的內容沒變，只是回答本身有波動。
 - `--replace` 刪舊 STP 時，`UPDATE documents SET status = 'failed'` 的慢查詢警告是刪除流程先把文件撤出檢索；245 個 unit 的 BM25 統計要 2.7s，不是錯誤。
+
+### 8.12 Gemma 同時處理數（2026-10-05）
+
+`dev-page-vision-20261003-2`、知識庫同 §8.11 的 17 份文件，其餘設定同 README（`KM_IDLE_SECS=600`、rerank 1 tile、chat 頁圖長邊 1280）。`bench/parallel-sweep.sh` 依序把 `OLLAMA_NUM_PARALLEL` 設成 1、2、3（三組都 `LLAMA_ARG_CTX_CHECKPOINTS=2`），每組重啟 Ollama、暖機一題，再跑 `bench/concurrency.ts`：1–4 人同時送出單輪問題，每種人數兩輪，共 20 題、題題不同，三組問同一批題目、同樣的組合。每 2 秒記一次 swap 與記憶體，app 與 Ollama 的 log 拆出各階段時間。
+
+全部答完的時間（括號內是平均／最慢的首字）：
+
+| 同時人數 | 1 格 | 2 格 | 3 格 |
+| --- | --- | --- | --- |
+| 1 | 19.1s（16.4／16.4s） | 19.3s（17.0／17.8s） | 20.8s（18.4／19.1s） |
+| 2 | 38.9s（29.7／37.2s） | 40.1s（36.3／38.5s） | 48.0s（44.2／48.4s） |
+| 3 | 69.3s（45.5／65.7s） | 67.6s（47.7／64.0s） | 85.1s（72.3／76.8s） |
+| 4 | 85.3s（59.4／84.3s） | 86.3s（64.3／86.0s） | 104.3s（83.9／100.2s） |
+| 每分鐘答完（2–4 人） | 2.6–3.1 題 | 2.7–3.0 題 | 2.1–2.5 題 |
+| swap 最高 | 2.9 GiB | 4.7 GiB | 7.0 GiB |
+
+- 一格時每題的 GPU 時間：rerank 7.3s（50 筆候選、平均 7 筆圖片 passage）、prefill 8.2s（3.3K tokens，約 400 tok/s）、生成 40–90 tokens 約 3–5s。推論服務的 embed／rerank 共用一把鎖，一次只做一題，4 人同時時 rerank 平均 29s、最慢 36s。
+- 2 格：兩題同時 prefill 時每題 236 tok/s，合計和一格相同；生成每題 13 tok/s。吞吐沒有增加，首字反而平均晚一些，因為兩題一起做完而不是先做完一題。
+- 3 格：swap 到 7.0 GiB，生成每題 8.7–9.3 tok/s，3–4 人同時時 rerank 平均 32–38s，吞吐比一格少約 20%。
+- KV cache 每格 896 MiB（全域層 256 + sliding-window 層 640）；`/api/ps` 的大小 1／2／3 格為 7.97／8.67／9.41 GB。三組 Ollama log 都沒有 OOM，可用記憶體最低都是 0.1 GiB；測試開始前 swap 已有 1.6 GiB。
+- 60 題答對 59 題。沒過的是 2 格、3 人那輪的 `jpg-brand`（KUKA 答成 KURODA），一格與三格同一題都對。回答請求沒有指定 temperature，用的是 Ollama 的預設取樣，§8.11 也記過圖片題的回答會波動。
+- 這組題目的回答都短，每題時間由 rerank 與 prefill 決定；回答長的時候（同日另一筆 619 tokens 生成 34.6s），多格合批生成的效果沒有在這裡量到。
+
+### 8.13 Gemma 改跑 MLX、拿掉 rerank（2026-10-05）
+
+Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重），QAT 版（`gemma4:12b-it-qat`）走的是 llama.cpp。知識庫、題目與其他設定同 §8.12（一格）。四組依序跑，每組先卸載模型，再跑 `bench/concurrency.ts`（同 §8.12 的 20 題）、`bench/examples.ts` 與 `bench/examples.ts --dataset bench/realistic.json`：
+
+- `mlx-1280`、`mlx-1152`：`GEMMA_4_MODEL_ID=gemma4:12b-mlx`，chat 頁圖長邊 1280／1152。
+- `qat-k6`：QAT、`RERANK_CANDIDATE_TOP_K=6`。rerank 只收到 RRF 前 6 名，等於由 RRF 決定送進 context 的來源，rerank 只重排順序。
+- `qat-base`：QAT 原設定，只跑兩組問答；表中 QAT 的同時處理數字取 §8.12 一格。
+
+切換設定、取樣記憶體、跑完自動還原 `.env` 與推論服務 plist 的腳本（`mlx-e2e.sh`），以及比較各組的 `compare.ts`，和結果放在一起：`knowva-mac:~/knowva-inference/bench-results/mlx-20261005-214342/`。
+
+| | QAT | MLX 1280 | MLX 1152 | QAT、候選 6 |
+| --- | --- | --- | --- | --- |
+| 每分鐘答完（1–4 人） | 2.6–3.1 | 3.2–4.1 | 3.2–3.9 | 3.8–5.2 |
+| 4 人同時，平均／最慢首字 | 59.4／84.3s | 53.4／69.0s | 56.2／77.8s | 36.4／62.4s |
+| 同時處理那 20 題答對 | 20/20 | 20/20 | 19/20 | 12/20 |
+| rerank 平均／最慢（同時處理那 21 題，含排隊） | 22.5／35.9s | 21.6／32.8s | 21.6／32.6s | 4.8／14.2s |
+| examples | 31/34 | 30/34 | 28/34 | 26/34 |
+| realistic | 32/39 | 31/39 | 32/39 | 26/39 |
+| 首字中位數 examples／realistic（一次一題） | 19.4／18.9s | 16.8／16.8s | 17.1／16.3s | 11.3／11.8s |
+| swap 最高 | 2.9 GiB（`qat-base` 3.2） | 12.5 GiB | 12.1 GiB | 2.3 GiB |
+
+- 單次 chat（`bench/chat.ts`，6 頁，每格 3 輪）：MLX prefill 546–566 tok/s、生成 26.8–29.5 tok/s；QAT 384–394、17.7–17.9 tok/s。
+- MLX 的頁圖 token 分 280／560／1120 三檔：長邊 1280 的頁約 1104 token，896–1152 約 539 token；QAT 在 1280 是 570 token。1152 的 token 少一半，但首字與吞吐和 1280 差不多。
+- MLX runner 載入後 `msg=memory held` 是 7.81 GiB，之後隨 prefix cache 一路漲到 15.0–15.4 GiB（peak 17.5 GiB），兩組都一樣；結束時 `/api/ps` 的大小是 16.1 GB（QAT 8.0 GB）。Ollama 0.35.0 的 `OLLAMA_*` 環境變數裡沒有限制它的設定，QAT 那條路有 `LLAMA_ARG_CACHE_RAM=2048`。`mlx-1152` 跑到一半時的 `top`：Ollama MLX runner 16 GB（其中 7.2 GB 被壓縮）、推論服務 10 GB、Colima VM 3.1 GB。四組都沒有 OOM 或 Metal 錯誤，可用記憶體最低 0.06–0.08 GiB。
+- 和 `qat-base` 相比多錯的題目：`mlx-1280` 是 `png-arm-color`、`cross-crane`、`poster-machine-measures`；`mlx-1152` 是 `jpg-brand`（KUKA 讀成 FANUC）、`nf-press-tonnage`、`png-arm-color`、`poster-machine-measures`。反過來，`qat-base` 沒過的 `osha-follow-up` 在兩組 MLX 都通過。
+- `qat-k6` 比 `qat-base` 多錯 14 題（examples 5、realistic 9），其中 11 題是正確來源沒進前 6 名（`not-retrieved`）：圖片與 EML 題、OSHA 單頁題、PPTX 統計與機器人事故題、海報題。它多答對三題 XLSX：`xlsx-deaths-112` 的 6 個來源與順序和 `qat-base` 完全一樣，差在回答本身；`xlsx-peak-month`、`xlsx-construction` 各有一到兩頁來源不同，`xlsx-construction` 的答案引自 `qat-base` 沒選進的第 7 頁。
+- `qat-k6` 一次一題的首字比 `qat-base` 快約 8s：rerank 平均 1.0s（`qat-base` 7.4s），每題 context 的圖片平均 1.7 張（`qat-base` 3.0 張），prefill 也比較短。
+- 一次一題時 rerank 平均 7.4s（`qat-base`，50 筆候選），和 §8.12 一格的 7.3s 相近；多人同時時平均多出約 14s，包含 embed／rerank 共用一把鎖的排隊與同時跑 Gemma 的 GPU 競爭，這次沒有拆開量。
+- 上傳壓力（2026-10-06，`gemma4:12b-mlx`、頁圖 1280）：先跑一次 realistic（32/39）把 prefix cache 填滿，再用 `concurrency.ts --levels 4 --rounds 3` 連續三輪 4 人同時提問，同時依序上傳 Machine Guarding（75 頁）與 OSHA 3080（32 頁）的複本，ready 後就刪掉。每輪全部答完 69.0–81.3s（平均 77.0s），平均／最慢首字 59.0／79.8s（沒有上傳的 `mlx-1280` 是 70.5s、53.4／69.0s），12 題答對 11 題（`jpg-brand` 又讀成別的廠牌）。兩份上傳分別 64.4s、66.4s ready（§8.11 單獨上傳 Machine Guarding 是 28.1s）。swap 最高 11.8 GiB；系統記憶體壓力有 4 個取樣點（約 8 秒）到 critical，都在 Gemma 寫上傳摘要或 4 題同時 prefill 時，wired 從約 9.6 GiB 升到 15.4 GiB。Ollama、推論服務、app 的 log 都沒有錯誤；系統 log 只有 macOS 把閒置的系統 daemon 以 idle-exit 結束，沒有砍到這三個服務。腳本與結果在 `knowva-mac:~/knowva-inference/bench-results/stress-20261005-235428/`。
+- MLX prefix cache 上限 2 GiB（2026-10-06）：`maxPagedOutBytes` 是常數，上游讓它可設定的 PR #18556 沒有被接受（issue #18131 仍開著）。在 knowva-mac 以 v0.35.0 原始碼（cc40693）套上 #18556，只用 `go build` 重編 Go 執行檔（Go 1.26.8），MLX 與 llama.cpp 沿用 release 附的函式庫；設 `OLLAMA_MLX_MAX_PAGED_OUT_BYTES=2147483648`，其餘同 `mlx-1280`，結果在 `knowva-mac:~/knowva-inference/bench-results/km1-20261006-002433/`。
+
+  | | `mlx-1280`（官方 8 GiB） | 上限 2 GiB |
+  | --- | --- | --- |
+  | `msg=memory held` 最高／peak | 15.4／17.5 GiB | 9.35／11.4 GiB |
+  | `/api/ps` 大小 | 16.1 GB | 9.8 GB |
+  | 每分鐘答完（1–4 人） | 3.2–4.1 | 3.3–4.0 |
+  | 4 人同時，平均／最慢首字 | 53.4／69.0s | 48.4／65.1s |
+  | 同時處理那 20 題答對 | 20/20 | 19/20 |
+  | examples／realistic | 30/34、31/39 | 29/34、32/39 |
+  | 重用超過 300 token 的請求（共 96 個） | 6 | 1 |
+  | 追問首字 `pdf-follow-up`／`osha-follow-up` | 19.1／17.2s | 18.7／17.2s |
+  | swap 最高 | 12.5 GiB | 5.2 GiB |
+  | 記憶體壓力 critical | —（未記錄） | 0 次 |
+  | 上傳壓力：每輪平均、平均／最慢首字 | 77.0s、59.0／79.8s | 75.2s、56.7／76.9s |
+  | 上傳壓力：ready 時間 | 64.4、66.4s | 54.3、69.4s |
+  | 上傳壓力：swap 最高、critical | 11.8 GiB、4 個取樣點 | 4.8 GiB、0 次 |
+
+  答錯的題目兩組差在 `jpg-brand`（2 GiB 這組在同時處理與 examples 各錯一次）與 `cross-crane`（2 GiB 這組通過）；上傳壓力的第二輪兩組也都錯在 `jpg-brand`。上限 2 GiB 後，追問少了前一輪的重用，但首字時間沒有變。兩組的 log 都沒有錯誤。
