@@ -409,7 +409,7 @@ Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重）�
 
 把 Nemotron Rerank VL 移植到 MLX 0.32.3（直接讀原始 `model.safetensors`），和推論服務現行的 PyTorch 2.14.1 MPS 比。前處理和模型的 transformers processor 逐 token、逐 pixel 相同（tiles 1 與 6、文字／圖／圖＋文、截斷都比過）。
 
-候選不是 app 實際送出的：擷取那些要暫時改正式 app 的 rerank 路由，這次沒做。改用 `examples.json` 與 `realistic.json` 裡來源是 PDF 或圖片的 34 題（兩題追問的每輪各算一題，共 36 題），以 BM25 從 4 份 PDF（共 53 頁）與 4 張圖片選出每題前 50 名；其中 7 筆帶頁圖（上傳的圖片與 iiot 報告第 7 頁優先，不足依名次補），頁圖是 180 DPI、長邊上限 1600 的 PNG。送進模型的方式照後端與推論服務：同一 modality 一批、每批最多 8 筆、循序，`KM_RERANK_TILES=1`，token 上限依 modality。每組各自一個程序、先跑 1 題暖機；每組開跑前推論服務都沒有載入模型，Gemma（MLX、上限 2 GiB）常駐。這份候選每題 rerank 5.87s，比 §8.13 實際候選的 7.4s 短。
+先用合成候選比（正式服務改跑 MLX 之後擷取的實際候選在本節後段）：`examples.json` 與 `realistic.json` 裡來源是 PDF 或圖片的 34 題（兩題追問的每輪各算一題，共 36 題），以 BM25 從 4 份 PDF（共 53 頁）與 4 張圖片選出每題前 50 名；其中 7 筆帶頁圖（上傳的圖片與 iiot 報告第 7 頁優先，不足依名次補），頁圖是 180 DPI、長邊上限 1600 的 PNG。送進模型的方式照後端與推論服務：同一 modality 一批、每批最多 8 筆、循序，`KM_RERANK_TILES=1`，token 上限依 modality。每組各自一個程序、先跑 1 題暖機；每組開跑前推論服務都沒有載入模型，Gemma（MLX、上限 2 GiB）常駐。這份候選每題 rerank 5.87s，比 §8.13 實際候選的 7.4s 短。
 
 | 每題 50 筆 | 平均 | 與 fp32 參考的 logit 最大差 | 前 6 名集合不同 | 前 6 名順序不同 | 使用中記憶體峰值（不含快取） |
 | --- | --- | --- | --- | --- | --- |
@@ -454,3 +454,30 @@ Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重）�
   embed 仍跑 PyTorch，程序裡還是有 PyTorch runtime 與 MPS 快取，所以峰值幾乎一樣。結果在 `rerank-server2-20261006-025831/`（沒設上限）與 `rerank-server3-20261006-031952/`。
 - MLX 第一版載入時同時持有 bf16 原檔與 fp16 副本，可用記憶體一度剩 0.15 GiB、記憶體壓力 critical 2 秒、swap 增加 2.3 GiB；改成逐個 tensor 轉換後沒有再出現。
 - 移植與量測工具在 `deploy/mac-mini/nemotron-vl-mlx/`（`tools/knowva/build_sets.py` 組候選、`bench_sets.py` 量時間與 logit、`compare_runs.py` 比較、`run-sets.sh` 依序執行並取樣記憶體、`cache-sweep.sh` 與 `server-test.sh`）。以上結果都在 `knowva-mac:~/knowva-inference/bench-results/` 底下，36 題的比較在 `rerank-sets-20261006-015536/` 與 `rerank-sets2-20261006-023640/`。
+
+正式推論服務 09:40 改成 `KM_RERANK_BACKEND=mlx`、`KM_MLX_CACHE_MB=256`（embed 仍是 PyTorch），照 §8.13 跑一輪 e2e（`mlx-rerank-e2e-20261006-094336/`），對照同一天 PyTorch 的 `km1-20261006-002433/`。這一輪 app 的 rerank 請求經過 `tools/knowva/capture-proxy.ts` 轉送，原樣記下請求與回應（`capture-e2e.sh`，跑完路由改回直連）。
+
+| | MLX rerank | PyTorch（km1） |
+| --- | --- | --- |
+| 1／2／3／4 人同時提問，每分鐘答完 | 5.15／4.44／3.98／4.18 | 4.03／3.86／3.30／3.65 |
+| 同時提問時每次 rerank 平均／最長 | 5.8s／7.0s | 21.5s／33.9s |
+| examples／realistic 答對 | 30/34、33/39 | 29/34、32/39 |
+| 首字中位數 examples／realistic | 13.4s／12.9s | 16.8s／16.2s |
+| 記憶體壓力 warn 的取樣比例 | 2.8% | 36% |
+| 跑的期間 swap | 1.5→2.7 GiB | 1.4→5.2 GiB |
+
+- swap 最高 9.7 GiB 是開跑前留下的（第一筆取樣時推論服務還沒載入模型），跑的期間一路降到 1.5 GiB 再回升。
+- 答對題不同的有 jpg-brand、xlsx-peak-month（MLX 對、km1 錯）與 poster-machine-causes、poster-hoisting-hazards（兩邊都錯，缺的關鍵字不同）。用下面的重播比，只有 poster-machine-causes 的前 6 名和 PyTorch fp16 不同（第 3、4 名對調）；其他三題前 6 名相同，差異來自 rerank 之後。
+
+擷取到的 520 個請求是 73 題（examples 34、realistic 39）、每題 50 筆的實際候選，3650 筆裡 524 筆帶頁圖（24 張不同的圖），以 `tools/knowva/capture_to_sets.py` 轉成 `bench_sets.py` 的格式。MLX 照服務設定（TF32 開、cache 256 MB）重播時，73 題的 logit 和服務當時回傳的完全相同，所以重播能代表正式服務。結果在 `rerank-captured-20261006/`：
+
+| 實際候選，每題 50 筆 | 平均 | 與 fp32 參考的 logit 最大差 | 前 6 名集合不同 | 前 6 名順序不同 | 程序 footprint |
+| --- | --- | --- | --- | --- | --- |
+| PyTorch MPS fp32（參考） | 22.12s | — | — | — | 12 GB |
+| PyTorch MPS fp16（原本的服務） | 7.18s | 0.0082 | 2/73 | 0 | 7.3 GB |
+| MLX fp16（服務設定） | 4.91s | 0.0104 | 1/73 | 1 | 4.0 GB |
+
+- 前 6 名集合不同的題目，參考值的第 6、7 名只差 0.0018 與 0.0003；MLX 不同的那一題，PyTorch fp16 也一樣換掉。MLX 和 PyTorch fp16 之間 logit 最大差 0.0107，前 6 名集合不同 1 題（pptx-content，第 6 名）、順序不同 1 題（poster-machine-causes）。
+- MLX 比 PyTorch fp16 快 1.46 倍（中位數 1.54 倍）。實際候選比合成的長（PyTorch 每題 7.18s 對 5.87s）。
+- TF32 開或關，fp16 的 logit 完全相同：fp16 模型裡只有 score head 是 float32 matmul。
+- 頁面文字的 `\r\n` 要原樣送：工具一開始用文字模式讀候選，換行被改成 `\n`，重播和服務的 logit 差到 0.45、前 6 名 18 題不同。合成候選（`build_sets.py`）同樣把 `\r\n` 換成 `\n`；各組拿到的文字相同，前面的比較仍成立，只是和 app 送出的差在換行。

@@ -44,7 +44,8 @@ sets_dir = Path(args.sets_dir)
 sets = json.loads((sets_dir / "sets.json").read_text())
 if args.limit:
     sets = sets[: args.limit]
-texts = {p.stem: p.read_text() for p in (sets_dir / "pool").glob("*.txt")}
+# Bytes as written: text mode would turn the "\r\n" in extracted pages into "\n".
+texts = {p.stem: p.read_bytes().decode() for p in (sets_dir / "pool").glob("*.txt")}
 pngs = {p.stem: p.read_bytes() for p in (sets_dir / "pool").glob("*.png")}
 
 

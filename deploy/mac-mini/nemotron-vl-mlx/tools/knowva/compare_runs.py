@@ -40,7 +40,8 @@ for path in run_paths:
         top_a = list(np.argsort(-a, kind="stable")[:TOP_N])
         top_b = list(np.argsort(-b, kind="stable")[:TOP_N])
         if set(top_a) != set(top_b):
-            gap = float(np.sort(a)[::-1][TOP_N - 1] - np.sort(a)[::-1][TOP_N])
+            ordered = np.sort(a)[::-1]
+            gap = float(ordered[TOP_N - 1] - ordered[TOP_N]) if len(ordered) > TOP_N else float("nan")
             set_mismatch.append(f"{r['id']} ref={[int(i) for i in top_a]} run={[int(i) for i in top_b]} "
                                 f"(ref gap at #6/#7 {gap:.4f})")
         elif top_a != top_b:

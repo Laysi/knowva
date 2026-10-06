@@ -5,11 +5,15 @@
 # it would distort the times. Changes no service.
 #   nohup bash run-sets.sh <results dir> [run ...] > <results dir>/run.log 2>&1 &
 # A run is backend:device:dtype[:batching], e.g. torch:mps:float16 or mlx:gpu:float16:unpadded.
+# SETS picks another candidate-set directory (default fixtures/sets);
+# CACHE_LIMIT_MB caps MLX's buffer cache as KM_MLX_CACHE_MB does in the service;
+# MLX_ENABLE_TF32=1 keeps MLX's TF32 default, as the service does.
 set -uo pipefail
 out=$(realpath "$1"); shift
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 models=$HOME/knowva-inference/models/llama-nemotron-rerank-vl-1b-v2
+sets=${SETS:-$root/fixtures/sets}
 runs=("$@")
 [ ${#runs[@]} -gt 0 ] || runs=(torch:mps:float16 mlx:gpu:float16 mlx:gpu:bfloat16 torch:mps:float32 mlx:gpu:float32)
 
@@ -33,8 +37,9 @@ for run in "${runs[@]}"; do
   sampler=$!
   extra=()
   [ -n "$variant" ] && extra=(--batching "$variant")
-  # TF32 is MLX's default on this GPU; float32 means float32 here.
-  MLX_ENABLE_TF32=0 "$root/.venv/bin/python" -u "$here/bench_sets.py" "$root/fixtures/sets" "$models" "$out/$name.json" \
+  [ -n "${CACHE_LIMIT_MB:-}" ] && extra+=(--cache-limit-mb "$CACHE_LIMIT_MB")
+  # TF32 is MLX's default on this GPU; float32 means float32 here unless asked.
+  MLX_ENABLE_TF32=${MLX_ENABLE_TF32:-0} "$root/.venv/bin/python" -u "$here/bench_sets.py" "$sets" "$models" "$out/$name.json" \
     --backend "$backend" --device "$device" --dtype "$dtype" --tiles 1 ${extra[@]+"${extra[@]}"} > "$out/$name.log" 2>&1
   echo "exit $? $(tail -1 "$out/$name.log")"
   kill "$sampler" 2>/dev/null
