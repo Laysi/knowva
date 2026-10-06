@@ -9,8 +9,8 @@ import {
   shouldPollDocuments,
   UPLOAD_ACCEPT,
   validateUploadFile,
-} from "./DocumentModel";
-import type { DocumentRow } from "./DocumentModel";
+} from "@knowva/core";
+import type { DocumentRow } from "@knowva/core";
 
 function fileExt(name: string): string {
   const dot = name.lastIndexOf(".");

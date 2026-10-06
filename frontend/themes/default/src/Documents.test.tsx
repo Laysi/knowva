@@ -7,8 +7,8 @@ import {
   documentStatusLabel,
   shouldPollDocuments,
   validateUploadFile,
-} from "./DocumentModel";
-import type { DocumentRow } from "./DocumentModel";
+} from "@knowva/core";
+import type { DocumentRow } from "@knowva/core";
 
 const NOW = Date.parse("2026-07-12T08:00:00.000Z");
 const RAW_SECRET = "provider response: Authorization Bearer sk-secret-123";
