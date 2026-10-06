@@ -73,6 +73,8 @@ since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 sample > "$out/memory.log" 2>&1 &
 sampler=$!
 
+# proto resolves bun's version from the app's .prototools.
+cd "$app" || exit 1
 bun "$here/capture-proxy.ts" --out "$out/ranking" > "$out/proxy.log" 2>&1 &
 proxy=$!
 for _ in $(seq 40); do curl -sf 127.0.0.1:9501/health >/dev/null && break; sleep 0.5; done
@@ -80,7 +82,6 @@ curl -sf 127.0.0.1:9501/health >/dev/null || { echo "proxy did not come up" >&2;
 (cd ~/knowva && docker compose -p knowva -f docker-compose.yml -f "$out/capture.override.yml" up -d) && wait_app || exit 1
 rerank_url || exit 1
 
-cd "$app" || exit 1
 echo "### examples $(date +%T)"
 # Both datasets have known failing cases, so their exit status is a result.
 bun bench/examples.ts --out "$out/examples.json"; echo "examples exit $?"
