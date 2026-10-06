@@ -39,6 +39,21 @@ describe("externalReferences", () => {
     ).toEqual(["url(https://cdn.example.com/a.png)"]);
   });
 
+  it("reads an emitted SVG like HTML, without flagging its namespaces", () => {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+      <style>@import url(https://fonts.googleapis.com/css2?family=Inter);</style>
+      <image href="https://cdn.example.com/photo.jpg" />
+      <image xlink:href="/assets/photo-abc.jpg" />
+      <use href="#mark" />
+    </svg>`;
+
+    expect(externalReferences("assets/hero-abc.svg", svg)).toEqual([
+      'href="https://cdn.example.com/photo.jpg"',
+      "url(https://fonts.googleapis.com/css2?family=Inter)",
+      "@import https://fonts.googleapis.com/css2?family=Inter",
+    ]);
+  });
+
   it("accepts bundled, relative and data: references, and skips JavaScript", () => {
     const html = `<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Crect fill='url(%23nova)'/%3E%3C/svg%3E">
       <script type="module" crossorigin src="/assets/index-abc.js"></script>

@@ -3,7 +3,7 @@ import type { Plugin } from "vite";
 // Knowva ships as an offline appliance: a theme must bundle its fonts, images
 // and styles instead of loading them from another host.
 //
-// Only HTML and CSS are read. Bundled JavaScript legitimately holds URL
+// Only HTML, SVG and CSS are read. Bundled JavaScript legitimately holds URL
 // strings (React's SVG and MathML namespaces, error-page links) that are never
 // fetched, so it is not scanned.
 
@@ -18,7 +18,7 @@ const cssReferences = (source: string): string[] => [
   ...[...source.matchAll(CSS_IMPORT)].map((match) => `@import ${match[2]}`),
 ];
 
-const htmlReferences = (source: string): string[] => {
+const markupReferences = (source: string): string[] => {
   const found: string[] = [];
   for (const match of source.matchAll(URL_ATTRIBUTES)) {
     const attribute = match[1]!.toLowerCase();
@@ -34,14 +34,18 @@ const htmlReferences = (source: string): string[] => {
   return [...found, ...cssReferences(source)];
 };
 
-/** External references in one emitted HTML or CSS file; other files are skipped. */
+/**
+ * External references in one emitted HTML, SVG or CSS file; other files are
+ * skipped. An SVG opened through <object> or <embed> loads its own <image
+ * href> and stylesheets, so it is read like HTML.
+ */
 export function externalReferences(fileName: string, source: string): string[] {
-  if (/\.html?$/i.test(fileName)) return htmlReferences(source);
+  if (/\.(?:html?|svg)$/i.test(fileName)) return markupReferences(source);
   if (/\.css$/i.test(fileName)) return cssReferences(source);
   return [];
 }
 
-/** Fails a theme's build if its HTML or CSS would load anything off the box. */
+/** Fails a theme's build if its HTML, SVG or CSS would load anything off the box. */
 export function offlineBundle(): Plugin {
   return {
     name: "knowva:offline-bundle",
