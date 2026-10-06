@@ -158,6 +158,9 @@ RUN ldconfig
 WORKDIR /app/backend
 COPY --from=backend-builder /tmp/knowva-server ./knowva-server
 COPY --from=frontend-builder /src/frontend/dist /app/frontend/dist
+# Every industry profile ships in the image. KNOWVA_PROFILE picks one at
+# startup from ../profiles, relative to the working directory above.
+COPY profiles /app/profiles
 RUN mkdir -p /app/backend/data/files \
     && chown -R knowva:knowva /app
 

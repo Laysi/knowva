@@ -37,6 +37,7 @@ services:
       DOCUMENT_CONVERSION_TIMEOUT_SECS: ${DOCUMENT_CONVERSION_TIMEOUT_SECS:-120}
       PDFIUM_LIBRARY_PATH: /usr/local/lib/libpdfium.so
       LIBREOFFICE_BIN: /usr/bin/libreoffice
+      KNOWVA_PROFILE: ${KNOWVA_PROFILE:-default}
     ports:
       - "${APP_PORT:-8080}:8080"
     volumes:
