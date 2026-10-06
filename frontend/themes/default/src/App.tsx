@@ -1,6 +1,7 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { AssistantRuntimeProvider, useLocalRuntime } from "@assistant-ui/react";
-import { BackendAdapter } from "@knowva/core";
+import { BackendAdapter, useProfile } from "@knowva/core";
+import type { ProfileSuggestion } from "@knowva/core";
 import { Thread } from "./Thread";
 import { Documents } from "./Documents";
 import { BrandMark, ChatIcon, DocsIcon } from "./Icons";
@@ -15,21 +16,24 @@ const NAV: NavItem[] = [
   { id: "documents", label: "文件", icon: <DocsIcon /> },
 ];
 
-const VIEW_META: Record<View, { title: string; description: string }> = {
-  chat: {
-    title: "知識問答",
-    description: "查詢已建立索引的公司文件。",
-  },
-  documents: {
-    title: "文件管理",
-    description: "上傳後，知星會讀完文件、整理摘要，並建立索引供查詢。",
-  },
-};
+/** Keeps a line's height while the profile loads, so nothing shifts when it lands. */
+const PENDING = " ";
+const NO_SUGGESTIONS: readonly ProfileSuggestion[] = [];
 
 function App() {
   const runtime = useLocalRuntime(BackendAdapter);
   const [view, setView] = useState<View>("chat");
-  const meta = VIEW_META[view];
+  // Brand, page copy, suggestions and the composer placeholder all come from
+  // the deployed profile. Chat and documents work whether or not it loads.
+  const profileState = useProfile();
+  const profile = profileState.status === "ready" ? profileState.profile : null;
+  const page = profile?.pages[view];
+
+  useEffect(() => {
+    if (profile) {
+      document.title = `${profile.brand.name} — ${profile.brand.tagline}`;
+    }
+  }, [profile]);
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
@@ -40,8 +44,8 @@ function App() {
               <BrandMark />
             </span>
             <span className="brand-text">
-              <span className="brand-name">Knowva 知星</span>
-              <span className="brand-sub">點亮你的知識星系</span>
+              <span className="brand-name">{profile?.brand.name ?? PENDING}</span>
+              <span className="brand-sub">{profile?.brand.tagline ?? PENDING}</span>
             </span>
           </div>
 
@@ -63,11 +67,27 @@ function App() {
 
         <div className="content">
           <header className="content-header">
-            <h1 className="content-title">{meta.title}</h1>
-            <p className="content-desc">{meta.description}</p>
+            <h1 className="content-title">{page?.title ?? PENDING}</h1>
+            {profileState.status === "error" ? (
+              <div className="profile-error" role="alert">
+                <span>{profileState.message}</span>
+                <button type="button" onClick={profileState.reload}>
+                  重新載入
+                </button>
+              </div>
+            ) : (
+              <p className="content-desc">{page?.description ?? PENDING}</p>
+            )}
           </header>
           <main className="content-body">
-            {view === "chat" ? <Thread /> : <Documents />}
+            {view === "chat" ? (
+              <Thread
+                suggestions={profile?.suggestions ?? NO_SUGGESTIONS}
+                composerPlaceholder={profile?.composerPlaceholder ?? ""}
+              />
+            ) : (
+              <Documents />
+            )}
           </main>
         </div>
       </div>

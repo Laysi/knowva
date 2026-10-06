@@ -11,3 +11,10 @@ export type {
   DocumentLibrary,
   UploadResult,
 } from "./useDocuments";
+export { isProfile, profileRequestErrorMessage, useProfile } from "./useProfile";
+export type {
+  Profile,
+  ProfilePage,
+  ProfileState,
+  ProfileSuggestion,
+} from "./useProfile";
