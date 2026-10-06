@@ -519,3 +519,5 @@ Embed VL 用同一套移植（`Embedder`）：和 sentence-transformers 一樣�
 - 全 MLX 和 rerank MLX 的 73 題取到的來源完全相同；和 km1 比只有 pptx-content、poster-machine-causes 兩題不同（就是重播裡前 6 名和 PyTorch fp16 不同的兩題，三輪都答錯）。答對題不同的 jpg-brand、jpg-task、xlsx-peak-month 來源都相同，是 Gemma 對同樣的來源給了不同答案，例如 jpg-brand 一次讀成 KUKA、一次讀成 FANUC。
 - pptx 在有人提問時變慢：同一份 pptx 沒人提問時 23.1s 可問答，其中 embed 11.6s。有人提問時 embed 要 48s，推論服務的存取紀錄顯示上傳的 embed 和 4 人的 rerank 批次輪流取得 GPU（約 4 個 embed、4 個 rerank 交替），上傳的進度被 rerank 綁住；km1 沒留推論服務紀錄，無法比較它當時的順序。第二次在 `mlx-all-upload-20261006/`，沒有取樣記憶體。同一段時間答題變多、首字變快，PDF 沒有變慢。
 - 推論服務不再載入 PyTorch，footprint 中位數少 1.2 GB、最高少 1.8 GB。上傳階段推論服務最高 8.3 GB。
+
+之後權重改從 Hugging Face 的 `Laysi-ai/llama-nemotron-{embed,rerank}-vl-1b-v2-mlx` 下載（`setup/fetch-models.ts`）。這是 NVIDIA 權重換成移植的參數名稱與版面，bf16 數值不變。切換前後，推論服務對同一組請求的回應逐位相同：15 個 embed（查詢、文字、頁圖、頁圖＋文字）和 9 個 rerank（文字、頁圖、頁圖＋文字各 3 題）。切換前同一份服務連跑兩次也逐位相同，所以這個比對有效。切換後透過 app 問 realistic 第一題，答案正確，答案用到的頁排第一。比對工具是 `tools/knowva/service_outputs.py`，結果在 `hf-weights-switch-20261006/`。
