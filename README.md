@@ -20,7 +20,7 @@
 
 | 層 | 技術 |
 |---|---|
-| 前端 | React + Vite + assistant-ui（純 CSS、繁中介面） |
+| 前端 | React + Vite + assistant-ui（npm workspaces：共用的 `@knowva/core` 加上主題；純 CSS、繁中介面） |
 | 後端 | Rust（axum + tokio + sqlx），單一 binary |
 | 資料庫 | PostgreSQL 17 + pgvector |
 | 模型呼叫 | 單一模型服務 HTTP client（`cloud_models.rs`，地端與雲端端點共用）；Gemma 4 + Nemotron Embed/Rerank VL |
@@ -184,15 +184,26 @@ proto exec rust -- cargo run      # http://localhost:8080
 ```bash
 cd frontend
 proto run npm -- ci
-proto run npm -- run dev          # http://localhost:5173，proxy /api 到 :8080
+proto run npm -- run dev          # default 主題，http://localhost:5173，proxy /api 到 :8080
 ```
 
 或建立 production bundle，交由後端服務：
 
 ```bash
 cd frontend
-proto run npm -- run build
+proto run npm -- run build        # 輸出到 frontend/dist/
 ```
+
+`frontend/` 是 npm workspaces，lockfile 只有根目錄的 `frontend/package-lock.json`，指令一律在 `frontend/` 執行：
+
+| Workspace | 內容 |
+|---|---|
+| `packages/core`（`@knowva/core`） | `BackendAdapter`、`DocumentModel`、`useDocuments`（文件列表、輪詢、上傳、刪除）與安全化的錯誤訊息；不含 CSS 與版面。`@knowva/core/testing` 提供主題契約測試，`@knowva/core/vite` 提供擋外部網址的 build plugin |
+| `themes/default`（`@knowva/theme-default`） | 現行介面：元件、CSS、`index.html` 與 `main.tsx` |
+
+根目錄的 `run lint`、`run test`、`run build` 依序跑過每個 workspace；`run dev` 與 `run preview` 啟動 default 主題，也可以用 `proto run npm -- run dev --workspace @knowva/theme-default` 指定。
+
+每個主題的 vitest 都要呼叫 `describeThemeContract`，用主題自己的元件確認產品承諾：回答完成後列出每個來源的檔名、分頁來源另列頁碼；SSE `error` 或連線失敗時顯示 core 的安全化訊息；串流途中可以停止生成；不支援的副檔名或超過 50 MiB 的檔案顯示 core 的訊息而且不送出請求。主題也要在 `:root` 宣告 `--theme-text`、`--theme-background`、`--theme-brand`、`--theme-on-brand`、`--theme-success`、`--theme-warning`、`--theme-error`，契約測試會檢查內文與三種狀態色在底色上、`on-brand` 在品牌色上的對比都達到 WCAG AA（4.5:1）。正式環境是離線 appliance，主題的 HTML 與 CSS 不能從其他主機載入字型、圖片或樣式，build 遇到這類 `src`、`href`、`url()`、`@import` 會直接失敗。
 
 ## API
 

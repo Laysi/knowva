@@ -14,9 +14,9 @@ The specification priority is the active GitHub issue, then tracker issue #1, th
 - Full stack: configure `.env`, then `docker compose up -d --build`
 - Database only: `docker compose up -d postgres`
 - Backend: `cd backend && proto exec rust -- cargo run` (run from `backend/` because data and frontend paths are working-directory relative)
-- Frontend: `cd frontend && proto run npm -- run dev`
+- Frontend: `cd frontend && proto run npm -- run dev` (starts the default theme; `--workspace @knowva/theme-default` names it explicitly)
 - Backend checks: run `proto exec rust -- cargo fmt --check`, `proto exec rust -- cargo clippy --all-targets -- -D warnings`, and `proto exec rust -- cargo test` from `backend/`
-- Frontend checks: run `proto run npm -- ci`, `proto run npm -- run lint`, and `proto run npm -- run build` from `frontend/`
+- Frontend checks: run `proto run npm -- ci`, `proto run npm -- run lint`, `proto run npm -- run test`, and `proto run npm -- run build` from `frontend/`; each runs every workspace
 - Native conversion smoke test: `docker build --target native-test -t knowva:native-test .`
 - Stop the backend with `pkill -x knowva-server`; never use `pkill -f`.
 
@@ -33,7 +33,9 @@ The backend requires a confirmed `GEMMA_4_MODEL_ID` and `MODEL_BASE_URL` (unless
   - `page_artifacts.rs` uses Pdfium for PDF rasterization/text-layer extraction, normalizes images, and runs isolated headless LibreOffice conversion for DOCX/PPTX/XLSX. Artifact conversion itself never calls a model or fabricates embeddings; ingestion embeds the published artifacts afterward.
   - `page_vision.rs` decides once per rendered page, from Pdfium page objects and without any model, whether the page needs vision (`needs_vision`, migration `0007_page_vision.sql`). Text-only pages are embedded, reranked, summarized, and answered from their text layer and never read their image; every stage goes through `page_uses_image`. Thresholds are constants there, uncertain pages count as vision, and image uploads always do. Images and shapes drawn with identical content and position on most of a document's pages, and confirmed to look the same in a text-masked 72 dpi rendering, are page furniture and do not count, so the decision is made after every page is observed.
   - `search.rs` owns injectable dense/BM25 candidate stages, deterministic RRF, safe artifact-to-passage preparation, VL reranking batched per modality (image vs text-only), strict index/score mapping, and transient-only RRF fallback. Dense and lexical paths default to top-50 over ready-only partial HNSW/GIN indexes; BM25 corpus statistics are transactionally maintained by migration `0004_hybrid_retrieval.sql`. Rerank output defaults to six candidates and is configurable from three to eight.
-- `frontend/` is Vite + React TypeScript + assistant-ui with plain CSS.
+- `frontend/` is an npm workspaces root (Vite + React TypeScript + assistant-ui with plain CSS); the only lockfile is `frontend/package-lock.json`.
+  - `packages/core` (`@knowva/core`) owns `BackendAdapter`, `DocumentModel`, `useDocuments` (list, polling, upload, delete) and the safe error messages, with no CSS or layout. `@knowva/core/testing` exports `describeThemeContract`, which every theme's vitest runs against the theme's own components and `:root` colours; `@knowva/core/vite` exports `offlineBundle`, which fails a build whose HTML or CSS loads anything from another host.
+  - `themes/default` (`@knowva/theme-default`) is the current interface. It builds into the flat `frontend/dist/` that the backend and the Docker image serve.
 - SQLx migrations run automatically at backend startup.
 
 ## Cloud model safety
