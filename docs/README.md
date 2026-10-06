@@ -1,6 +1,6 @@
 # Knowva 知星 冷啟動規劃(總覽)
 
-> **系統定位:本產品不是 SaaS。** 它是部署在「單一企業內網」的簡易知識管理系統(文件上傳 → 建立知識庫 → RAG 問答附來源)。一套系統只服務一個客戶,沒有多租戶、沒有雲端帳號體系;軟體永遠只有一套,差異只在客戶採購的硬體與掛載的模型尺寸。
+> **系統定位:本產品不是 SaaS。** 它是部署在「單一企業內網」的簡易知識管理系統(文件上傳 → 建立知識庫 → RAG 問答附來源)。一套系統只服務一個客戶,沒有多租戶、沒有雲端帳號體系;軟體只有一套,產業差異是 profile(產業段 prompt、預設文案)加上主題,由部署時的 `KNOWVA_PROFILE` 選定,其餘差異只在客戶採購的硬體與掛載的模型尺寸。
 >
 > 文中的 **10 萬 / 20 萬指「客戶買機器的預算」(新台幣)**:10 萬級 = x86 + RTX 5060 Ti 16GB ×2 主機(合計 32GB)、20 萬級 = DGX Spark 128GB 或 RTX 5090 主機(市場行情:5060 Ti 16GB 單卡約 1.4-1.7 萬、GB10 迷你機實售 17 萬+、RTX 5090 單卡 15 萬+),與 MVP / 正式產品的階段無關。**產品線全部落在 NVIDIA + Linux(macOS 不在標準支援清單)**,整套系統含模型皆可容器化,一套部署法通用全落點。
 
@@ -31,7 +31,7 @@
 
 | 原則 | 說明 |
 | --- | --- |
-| 一套系統 | 軟體不分版本。Basic / Enterprise 只是「硬體採購與模型尺寸」的建議落點,pipeline、API、資料格式完全相同;**部署手順也相同**(全線 NVIDIA Linux,同一份 compose、安裝腳本與權重包,含模型全容器)。 |
+| 一套系統 | 軟體不分版本;產業版本是同一個 image 內以 `KNOWVA_PROFILE` 選定的 profile 與主題,核心問答規則不變。Basic / Enterprise 只是「硬體採購與模型尺寸」的建議落點,pipeline、API、資料格式完全相同;**部署手順也相同**(全線 NVIDIA Linux,同一份 compose、安裝腳本與權重包,含模型全容器)。 |
 | 模型與交付一致 | LLM/VLM 主線固定 Google Gemma 4 family,只在家族內調尺寸(12B/31B)、量化(Q4/Q8/SFP8)、context 與併發。**開發/測試走雲端時,也用同一家族與版本 — 雲端只改執行位置,不改模型。** |
 | Embedding 固定 | 換 embedding = 全庫向量重建。全程固定 Llama Nemotron Embed VL 1B v2(2048 維;文字、頁圖、「圖+文」同一空間),從 MVP 就開始。demo 已實測:Bedrock Titan 與 NVIDIA embed 的向量空間互不相容,切換 provider 後必須刪除並重傳所有文件 — 這就是此原則的成本證明。 |
 | Rerank 固定 family | 固定 NVIDIA Llama Nemotron Rerank VL 1B v2 — 單一 cross-encoder 同時精排文字與頁面候選(官方評測 recall@5 約 +6~7 個百分點)。低階機只調低候選數(top-k / top-n)或改低併發批次,不換模型、不改 retrieval API 與資料格式。 |
