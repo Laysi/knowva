@@ -17,7 +17,7 @@ import {
   ArrowRightIcon,
 } from "./Icons";
 import type { ReactNode } from "react";
-import type { ChatSource } from "./BackendAdapter";
+import type { ChatSource } from "@knowva/core";
 
 const MarkdownText = () => (
   <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} className="aui-md" />

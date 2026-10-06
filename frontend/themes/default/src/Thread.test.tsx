@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { SourceList } from "./Thread";
-import type { ChatSource } from "./BackendAdapter";
+import type { ChatSource } from "@knowva/core";
 
 const sources: ChatSource[] = [
   {

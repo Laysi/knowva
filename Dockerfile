@@ -27,11 +27,22 @@ RUN apt-get update \
     && tar -xzf /tmp/pdfium.tgz -C /opt/pdfium \
     && rm /tmp/pdfium.tgz
 
+# The frontend's package manifests and nothing else: the root lockfile and
+# every workspace's package.json, found rather than listed so that a new
+# workspace cannot be left out of the install. This stage reruns on any
+# frontend change, but its output only changes with a manifest, and the copy
+# below is cached on that content.
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-bookworm-slim AS frontend-manifests
+WORKDIR /src/frontend
+COPY frontend/ ./
+RUN find . -type f ! -name package.json ! -name package-lock.json -delete \
+    && find . -type d -empty -delete
+
 # The bundle is static files and identical on every architecture, so it is
 # built once on the builder's own rather than under emulation.
 FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-bookworm-slim AS frontend-builder
 WORKDIR /src/frontend
-COPY frontend/package.json frontend/package-lock.json ./
+COPY --from=frontend-manifests /src/frontend/ ./
 RUN --mount=type=cache,target=/root/.npm npm ci
 COPY frontend/ ./
 RUN npm run build

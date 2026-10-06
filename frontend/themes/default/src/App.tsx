@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { AssistantRuntimeProvider, useLocalRuntime } from "@assistant-ui/react";
-import { BackendAdapter } from "./BackendAdapter";
+import { BackendAdapter } from "@knowva/core";
 import { Thread } from "./Thread";
 import { Documents } from "./Documents";
 import { BrandMark, ChatIcon, DocsIcon } from "./Icons";

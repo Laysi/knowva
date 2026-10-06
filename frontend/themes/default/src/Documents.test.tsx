@@ -4,11 +4,8 @@ import { DocumentList } from "./Documents";
 import {
   documentFailureMessage,
   documentRequestErrorMessage,
-  documentStatusLabel,
-  shouldPollDocuments,
-  validateUploadFile,
-} from "./DocumentModel";
-import type { DocumentRow } from "./DocumentModel";
+} from "@knowva/core";
+import type { DocumentRow } from "@knowva/core";
 
 const NOW = Date.parse("2026-07-12T08:00:00.000Z");
 const RAW_SECRET = "provider response: Authorization Bearer sk-secret-123";
@@ -86,27 +83,6 @@ describe("DocumentList", () => {
     expect(html).not.toContain(RAW_SECRET);
   });
 
-  it("uses explicit extracting and indexing copy", () => {
-    expect(documentStatusLabel(documents[1]!)).toBe("讀取內容中");
-    expect(
-      documentStatusLabel({
-        ...documents[1]!,
-        processingStage: "indexing",
-      }),
-    ).toBe("建立索引中");
-  });
-
-  it("keeps polling for every processing stage and stops for terminal rows", () => {
-    expect(shouldPollDocuments([documents[0]!, documents[3]!])).toBe(false);
-    expect(shouldPollDocuments([documents[2]!])).toBe(true);
-    expect(shouldPollDocuments([documents[1]!])).toBe(true);
-    expect(
-      shouldPollDocuments([
-        { ...documents[1]!, processingStage: "ready" },
-      ]),
-    ).toBe(true);
-  });
-
   it("never exposes canonical or legacy raw failure messages", () => {
     const legacyOnly: DocumentRow = {
       ...documents[3]!,
@@ -124,17 +100,5 @@ describe("DocumentList", () => {
     expect(documentRequestErrorMessage("upload", 500)).not.toContain(
       RAW_SECRET,
     );
-  });
-
-  it("retains the supported upload formats without a client size limit", () => {
-    expect(validateUploadFile({ name: "manual.PDF", size: 500 * 1024 * 1024 })).toBeNull();
-    expect(validateUploadFile({ name: "script.exe", size: 10 })).toContain(
-      "不支援",
-    );
-    expect(validateUploadFile({ name: "sensor.stp", size: 10 })).toBeNull();
-    expect(validateUploadFile({ name: "inspection.mp4", size: 10 })).toContain(
-      "不支援",
-    );
-    expect(validateUploadFile({ name: "alert.eml", size: 10 })).toBeNull();
   });
 });

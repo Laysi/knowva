@@ -78,6 +78,17 @@
   --color-danger-border: #f7d2d9;
   --color-danger-text: #a32236;
 
+  /* ---- Semantic roles (theme contract) ----
+     @knowva/core checks text and each status colour on the background, and
+     on-brand on brand, for WCAG AA. They name colours already used above. */
+  --theme-text: var(--color-text);
+  --theme-background: var(--color-canvas);
+  --theme-brand: var(--color-accent);
+  --theme-on-brand: #fff;
+  --theme-success: var(--color-success-text);
+  --theme-warning: var(--color-warning-text);
+  --theme-error: var(--color-danger-text);
+
   /* ---- Spacing scale (4 / 8) ---- */
   --space-1: 4px;
   --space-2: 8px;
