@@ -1409,7 +1409,8 @@
   border-color: var(--color-danger-border);
 }
 
-.docs-request-error {
+.docs-request-error,
+.profile-error {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1423,7 +1424,13 @@
   border-radius: var(--radius-md);
 }
 
-.docs-request-error button {
+/* Takes the description's place under the page title. */
+.profile-error {
+  margin: 4px 0 0;
+}
+
+.docs-request-error button,
+.profile-error button {
   flex: none;
   padding: 5px 10px;
   font-size: 13px;

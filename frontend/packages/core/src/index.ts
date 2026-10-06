@@ -26,3 +26,10 @@ export type { StoredConversation } from "./conversationStore";
 export { createConversationListAdapter } from "./conversationAdapter";
 export { useKnowvaRuntime } from "./useKnowvaRuntime";
 export type { ConversationHistory, KnowvaRuntime } from "./useKnowvaRuntime";
+export { isProfile, profileRequestErrorMessage, useProfile } from "./useProfile";
+export type {
+  Profile,
+  ProfilePage,
+  ProfileState,
+  ProfileSuggestion,
+} from "./useProfile";

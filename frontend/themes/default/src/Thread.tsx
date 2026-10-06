@@ -17,7 +17,7 @@ import {
   ArrowRightIcon,
 } from "./Icons";
 import type { ReactNode } from "react";
-import type { ChatSource } from "@knowva/core";
+import type { ChatSource, ProfileSuggestion } from "@knowva/core";
 
 const MarkdownText = () => (
   <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} className="aui-md" />
@@ -54,27 +54,32 @@ export const SourceList = ({ data }: SourceListProps) => {
   );
 };
 
-const SUGGESTIONS: { icon: ReactNode; text: string }[] = [
-  { icon: <CompassIcon />, text: "知識庫裡有哪些主題？" },
-  { icon: <ListIcon />, text: "整理知識庫的重點" },
-  { icon: <UserIcon />, text: "新人該先看哪幾份文件？" },
+/** Suggestions take these icons in turn, in the order the profile lists them. */
+const SUGGESTION_ICONS: readonly ReactNode[] = [
+  <CompassIcon key="compass" />,
+  <ListIcon key="list" />,
+  <UserIcon key="user" />,
 ];
 
-const Welcome = () => (
+type WelcomeProps = { suggestions: readonly ProfileSuggestion[] };
+
+const Welcome = ({ suggestions }: WelcomeProps) => (
   <div className="welcome">
     <span className="welcome-mark">
       <BrandMark />
     </span>
     <h2 className="welcome-title">想知道什麼？</h2>
     <div className="suggestions">
-      {SUGGESTIONS.map((s) => (
+      {suggestions.map((s, index) => (
         <ThreadPrimitive.Suggestion
           key={s.text}
           prompt={s.text}
           send
           className="suggestion"
         >
-          <span className="suggestion-icon">{s.icon}</span>
+          <span className="suggestion-icon">
+            {SUGGESTION_ICONS[index % SUGGESTION_ICONS.length]}
+          </span>
           <span className="suggestion-text">{s.text}</span>
           <span className="suggestion-go">
             <ArrowRightIcon />
@@ -121,11 +126,11 @@ const AssistantMessage = () => (
   </MessagePrimitive.Root>
 );
 
-const Composer = () => (
+const Composer = ({ placeholder }: { placeholder: string }) => (
   <ComposerPrimitive.Root className="composer">
     <ComposerPrimitive.Input
       className="composer-input"
-      placeholder="問問你的文件…"
+      placeholder={placeholder}
       submitMode="enter"
       maxRows={8}
     />
@@ -147,12 +152,19 @@ const Composer = () => (
   </ComposerPrimitive.Root>
 );
 
-export const Thread = () => (
+type ThreadProps = {
+  /** The profile's suggested questions; empty until the profile arrives. */
+  suggestions: readonly ProfileSuggestion[];
+  /** The profile's composer placeholder; empty until the profile arrives. */
+  composerPlaceholder: string;
+};
+
+export const Thread = ({ suggestions, composerPlaceholder }: ThreadProps) => (
   <ThreadPrimitive.Root className="thread">
     <ThreadPrimitive.Viewport className="thread-viewport">
       <div className="thread-col">
         <ThreadPrimitive.Empty>
-          <Welcome />
+          <Welcome suggestions={suggestions} />
         </ThreadPrimitive.Empty>
         <ThreadPrimitive.Messages
           components={{ UserMessage, AssistantMessage }}
@@ -161,7 +173,7 @@ export const Thread = () => (
     </ThreadPrimitive.Viewport>
     <div className="composer-bar">
       <div className="composer-col">
-        <Composer />
+        <Composer placeholder={composerPlaceholder} />
         <p className="composer-hint">
           內容由語言模型生成，可能有誤，以原始文件為準。
         </p>

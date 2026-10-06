@@ -25,6 +25,8 @@ import {
 } from "../conversationStore";
 import type { StoredConversation } from "../conversationStore";
 import { MAX_UPLOAD_BYTES, validateUploadFile } from "../DocumentModel";
+import { profileRequestErrorMessage } from "../useProfile";
+import type { Profile } from "../useProfile";
 import { themeContrasts, WCAG_AA_TEXT_CONTRAST } from "./themeColors";
 
 export type ThemeContractHarness = {
@@ -60,6 +62,25 @@ export type ThemeContractHarness = {
 };
 
 const RAW_SECRET = "provider said: Authorization Bearer sk-theme-contract";
+
+/**
+ * What `GET /api/profile` answers in every contract test. Each value differs
+ * from the default profile, so a theme that still shows built-in copy fails.
+ */
+const CONTRACT_PROFILE: Profile = {
+  id: "contract",
+  theme: "contract",
+  brand: { name: "契約品牌名稱", tagline: "契約品牌標語" },
+  pages: {
+    chat: { title: "契約問答頁標題", description: "契約問答頁說明" },
+    documents: { title: "契約文件頁標題", description: "契約文件頁說明" },
+  },
+  suggestions: [
+    { text: "契約總覽建議問題？", catalog: true },
+    { text: "契約一般建議問題", catalog: false },
+  ],
+  composerPlaceholder: "契約輸入框提示",
+};
 
 const PAGE_SOURCE: ChatSource = {
   sourceId: "S1",
@@ -113,10 +134,18 @@ const hangingSseResponse = (text: string, signal: AbortSignal) =>
 
 type Handler = (init: RequestInit | undefined) => Response | Promise<Response>;
 
+/**
+ * Unlisted routes answer 404. `GET /api/profile` answers the contract profile
+ * unless a test lists it.
+ */
 const stubFetch = (handlers: Record<string, Handler>) => {
+  const routes: Record<string, Handler> = {
+    "GET /api/profile": () => Response.json(CONTRACT_PROFILE),
+    ...handlers,
+  };
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const key = `${init?.method ?? "GET"} ${String(input)}`;
-    const handler = handlers[key];
+    const handler = routes[key];
     if (!handler) return new Response(null, { status: 404 });
     return handler(init);
   });
@@ -430,6 +459,29 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
       expect(pageText()).not.toContain(CHAT_ERROR_MESSAGES.interrupted);
     });
 
+    it("shows the chat page title and the suggested questions from /api/profile", async () => {
+      stubFetch({});
+      render(harness.renderChat());
+
+      await waitFor(() =>
+        expect(pageText()).toContain(CONTRACT_PROFILE.pages.chat.title),
+      );
+      for (const suggestion of CONTRACT_PROFILE.suggestions) {
+        expect(pageText()).toContain(suggestion.text);
+      }
+    });
+
+    it("shows core's safe message and keeps chat usable when /api/profile fails", async () => {
+      stubFetch({
+        "GET /api/profile": () => new Response(RAW_SECRET, { status: 500 }),
+      });
+      render(harness.renderChat());
+
+      await expectShown(profileRequestErrorMessage(500), alert);
+      expect(pageText()).not.toContain(RAW_SECRET);
+      expect(await screen.findByRole("textbox")).toBeDefined();
+    });
+
     const uploadCases = [
       {
         title: "an unsupported extension",
@@ -613,7 +665,9 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
       await waitFor(() =>
         expect(storedConversations().map((stored) => stored.title)).toEqual([title]),
       );
-      expect(sentRequests(fetchMock)).toEqual(["POST /api/chat"]);
+      expect(
+        sentRequests(fetchMock).filter((request) => request !== "GET /api/profile"),
+      ).toEqual(["POST /api/chat"]);
     });
 
     it(`deletes the least recently updated conversation when a ${MAX_STORED_CONVERSATIONS + 1}st one starts`, async () => {

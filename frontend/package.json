@@ -9,7 +9,8 @@
   ],
   "scripts": {
     "dev": "npm run dev --workspace @knowva/theme-default",
-    "build": "npm run build --workspaces",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && npm run build --workspaces",
     "lint": "npm run lint --workspaces",
     "test": "npm run test --workspaces",
     "preview": "npm run preview --workspace @knowva/theme-default"

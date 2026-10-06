@@ -63,9 +63,11 @@ jobs:
             backend:
               - *shared
               - 'backend/**'
+              - 'profiles/**'
             frontend:
               - *shared
               - 'frontend/**'
+              - 'profiles/**'
             native:
               - *shared
               - 'backend/**'

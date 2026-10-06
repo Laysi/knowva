@@ -1444,6 +1444,8 @@ mod tests {
             storage: storage.clone(),
             artifact_config: crate::page_artifacts::ArtifactConfig::from_env()?,
             document_locks: DocumentLocks::default(),
+            // The native-test image holds only backend/, so this cannot read profiles/.
+            profile: crate::profile::test_support::standalone_profile(),
         };
 
         // Only the scan has no text layer; every other fixture page is text-only.
