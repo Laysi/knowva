@@ -114,3 +114,23 @@ export const ArrowRightIcon = ({ className }: IconProps) => (
     <path d="M12.5 5.5 19 12l-6.5 6.5" />
   </svg>
 );
+
+export const PlusIcon = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <path d="M12 5v14M5 12h14" />
+  </svg>
+);
+
+export const HistoryIcon = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <path d="M3.8 12a8.2 8.2 0 1 0 2.4-5.8" />
+    <path d="M3.5 4.5v4h4" />
+    <path d="M12 8v4.3l2.8 1.7" />
+  </svg>
+);
+
+export const ChevronDownIcon = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <path d="m6 9.5 6 6 6-6" />
+  </svg>
+);

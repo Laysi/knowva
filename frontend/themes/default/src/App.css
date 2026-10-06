@@ -807,6 +807,358 @@
 }
 
 /* ============================================================
+   Conversation history
+   A list beside the thread on wide screens; a bar with a
+   fold-down list on narrow ones.
+   ============================================================ */
+.chat {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.chat-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.history-notice {
+  flex: none;
+  padding: 9px var(--space-6);
+  font-size: 13.5px;
+  line-height: 1.5;
+  text-align: center;
+  color: var(--color-warning-text);
+  background: var(--color-warning-bg);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.conversations {
+  position: relative;
+  flex: none;
+  width: 260px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-surface);
+  border-right: 1px solid var(--color-border);
+}
+
+.conversations-bar {
+  flex: none;
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-3) var(--space-2);
+}
+
+.conversation-new {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 14px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-accent-active);
+  background: var(--color-accent-weak);
+  border: 1px solid var(--color-accent-weak-border);
+  border-radius: var(--radius-md);
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.conversation-new svg {
+  font-size: 18px;
+}
+
+.conversation-new:hover {
+  background: var(--color-surface);
+  border-color: var(--color-accent);
+}
+
+.conversations-toggle {
+  display: none;
+}
+
+.conversations-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0 var(--space-3) var(--space-3);
+}
+
+.conversations-heading {
+  padding: var(--space-3) var(--space-2) var(--space-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+}
+
+.conversations-empty {
+  padding: 0 var(--space-2);
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--color-text-muted);
+}
+
+.conversation-list {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.conversation {
+  flex: none;
+  display: flex;
+  align-items: center;
+  border-radius: var(--radius-sm);
+  transition: background 0.15s ease;
+}
+
+.conversation:hover {
+  background: var(--color-surface-hover);
+}
+
+.conversation[data-active] {
+  background: var(--color-accent-weak);
+}
+
+.conversation-open {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 4px 9px 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  font-size: 14.5px;
+  text-align: left;
+  color: var(--color-text-secondary);
+}
+
+.conversation[data-active] .conversation-open {
+  color: var(--color-accent-active);
+  font-weight: 600;
+}
+
+.conversation-title {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conversation-delete {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  margin-right: 2px;
+  font-size: 16px;
+  color: var(--color-text-faint);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  opacity: 0;
+  transition: color 0.15s ease, background 0.15s ease,
+    border-color 0.15s ease, opacity 0.15s ease;
+}
+
+.conversation:hover .conversation-delete,
+.conversation:focus-within .conversation-delete,
+.conversation[data-active] .conversation-delete {
+  opacity: 1;
+}
+
+.conversation-delete:hover {
+  color: var(--color-danger);
+  background: var(--color-danger-bg);
+  border-color: var(--color-danger-border);
+}
+
+.conversations-clear {
+  flex: none;
+  align-self: flex-start;
+  margin-top: var(--space-2);
+  padding: 7px 10px;
+  font-size: 13.5px;
+  color: var(--color-text-muted);
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.conversations-clear:hover {
+  color: var(--color-danger-text);
+  background: var(--color-danger-bg);
+}
+
+.conversations-confirm {
+  flex: none;
+  margin-top: var(--space-2);
+  padding: 12px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--color-danger-text);
+  background: var(--color-danger-bg);
+  border: 1px solid var(--color-danger-border);
+  border-radius: var(--radius-md);
+}
+
+.conversations-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.conversations-confirm-actions button {
+  padding: 6px 12px;
+  font-size: 13.5px;
+  font-weight: 650;
+  border-radius: var(--radius-sm);
+}
+
+.conversations-confirm-cancel {
+  color: var(--color-text-secondary);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+}
+
+.conversations-confirm-clear {
+  color: #fff;
+  background: var(--color-danger-text);
+  border: 1px solid var(--color-danger-text);
+}
+
+/* Without hover, the delete button has to stay visible. */
+@media (hover: none) {
+  .conversation-delete {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 1080px) {
+  .chat {
+    flex-direction: column;
+  }
+  .conversations {
+    z-index: 2;
+    width: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--color-border);
+  }
+  .conversations-bar {
+    padding: var(--space-2) var(--space-5);
+  }
+  .conversations-toggle {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    font-size: 14.5px;
+    font-weight: 600;
+    color: var(--color-text-secondary);
+    background: var(--color-surface);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-md);
+  }
+  .conversations-toggle-icon {
+    flex: none;
+    font-size: 17px;
+    color: var(--color-text-muted);
+  }
+  .conversations-toggle-label {
+    white-space: nowrap;
+  }
+  .conversations-count {
+    padding: 0 7px;
+    font-size: 12px;
+    font-weight: 650;
+    line-height: 20px;
+    color: var(--color-accent-active);
+    background: var(--color-accent-weak);
+    border-radius: var(--radius-full);
+  }
+  .conversations-chevron {
+    flex: none;
+    margin-left: auto;
+    font-size: 16px;
+    color: var(--color-text-muted);
+    transition: rotate 0.15s ease;
+  }
+  .conversations.is-open .conversations-chevron {
+    rotate: 180deg;
+  }
+  .conversation-new {
+    flex: none;
+    padding: 8px 12px;
+    font-size: 14.5px;
+  }
+  .conversations-heading {
+    display: none;
+  }
+  /* Folds down over the thread instead of pushing it away. */
+  .conversations-panel {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    max-height: min(60vh, 440px);
+    padding: var(--space-3) var(--space-5);
+    background: var(--color-surface);
+    border-bottom: 1px solid var(--color-border);
+    box-shadow: var(--shadow-md);
+  }
+  .conversations.is-open .conversations-panel {
+    display: flex;
+  }
+  .history-notice {
+    padding-left: var(--space-5);
+    padding-right: var(--space-5);
+  }
+}
+
+/* Phones: the bar has to fit beside the icon rail. */
+@media (max-width: 720px) {
+  .conversations-bar,
+  .conversations-panel {
+    padding-left: var(--space-3);
+    padding-right: var(--space-3);
+  }
+  .conversations-toggle {
+    padding: 8px 10px;
+  }
+  .conversations-toggle-icon {
+    display: none;
+  }
+  .conversation-new {
+    padding: 8px 11px;
+  }
+  /* Icon only; the label still names the button. */
+  .conversation-new span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+/* ============================================================
    Documents
    ============================================================ */
 .documents {

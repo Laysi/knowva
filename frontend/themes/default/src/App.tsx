@@ -1,8 +1,9 @@
 import { useState, type ReactNode } from "react";
-import { AssistantRuntimeProvider, useLocalRuntime } from "@assistant-ui/react";
-import { BackendAdapter } from "@knowva/core";
+import { AssistantRuntimeProvider } from "@assistant-ui/react";
+import { CONVERSATION_NOT_SAVED_MESSAGE, useKnowvaRuntime } from "@knowva/core";
 import { Thread } from "./Thread";
 import { Documents } from "./Documents";
+import { Conversations } from "./Conversations";
 import { BrandMark, ChatIcon, DocsIcon } from "./Icons";
 import "./App.css";
 
@@ -27,7 +28,7 @@ const VIEW_META: Record<View, { title: string; description: string }> = {
 };
 
 function App() {
-  const runtime = useLocalRuntime(BackendAdapter);
+  const { runtime, history } = useKnowvaRuntime();
   const [view, setView] = useState<View>("chat");
   const meta = VIEW_META[view];
 
@@ -67,7 +68,21 @@ function App() {
             <p className="content-desc">{meta.description}</p>
           </header>
           <main className="content-body">
-            {view === "chat" ? <Thread /> : <Documents />}
+            {view === "chat" ? (
+              <div className="chat">
+                <Conversations history={history} />
+                <div className="chat-main">
+                  {!history.saved && (
+                    <p className="history-notice" role="status">
+                      {CONVERSATION_NOT_SAVED_MESSAGE}
+                    </p>
+                  )}
+                  <Thread />
+                </div>
+              </div>
+            ) : (
+              <Documents />
+            )}
           </main>
         </div>
       </div>

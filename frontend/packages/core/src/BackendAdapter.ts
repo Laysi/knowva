@@ -114,7 +114,8 @@ const isChatSource = (value: unknown): value is ChatSource => {
   );
 };
 
-const sourceData = (value: unknown): ChatSource[] | null => {
+/** The sources of one answer, or null unless every entry is well formed and unique. */
+export const sourceData = (value: unknown): ChatSource[] | null => {
   if (!Array.isArray(value) || !value.every(isChatSource)) return null;
   const sourceIds = new Set(value.map((source) => source.sourceId));
   return sourceIds.size === value.length ? value : null;

@@ -14,6 +14,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MockInstance } from "vitest";
 import { CHAT_ERROR_MESSAGES, chatRequestErrorMessage } from "../BackendAdapter";
 import type { ChatSource } from "../BackendAdapter";
+import {
+  CONVERSATION_INDEX_KEY,
+  CONVERSATION_NOT_SAVED_MESSAGE,
+  CONVERSATION_STORAGE_PREFIX,
+  CONVERSATION_TITLE_LENGTH,
+  conversationMessagesKey,
+  ConversationStore,
+  MAX_STORED_CONVERSATIONS,
+} from "../conversationStore";
+import type { StoredConversation } from "../conversationStore";
 import { MAX_UPLOAD_BYTES, validateUploadFile } from "../DocumentModel";
 import { themeContrasts, WCAG_AA_TEXT_CONTRAST } from "./themeColors";
 
@@ -21,10 +31,15 @@ export type ThemeContractHarness = {
   /** Shown in the test names. */
   name: string;
   /**
-   * The theme's chat surface with its own runtime wiring, usually the whole
-   * app opened on chat. The contract drives it like a person: it types into
+   * The theme's chat surface with its own runtime wiring (`useKnowvaRuntime`),
+   * usually the whole app opened on chat. Rendering it again after `cleanup`
+   * stands for a reload. The contract drives it like a person: it types into
    * the only textbox, presses the button named 送出, and stops with the button
-   * named 停止.
+   * named 停止. For conversation history it presses the button named 新對話,
+   * opens a conversation with the button named by its title, deletes one with
+   * the button whose name holds 刪除 and the title, and clears them all with
+   * 清除全部對話 followed by 確定清除 in the page. It reads storage through
+   * jsdom's localStorage and clears it around every test.
    */
   renderChat: () => ReactElement;
   /**
@@ -199,6 +214,115 @@ const expectShown = async (
   });
 };
 
+const answerEvents = (text: string, sources: readonly ChatSource[]) => [
+  { type: "text-delta", text },
+  { type: "sources", sources },
+  { type: "done" },
+];
+
+/** Answers the n-th chat request with `answers[n]`, cycling, and keeps every body. */
+const stubChat = (answers: readonly (readonly unknown[])[]) => {
+  const bodies: unknown[] = [];
+  const fetchMock = stubFetch({
+    "POST /api/chat": (init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return sseResponse(answers[(bodies.length - 1) % answers.length]!);
+    },
+  });
+  return { fetchMock, bodies };
+};
+
+const storedKeys = (): string[] => {
+  const keys: string[] = [];
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index);
+    if (key?.startsWith(CONVERSATION_STORAGE_PREFIX)) keys.push(key);
+  }
+  return keys.sort();
+};
+
+/** Everything kept, as text, to wait for a write to land. */
+const storedText = () =>
+  storedKeys()
+    .map((key) => localStorage.getItem(key))
+    .join("\n");
+
+/** The stored list, most recently updated first. */
+const storedConversations = (): StoredConversation[] => {
+  const raw = localStorage.getItem(CONVERSATION_INDEX_KEY);
+  return raw
+    ? (JSON.parse(raw) as { conversations: StoredConversation[] }).conversations
+    : [];
+};
+
+const conversationButtons = (title: string) =>
+  screen.queryAllByRole("button", {
+    name: (name) => name.includes(title) && !name.includes("刪除"),
+  });
+
+const deleteButton = (title: string) =>
+  screen.getByRole("button", {
+    name: (name) => name.includes("刪除") && name.includes(title),
+  });
+
+/** Makes every use of localStorage throw, as a browser blocking site data does. */
+const blockStorage = () => {
+  const own = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    get() {
+      throw new DOMException("The operation is insecure.", "SecurityError");
+    },
+  });
+  return () => {
+    if (own) Object.defineProperty(globalThis, "localStorage", own);
+    else delete (globalThis as { localStorage?: Storage }).localStorage;
+  };
+};
+
+/**
+ * `count` answered conversations, a minute apart from 2026-01-01 on, so the
+ * first is the least recently updated.
+ */
+const seedConversations = (count: number) => {
+  let clock = Date.UTC(2026, 0, 1);
+  const store = new ConversationStore(localStorage, () => clock);
+  return Array.from({ length: count }, (_, index) => {
+    clock += 60_000;
+    const id = store.newId();
+    const title = `舊對話 ${String(index + 1).padStart(2, "0")}`;
+    store.append(id, {
+      parentId: null,
+      message: {
+        id: `question-${index}`,
+        role: "user",
+        createdAt: new Date(clock),
+        content: [{ type: "text", text: title }],
+        attachments: [],
+        metadata: { custom: {} },
+      },
+    });
+    store.append(id, {
+      parentId: `question-${index}`,
+      message: {
+        id: `answer-${index}`,
+        role: "assistant",
+        createdAt: new Date(clock),
+        content: [{ type: "text", text: `舊回答 ${index + 1}` }],
+        status: { type: "complete", reason: "stop" },
+        metadata: {
+          unstable_state: null,
+          unstable_annotations: [],
+          unstable_data: [],
+          steps: [],
+          custom: {},
+        },
+      },
+    });
+    return { id, title };
+  });
+};
+
 /**
  * The product promises every theme keeps, run against the theme's own
  * components. Call it once from a test file in each theme that sets
@@ -207,7 +331,9 @@ const expectShown = async (
 export function describeThemeContract(harness: ThemeContractHarness): void {
   describe(`theme contract: ${harness.name}`, () => {
     let alert: MockInstance<typeof window.alert>;
+    let confirm: MockInstance<typeof window.confirm>;
     let removeLayoutStubs: () => void = () => undefined;
+    let unblockStorage: () => void = () => undefined;
 
     beforeEach(() => {
       if (typeof document === "undefined") {
@@ -215,16 +341,21 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
           "the theme contract needs a DOM: add `// @vitest-environment jsdom` to the test file",
         );
       }
+      // Conversations from one test must not show up in the next.
+      localStorage.clear();
       removeLayoutStubs = installLayoutStubs();
       alert = vi.spyOn(window, "alert").mockImplementation(() => undefined);
-      vi.spyOn(window, "confirm").mockImplementation(() => true);
+      confirm = vi.spyOn(window, "confirm").mockImplementation(() => true);
     });
 
     afterEach(() => {
       cleanup();
       removeLayoutStubs();
+      unblockStorage();
+      unblockStorage = () => undefined;
       vi.restoreAllMocks();
       vi.unstubAllGlobals();
+      localStorage.clear();
     });
 
     it("shows every source's filename, and the page of a page source, once the answer completes", async () => {
@@ -338,6 +469,250 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
         ).toEqual([]);
       });
     }
+
+    const FIRST_QUESTION = "馬達多久保養一次？";
+    const FIRST_ANSWER = "馬達每三個月保養一次。";
+    const FOLLOW_UP = "交接時要注意哪些事項？";
+    const FOLLOW_UP_ANSWER = "請依照交接筆記逐項確認。";
+
+    it("keeps both questions, answers and their sources after a reload", async () => {
+      stubChat([
+        answerEvents(FIRST_ANSWER, [PAGE_SOURCE]),
+        answerEvents(FOLLOW_UP_ANSWER, [TEXT_SOURCE]),
+      ]);
+      render(harness.renderChat());
+
+      await ask(FIRST_QUESTION);
+      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
+      await ask(FOLLOW_UP);
+      await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
+      await waitFor(() => expect(storedText()).toContain(FOLLOW_UP_ANSWER));
+
+      cleanup();
+      render(harness.renderChat());
+
+      await waitFor(() => {
+        for (const text of [
+          FIRST_ANSWER,
+          FOLLOW_UP_ANSWER,
+          PAGE_SOURCE.filename,
+          TEXT_SOURCE.filename,
+        ]) {
+          expect(pageText()).toContain(text);
+        }
+      });
+      const page = sourceEntry(PAGE_SOURCE.filename, [TEXT_SOURCE.filename]);
+      expect(page, "page source entry").toBeDefined();
+      expect(page!.textContent).toMatch(/(?<!\d)37(?!\d)/);
+      expect(sourceEntry(TEXT_SOURCE.filename, [PAGE_SOURCE.filename])).toBeDefined();
+    });
+
+    it("sends the same follow-up request after a reload as without one", async () => {
+      const { bodies } = stubChat([
+        answerEvents(FIRST_ANSWER, [PAGE_SOURCE, TEXT_SOURCE]),
+        answerEvents(FOLLOW_UP_ANSWER, [TEXT_SOURCE]),
+      ]);
+
+      render(harness.renderChat());
+      await ask(FIRST_QUESTION);
+      await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
+      await ask(FOLLOW_UP);
+      await waitFor(() => expect(bodies).toHaveLength(2));
+      await waitFor(() => expect(pageText()).toContain(FOLLOW_UP_ANSWER));
+      cleanup();
+      localStorage.clear();
+
+      render(harness.renderChat());
+      await ask(FIRST_QUESTION);
+      await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
+      await waitFor(() => expect(storedText()).toContain(FIRST_ANSWER));
+      cleanup();
+      render(harness.renderChat());
+      await waitFor(() => expect(pageText()).toContain(FIRST_ANSWER));
+      await ask(FOLLOW_UP);
+      await waitFor(() => expect(bodies).toHaveLength(4));
+
+      expect(bodies[3]).toEqual(bodies[1]);
+      expect(bodies[3]).toMatchObject({
+        previousSources: [PAGE_SOURCE, TEXT_SOURCE],
+      });
+    });
+
+    it("starts, switches, deletes and clears conversations along with their storage", async () => {
+      stubChat([
+        answerEvents(FIRST_ANSWER, [PAGE_SOURCE]),
+        answerEvents(FOLLOW_UP_ANSWER, [TEXT_SOURCE]),
+      ]);
+      render(harness.renderChat());
+
+      await ask(FIRST_QUESTION);
+      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
+      fireEvent.click(await screen.findByRole("button", { name: "新對話" }));
+      await waitFor(() => expect(pageText()).not.toContain(FIRST_ANSWER));
+      await ask(FOLLOW_UP);
+      await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
+      await waitFor(() =>
+        expect(storedConversations().map(({ title }) => title)).toEqual([
+          FOLLOW_UP,
+          FIRST_QUESTION,
+        ]),
+      );
+      const [second, first] = storedConversations();
+      await waitFor(() => expect(storedText()).toContain(FOLLOW_UP_ANSWER));
+      expect(storedKeys()).toEqual(
+        [
+          CONVERSATION_INDEX_KEY,
+          conversationMessagesKey(first!.id),
+          conversationMessagesKey(second!.id),
+        ].sort(),
+      );
+
+      await waitFor(() => expect(conversationButtons(FIRST_QUESTION)).toHaveLength(1));
+      fireEvent.click(conversationButtons(FIRST_QUESTION)[0]!);
+      await waitFor(() => {
+        expect(pageText()).toContain(FIRST_ANSWER);
+        expect(pageText()).not.toContain(FOLLOW_UP_ANSWER);
+      });
+
+      fireEvent.click(deleteButton(FOLLOW_UP));
+      await waitFor(() =>
+        expect(localStorage.getItem(conversationMessagesKey(second!.id))).toBeNull(),
+      );
+      await waitFor(() => expect(conversationButtons(FOLLOW_UP)).toHaveLength(0));
+      expect(storedConversations().map(({ id }) => id)).toEqual([first!.id]);
+      expect(localStorage.getItem(conversationMessagesKey(first!.id))).not.toBeNull();
+      expect(pageText()).toContain(FIRST_ANSWER);
+
+      fireEvent.click(screen.getByRole("button", { name: /清除全部對話/ }));
+      expect(storedKeys()).toHaveLength(2);
+      fireEvent.click(await screen.findByRole("button", { name: /確定清除/ }));
+      await waitFor(() => expect(storedKeys()).toEqual([]));
+      await waitFor(() => {
+        expect(conversationButtons(FIRST_QUESTION)).toHaveLength(0);
+        expect(pageText()).not.toContain(FIRST_ANSWER);
+      });
+      expect(confirm).not.toHaveBeenCalled();
+    });
+
+    it("titles a conversation with the first 30 characters of its first question, without a request", async () => {
+      // Two characters outside the BMP: 30 characters are 32 UTF-16 units.
+      const question =
+        "𠀋𡈽三號廠區冷卻水塔今年第三季有哪些異常紀錄、各自如何處理、負責人是誰？";
+      const characters = Array.from(question);
+      expect(characters.length).toBeGreaterThan(CONVERSATION_TITLE_LENGTH);
+      const title = characters.slice(0, CONVERSATION_TITLE_LENGTH).join("");
+      const tooLong = characters.slice(0, CONVERSATION_TITLE_LENGTH + 1).join("");
+      const { fetchMock } = stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
+      render(harness.renderChat());
+
+      await ask(question);
+      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
+      await waitFor(() => expect(conversationButtons(title)).toHaveLength(1));
+
+      expect(conversationButtons(tooLong)).toHaveLength(0);
+      await waitFor(() =>
+        expect(storedConversations().map((stored) => stored.title)).toEqual([title]),
+      );
+      expect(sentRequests(fetchMock)).toEqual(["POST /api/chat"]);
+    });
+
+    it(`deletes the least recently updated conversation when a ${MAX_STORED_CONVERSATIONS + 1}st one starts`, async () => {
+      const seeded = seedConversations(MAX_STORED_CONVERSATIONS);
+      const oldest = seeded[0]!;
+      const next = seeded[1]!;
+      stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
+      render(harness.renderChat());
+      await waitFor(() => expect(conversationButtons(oldest.title)).toHaveLength(1));
+
+      fireEvent.click(await screen.findByRole("button", { name: "新對話" }));
+      await ask(FIRST_QUESTION);
+      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
+
+      await waitFor(() => expect(conversationButtons(oldest.title)).toHaveLength(0));
+      expect(localStorage.getItem(conversationMessagesKey(oldest.id))).toBeNull();
+      expect(localStorage.getItem(conversationMessagesKey(next.id))).not.toBeNull();
+      expect(conversationButtons(next.title)).toHaveLength(1);
+      await waitFor(() => {
+        const stored = storedConversations();
+        expect(stored).toHaveLength(MAX_STORED_CONVERSATIONS);
+        expect(stored[0]!.title).toBe(FIRST_QUESTION);
+        expect(stored.map(({ id }) => id)).not.toContain(oldest.id);
+      });
+    });
+
+    it("ignores and removes corrupt stored history, and still answers", async () => {
+      localStorage.setItem(CONVERSATION_INDEX_KEY, '{"version":1,"conversations":[');
+      localStorage.setItem(conversationMessagesKey("corrupt"), "{not json");
+      stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
+      render(harness.renderChat());
+
+      await ask(FIRST_QUESTION);
+      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
+
+      await waitFor(() => expect(storedConversations()).toHaveLength(1));
+      expect(localStorage.getItem(conversationMessagesKey("corrupt"))).toBeNull();
+      expect(pageText()).not.toContain(CONVERSATION_NOT_SAVED_MESSAGE);
+    });
+
+    it("ignores and removes history of an unknown version, and still answers", async () => {
+      localStorage.setItem(
+        CONVERSATION_INDEX_KEY,
+        JSON.stringify({
+          version: 2,
+          conversations: [
+            { id: "future", title: "新版本留下的對話", createdAt: 1, updatedAt: 2 },
+          ],
+        }),
+      );
+      localStorage.setItem(
+        conversationMessagesKey("future"),
+        JSON.stringify({ version: 2, headId: "m1", messages: [] }),
+      );
+      stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
+      render(harness.renderChat());
+
+      await ask(FIRST_QUESTION);
+      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
+
+      expect(pageText()).not.toContain("新版本留下的對話");
+      expect(localStorage.getItem(conversationMessagesKey("future"))).toBeNull();
+      await waitFor(() =>
+        expect(storedConversations().map(({ title }) => title)).toEqual([
+          FIRST_QUESTION,
+        ]),
+      );
+    });
+
+    it("answers without saving, and says so, when the browser blocks storage", async () => {
+      unblockStorage = blockStorage();
+      stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
+      render(harness.renderChat());
+
+      await waitFor(() =>
+        expect(pageText()).toContain(CONVERSATION_NOT_SAVED_MESSAGE),
+      );
+      await ask(FIRST_QUESTION);
+      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
+      expect(pageText()).toContain(FIRST_ANSWER);
+      expect(pageText()).toContain(CONVERSATION_NOT_SAVED_MESSAGE);
+    });
+
+    it("answers without saving, and says so, when storage is full", async () => {
+      vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+      });
+      stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
+      render(harness.renderChat());
+
+      expect(pageText()).not.toContain(CONVERSATION_NOT_SAVED_MESSAGE);
+      await ask(FIRST_QUESTION);
+      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
+      await waitFor(() =>
+        expect(pageText()).toContain(CONVERSATION_NOT_SAVED_MESSAGE),
+      );
+      expect(pageText()).toContain(FIRST_ANSWER);
+      expect(storedKeys()).toEqual([]);
+    });
 
     it("declares --theme-* colours whose pairs meet WCAG AA", () => {
       const css = harness.stylesheets
