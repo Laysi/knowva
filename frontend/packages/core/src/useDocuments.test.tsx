@@ -2,6 +2,7 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DOCUMENT_POLL_INTERVAL_MS, useDocuments } from "./useDocuments";
+import { MAX_UPLOAD_BYTES } from "./DocumentModel";
 import type { DocumentRow } from "./DocumentModel";
 
 const RAW_SECRET = "provider response: Authorization Bearer sk-secret-321";
@@ -102,18 +103,22 @@ describe("useDocuments", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("rejects an unsupported file without sending it", async () => {
+  it("rejects an unsupported or oversized file without sending it", async () => {
     const fetchMock = stubBackend({ "GET /api/documents": [() => json([])] });
     const { result } = renderHook(() => useDocuments());
     await waitFor(() => expect(result.current.loaded).toBe(true));
+    const oversized = new File(["%PDF"], "scan.pdf");
+    Object.defineProperty(oversized, "size", { value: MAX_UPLOAD_BYTES + 1 });
 
-    const outcome = await act(() =>
-      result.current.upload(new File(["MZ"], "setup.exe")),
-    );
-
-    expect(outcome).toEqual({
+    expect(
+      await act(() => result.current.upload(new File(["MZ"], "setup.exe"))),
+    ).toEqual({
       status: "rejected",
       message: "不支援這種檔案格式，請選擇 PDF、Office、圖片、STP 或 Email 檔案。",
+    });
+    expect(await act(() => result.current.upload(oversized))).toEqual({
+      status: "rejected",
+      message: "檔案超過 50 MiB 上限，請壓縮或拆分後再上傳。",
     });
     expect(requests(fetchMock)).toEqual(["GET /api/documents"]);
     expect(result.current.uploading).toBe(false);

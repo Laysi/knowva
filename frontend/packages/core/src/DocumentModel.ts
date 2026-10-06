@@ -20,6 +20,11 @@ export type DocumentRow = {
 
 type DocumentAction = "list" | "upload" | "delete";
 
+/** The backend's per-file limit (`ingest::MAX_UPLOAD_BYTES`). */
+export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
+const FILE_TOO_LARGE_MESSAGE = "檔案超過 50 MiB 上限，請壓縮或拆分後再上傳。";
+
 export const SUPPORTED_UPLOAD_EXTENSIONS = [
   ".pdf",
   ".png",
@@ -63,7 +68,7 @@ export function safeDocumentFailureMessage(
     case "unsupported_format":
       return "不支援這種檔案格式，請改用上方列出的格式。";
     case "file_too_large":
-      return "檔案超過 50 MiB 上限，請壓縮或拆分後再上傳。";
+      return FILE_TOO_LARGE_MESSAGE;
     case "encrypted_document":
     case "password_protected":
       return "文件有密碼保護，請解除後再上傳。";
@@ -127,6 +132,8 @@ export function validateUploadFile(
   if (!hasSupportedExtension) {
     return "不支援這種檔案格式，請選擇 PDF、Office、圖片、STP 或 Email 檔案。";
   }
+  // The server would refuse it anyway; checking first saves sending it.
+  if (file.size > MAX_UPLOAD_BYTES) return FILE_TOO_LARGE_MESSAGE;
   return null;
 }
 
