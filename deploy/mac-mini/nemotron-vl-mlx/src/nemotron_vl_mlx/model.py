@@ -2,7 +2,8 @@
 
 A SigLIP 2 vision encoder, a pixel-shuffle MLP projector and a bidirectional
 Llama 3.2 1B, loaded straight from the original ``model.safetensors``. The
-reranker mean-pools the last hidden state and scores it with one linear layer.
+embedding model mean-pools the last hidden state; the reranker scores that
+mean with one linear layer.
 """
 
 from __future__ import annotations
@@ -334,6 +335,25 @@ class LlamaNemotronVLModel(nn.Module):
         image_tokens = None if pixel_values is None else self.image_tokens(pixel_values)
         return self.language_model(self.embed(input_ids, image_tokens), attention_mask)
 
+    def pooled_unpadded(self, sequences, pixel_values=None):
+        """Mean of the last hidden state per sequence, in float32, for
+        sequences of different lengths, each run on its own so no token is
+        padding. The image tiles of all sequences are encoded together, in
+        sequence order."""
+        image_tokens = None if pixel_values is None else self.image_tokens(pixel_values)
+        pooled = []
+        offset = 0
+        for ids in sequences:
+            count = int(np.count_nonzero(np.asarray(ids) == IMG_CONTEXT_ID))
+            ids = mx.array(ids)[None]
+            tokens = None
+            if count:
+                tokens = image_tokens[offset:offset + count]
+                offset += count
+            hidden = self.language_model(self.embed(ids, tokens), None)
+            pooled.append(hidden.astype(mx.float32).mean(axis=1))
+        return mx.concatenate(pooled, axis=0)
+
 
 def mean_pool(hidden, attention_mask):
     """Average over non-padding tokens, accumulated in float32."""
@@ -359,23 +379,9 @@ class LlamaNemotronVLReranker(nn.Module):
         return self.head(mean_pool(hidden, attention_mask))
 
     def score_unpadded(self, sequences, pixel_values=None):
-        """Relevance logits for sequences of different lengths, each run on its
-        own so no token is padding. The image tiles of all sequences are
-        encoded together, in sequence order."""
-        model = self.model
-        image_tokens = None if pixel_values is None else model.image_tokens(pixel_values)
-        pooled = []
-        offset = 0
-        for ids in sequences:
-            count = int(np.count_nonzero(np.asarray(ids) == IMG_CONTEXT_ID))
-            ids = mx.array(ids)[None]
-            tokens = None
-            if count:
-                tokens = image_tokens[offset:offset + count]
-                offset += count
-            hidden = model.language_model(model.embed(ids, tokens), None)
-            pooled.append(hidden.astype(mx.float32).mean(axis=1))
-        return self.head(mx.concatenate(pooled, axis=0))
+        """Relevance logits for sequences of different lengths; see
+        ``LlamaNemotronVLModel.pooled_unpadded``."""
+        return self.head(self.model.pooled_unpadded(sequences, pixel_values))
 
 
 def sanitize(weights: dict[str, mx.array]) -> dict[str, mx.array]:
@@ -393,9 +399,7 @@ def sanitize(weights: dict[str, mx.array]) -> dict[str, mx.array]:
     return out
 
 
-def load_reranker(model_dir: str | Path, dtype=mx.float16) -> LlamaNemotronVLReranker:
-    model_dir = Path(model_dir)
-    model = LlamaNemotronVLReranker(ModelConfig.from_dir(model_dir))
+def _load(module, model_dir: Path, dtype) -> None:
     weights = sanitize(mx.load(str(model_dir / "model.safetensors")))
     # Converted and evaluated one tensor at a time, dropping each checkpoint
     # tensor as soon as it is copied, so loading never holds the model twice.
@@ -404,6 +408,21 @@ def load_reranker(model_dir: str | Path, dtype=mx.float16) -> LlamaNemotronVLRer
         value = weights.pop(name).astype(mx.float32 if name == "score.weight" else dtype)
         mx.eval(value)
         converted.append((name, value))
-    model.load_weights(converted, strict=True)
-    model.eval()
+    module.load_weights(converted, strict=True)
+    module.eval()
+
+
+def load_reranker(model_dir: str | Path, dtype=mx.float16) -> LlamaNemotronVLReranker:
+    """llama-nemotron-rerank-vl-1b-v2."""
+    model_dir = Path(model_dir)
+    model = LlamaNemotronVLReranker(ModelConfig.from_dir(model_dir))
+    _load(model, model_dir, dtype)
+    return model
+
+
+def load_embedder(model_dir: str | Path, dtype=mx.float16) -> LlamaNemotronVLModel:
+    """llama-nemotron-embed-vl-1b-v2, whose checkpoint is the bare model."""
+    model_dir = Path(model_dir)
+    model = LlamaNemotronVLModel(ModelConfig.from_dir(model_dir))
+    _load(model, model_dir, dtype)
     return model

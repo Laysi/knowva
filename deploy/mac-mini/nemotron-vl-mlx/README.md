@@ -1,18 +1,24 @@
 # nemotron-vl-mlx
 
-MLX port of NVIDIA's `llama-nemotron-rerank-vl-1b-v2`, loaded straight from the
-original `model.safetensors`. The Mac mini inference service runs rerank on it
-with `KM_RERANK_BACKEND=mlx` (`../inference/server.py`), where it is a path
-dependency; it lives here until it is published on its own (#47).
+MLX port of NVIDIA's `llama-nemotron-rerank-vl-1b-v2` and
+`llama-nemotron-embed-vl-1b-v2`, loaded straight from the original
+`model.safetensors`. The Mac mini inference service runs them on it with
+`KM_RERANK_BACKEND=mlx` and `KM_EMBED_BACKEND=mlx` (`../inference/server.py`),
+where it is a path dependency; it lives here until it is published on its
+own (#47).
 
-- `processing.py` reproduces the model's transformers processor without PyTorch:
-  identical token ids, attention mask and pixel values
-  (`tools/check_processing.py`).
+- `processing.py` reproduces the models' transformers processors without
+  PyTorch: identical token ids, attention mask and pixel values
+  (`tools/check_processing.py`, `tools/check_embed_processing.py`).
 - `model.py` matches PyTorch float32 to 1e-5 in logits with
   `MLX_ENABLE_TF32=0`; MLX uses TF32 for float32 matmuls by default on M5/M6.
 - `Reranker` runs each passage at its own length rather than as a padded
   batch. MLX's buffer cache has no practical limit by default; the service
   caps it (`KM_MLX_CACHE_MB`).
+- `Embedder` gives what sentence-transformers gives for the embed model:
+  `query: ` and `passage: ` prompts, 4096-token truncation, the unnormalised
+  mean of the last hidden state; `tools/embed_vectors.py` and
+  `tools/compare_embed.py` compare it with the original.
 - Measurements: `docs/measurements/README.md` §8.14. `tools/` compares the
   port with the PyTorch original (`reference.py`, `compare.py`) and replays
   Knowva-shaped candidate sets (`tools/knowva/`).

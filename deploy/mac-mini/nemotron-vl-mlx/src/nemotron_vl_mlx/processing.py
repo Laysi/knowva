@@ -151,3 +151,45 @@ class RerankProcessor:
         if pixel_values:
             pixels = round_to_bfloat16(np.stack(pixel_values))
         return Batch(input_ids=input_ids, attention_mask=attention_mask, pixel_values=pixels)
+
+
+# What sentence-transformers sends llama-nemotron-embed-vl-1b-v2: its prompts
+# for text, the processor's own "passage: " prefix for images, and the
+# processor's passage budget (p_max_length) for every input, queries included.
+QUERY_PROMPT = "query: "
+PASSAGE_PROMPT = "passage: "
+EMBED_MAX_LENGTH = 4096
+
+
+class EmbedProcessor:
+    def __init__(self, model_dir: str | Path, max_input_tiles: int = 6, use_thumbnail: bool = True,
+                 max_length: int = EMBED_MAX_LENGTH):
+        self.tokenizer = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
+        self.tokenizer.enable_truncation(max_length, strategy="longest_first", direction="right")
+        self.tokenizer.no_padding()
+        self.max_input_tiles = max_input_tiles
+        self.use_thumbnail = use_thumbnail
+
+    def prompt(self, item: Passage, input_type: str) -> tuple[str, list[Image.Image]]:
+        if item.image is None:
+            return (QUERY_PROMPT if input_type == "query" else PASSAGE_PROMPT) + item.text, []
+        if input_type == "query":
+            raise ValueError("queries are text only")
+        tiles = dynamic_tiles(item.image, self.max_input_tiles, use_thumbnail=self.use_thumbnail)
+        content = PASSAGE_PROMPT + "<image> " + item.text
+        image_tokens = IMG_START + IMG_CONTEXT * (TOKENS_PER_TILE * len(tiles)) + IMG_END
+        return content.replace("<image>", image_tokens, 1), tiles
+
+    def __call__(self, items: Sequence[Passage], input_type: str) -> tuple[list[np.ndarray], np.ndarray | None]:
+        """Token ids per input (unpadded) and the image tiles of all inputs in
+        input order, as (tiles, 512, 512, 3) bfloat16-representable float32."""
+        prompts = []
+        pixel_values = []
+        for item in items:
+            prompt, tiles = self.prompt(item, input_type)
+            prompts.append(prompt)
+            pixel_values.extend(tile_pixels(tile) for tile in tiles)
+        encodings = self.tokenizer.encode_batch(prompts, add_special_tokens=True)
+        sequences = [np.array(encoding.ids, dtype=np.int64) for encoding in encodings]
+        pixels = round_to_bfloat16(np.stack(pixel_values)) if pixel_values else None
+        return sequences, pixels
