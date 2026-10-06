@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import type { Plugin } from "vite";
 
 // Knowva ships as an offline appliance: a theme must bundle its fonts, images
@@ -45,29 +47,34 @@ export function externalReferences(fileName: string, source: string): string[] {
   return [];
 }
 
-/** Fails a theme's build if its HTML, SVG or CSS would load anything off the box. */
+const SCANNED = /\.(?:html?|svg|css)$/i;
+
+/**
+ * Fails a theme's build if its HTML, SVG or CSS would load anything off the
+ * box. It reads the written output directory rather than the bundle, because
+ * Vite copies `public/` there without passing it through the bundle.
+ */
 export function offlineBundle(): Plugin {
   return {
     name: "knowva:offline-bundle",
     apply: "build",
     enforce: "post",
-    generateBundle: {
+    writeBundle: {
       order: "post",
-      handler(_options, bundle) {
-        const problems = Object.values(bundle).flatMap((output) => {
-          const source =
-            output.type === "asset"
-              ? typeof output.source === "string"
-                ? output.source
-                : new TextDecoder().decode(output.source)
-              : "";
-          return externalReferences(output.fileName, source).map(
-            (reference) => `${output.fileName}: ${reference}`,
-          );
-        });
+      handler({ dir }) {
+        if (!dir) this.error("offlineBundle needs an output directory");
+        const problems = readdirSync(dir, { recursive: true, withFileTypes: true })
+          .filter((entry) => entry.isFile() && SCANNED.test(entry.name))
+          .flatMap((entry) => {
+            const path = join(entry.parentPath, entry.name);
+            const name = relative(dir, path);
+            return externalReferences(name, readFileSync(path, "utf8")).map(
+              (reference) => `${name}: ${reference}`,
+            );
+          });
         if (problems.length > 0) {
           this.error(
-            "the bundle references external URLs; bundle these with the theme instead:\n" +
+            "the build references external URLs; bundle these with the theme instead:\n" +
               problems.join("\n"),
           );
         }
