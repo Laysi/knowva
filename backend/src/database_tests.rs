@@ -109,6 +109,7 @@ fn test_state(pool: &PgPool, models: CloudModelClient, storage: Storage) -> Arc<
         storage,
         artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
         document_locks: crate::ingest::DocumentLocks::default(),
+        profile: crate::profile::Profile::for_test(),
     })
 }
 
@@ -2414,11 +2415,18 @@ async fn upload_answer_delete_flow(pool: &PgPool, storage: Storage) -> anyhow::R
                 .is_some_and(|image| image.starts_with("data:image/png;base64,"))
         );
         let chats = mock.summary_requests.lock().expect("chat request lock");
-        let answer = chats
+        let answer_request = chats
             .iter()
             .find(|request| request["stream"] == true)
-            .expect("streamed answer request")
-            .to_string();
+            .expect("streamed answer request");
+        // The default profile has no industry section, so /api/chat sends the core rules
+        // exactly as written.
+        assert_eq!(answer_request["messages"][0]["role"], "system");
+        assert_eq!(
+            answer_request["messages"][0]["content"],
+            crate::rag_context::RAG_SYSTEM_PROMPT
+        );
+        let answer = answer_request.to_string();
         assert!(answer.contains("data:image/jpeg;base64,"));
         assert!(
             !answer.contains(&image_path),

@@ -19,7 +19,8 @@ use crate::cloud_models::{
 };
 use crate::ingest::{DocumentLocks, EvaluationIngestResult, ingest_evaluation_bytes};
 use crate::page_artifacts::ArtifactConfig;
-use crate::rag_context::{MAX_RAG_SOURCES, RAG_SYSTEM_PROMPT, SourceRef, build_rag_context};
+use crate::profile::{Profile, PromptKind};
+use crate::rag_context::{MAX_RAG_SOURCES, SourceRef, build_rag_context};
 use crate::search::{
     DEFAULT_BM25_TOP_K, DEFAULT_DENSE_TOP_K, ObservedAbRetrieval, ObservedFailureStage,
     ObservedModeRetrieval, ObservedRetrievalFailure, ObservedRetrievalStage, RRF_K,
@@ -47,6 +48,9 @@ const DEFAULT_OUTPUT: &str = "eval/results";
 const DEFAULT_SEED: u64 = 42;
 const DEFAULT_CONCURRENCY: usize = 1;
 const PROMPT_VERSION: &str = "gemma4-rag-v1";
+/// Every evaluation answer is generated under the general answer rules of the selected
+/// profile, composed by the same function `/api/chat` uses; the manifest hashes this prompt.
+const EVALUATION_PROMPT_KIND: PromptKind = PromptKind::Answer;
 const MAX_ANSWER_CHARS: usize = 4_000;
 const EVALUATION_DATABASE_PREFIX: &str = "knowva_eval_";
 const EVALUATION_DATABASE_MARKER: &str = "knowva-evaluation-only:v1";
@@ -236,6 +240,8 @@ struct DryRunSummary {
     queries: Vec<String>,
     seed: u64,
     concurrency: usize,
+    profile_id: String,
+    system_prompt_sha256: String,
 }
 
 struct Selection<'a> {
@@ -299,6 +305,9 @@ fn select_dataset<'a>(
 
 pub async fn run_cli(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
     let options = CliOptions::parse(arguments)?;
+    // Both modes read the same environment, so a dry-run validates and reports the profile
+    // a cloud run would use.
+    dotenvy::dotenv().ok();
     execute(options).await
 }
 
@@ -308,26 +317,8 @@ async fn execute(options: CliOptions) -> anyhow::Result<()> {
     match options.mode {
         RunMode::DryRun => {
             let selection = select_dataset(&snapshot.dataset, &options)?;
-            let summary = DryRunSummary {
-                status: "valid",
-                manifest: display_path(&options.manifest),
-                output: display_path(&options.output),
-                dataset_version: snapshot.dataset.version.clone(),
-                document_count: selection.documents.len(),
-                query_count: selection.queries.len(),
-                documents: selection
-                    .documents
-                    .iter()
-                    .map(|document| document.document_key.clone())
-                    .collect(),
-                queries: selection
-                    .queries
-                    .iter()
-                    .map(|query| query.query_id.clone())
-                    .collect(),
-                seed: options.seed,
-                concurrency: options.concurrency,
-            };
+            let profile = Profile::from_env()?;
+            let summary = dry_run_summary(&options, &snapshot, &selection, &profile);
             println!("{}", serde_json::to_string_pretty(&summary)?);
             Ok(())
         }
@@ -336,6 +327,36 @@ async fn execute(options: CliOptions) -> anyhow::Result<()> {
             select_dataset(&snapshot.dataset, &options)?;
             run_cloud(options, snapshot).await
         }
+    }
+}
+
+fn dry_run_summary(
+    options: &CliOptions,
+    snapshot: &EvaluationDatasetSnapshot,
+    selection: &Selection<'_>,
+    profile: &Profile,
+) -> DryRunSummary {
+    DryRunSummary {
+        status: "valid",
+        manifest: display_path(&options.manifest),
+        output: display_path(&options.output),
+        dataset_version: snapshot.dataset.version.clone(),
+        document_count: selection.documents.len(),
+        query_count: selection.queries.len(),
+        documents: selection
+            .documents
+            .iter()
+            .map(|document| document.document_key.clone())
+            .collect(),
+        queries: selection
+            .queries
+            .iter()
+            .map(|query| query.query_id.clone())
+            .collect(),
+        seed: options.seed,
+        concurrency: options.concurrency,
+        profile_id: profile.id().to_owned(),
+        system_prompt_sha256: profile.system_prompt_sha256(EVALUATION_PROMPT_KIND),
     }
 }
 
@@ -355,7 +376,6 @@ fn display_path(path: &Path) -> String {
 async fn run_cloud(options: CliOptions, snapshot: EvaluationDatasetSnapshot) -> anyhow::Result<()> {
     #[cfg(test)]
     CLOUD_RUN_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
-    dotenvy::dotenv().ok();
     run_cloud_with_lookup(options, snapshot, |name| std::env::var(name).ok()).await
 }
 
@@ -1128,7 +1148,7 @@ async fn answer_mode(
         Ok(context) => context,
         Err(error) => return failed_answer("rag_context_failed", error.client_message(), false),
     };
-    let system_prompt = RAG_SYSTEM_PROMPT;
+    let system_prompt = state.profile.system_prompt(EVALUATION_PROMPT_KIND);
     let context = match state.models.fit_rag_context_to_request(
         system_prompt,
         context,
@@ -1542,6 +1562,9 @@ async fn bootstrap_and_ingest(
     let rerank_top_n = models.rerank_top_n();
     let top_n = manifest_top_n(rerank_candidate_top_k, rerank_top_n);
     let artifact_config = ArtifactConfig::from_env()?;
+    let profile = Arc::new(Profile::from_lookup(|name| get_env(name))?);
+    let profile_id = profile.id().to_owned();
+    let system_prompt_sha256 = profile.system_prompt_sha256(EVALUATION_PROMPT_KIND);
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&preflight.database_url)
@@ -1583,6 +1606,7 @@ async fn bootstrap_and_ingest(
         storage,
         artifact_config,
         document_locks: DocumentLocks::default(),
+        profile,
     });
     let selection = select_dataset(dataset, options)?;
     let ingest_before = state.models.telemetry_snapshot();
@@ -1674,6 +1698,8 @@ async fn bootstrap_and_ingest(
         subsets: subset_manifest(options),
         top_n,
         prompt_version: PROMPT_VERSION.to_owned(),
+        profile_id,
+        system_prompt_sha256,
         provider_seed_support: ProviderSeedSupport {
             mode_a: false,
             mode_b: false,
@@ -2029,6 +2055,32 @@ mod tests {
         };
         execute(options).await.expect("offline dry-run must pass");
         assert_eq!(CLOUD_RUN_INVOCATIONS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dry_run_reports_the_profile_and_the_hash_of_the_prompt_answers_use() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/fixtures/manifest.json");
+        let options = CliOptions {
+            manifest: manifest.clone(),
+            ..CliOptions::default()
+        };
+        let snapshot = load_and_validate_dataset_snapshot(&manifest)
+            .unwrap_or_else(|_| panic!("fixtures must validate"));
+        let selection = select_dataset(&snapshot.dataset, &options).expect("select all");
+        let profile = Profile::for_test();
+        let summary =
+            serde_json::to_value(dry_run_summary(&options, &snapshot, &selection, &profile))
+                .expect("serialize summary");
+        assert_eq!(summary["profileId"], "default");
+        // The default profile answers under the core rules exactly as written.
+        assert_eq!(
+            summary["systemPromptSha256"],
+            super::super::schema::sha256_hex(crate::rag_context::RAG_SYSTEM_PROMPT.as_bytes())
+        );
+        assert_eq!(
+            profile.system_prompt(EVALUATION_PROMPT_KIND),
+            crate::rag_context::RAG_SYSTEM_PROMPT
+        );
     }
 
     #[test]
