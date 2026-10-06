@@ -404,3 +404,120 @@ Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重）�
   | 上傳壓力：swap 最高、critical | 11.8 GiB、4 個取樣點 | 4.8 GiB、0 次 |
 
   答錯的題目兩組差在 `jpg-brand`（2 GiB 這組在同時處理與 examples 各錯一次）與 `cross-crane`（2 GiB 這組通過）；上傳壓力的第二輪兩組也都錯在 `jpg-brand`。上限 2 GiB 後，追問少了前一輪的重用，但首字時間沒有變。兩組的 log 都沒有錯誤。
+
+### 8.14 Rerank 與 Embed 改跑 MLX（#47，2026-10-06）
+
+把 Nemotron Rerank VL 移植到 MLX 0.32.3（直接讀原始 `model.safetensors`），和推論服務現行的 PyTorch 2.14.1 MPS 比。前處理和模型的 transformers processor 逐 token、逐 pixel 相同（tiles 1 與 6、文字／圖／圖＋文、截斷都比過）。
+
+先用合成候選比（正式服務改跑 MLX 之後擷取的實際候選在本節後段）：`examples.json` 與 `realistic.json` 裡來源是 PDF 或圖片的 34 題（兩題追問的每輪各算一題，共 36 題），以 BM25 從 4 份 PDF（共 53 頁）與 4 張圖片選出每題前 50 名；其中 7 筆帶頁圖（上傳的圖片與 iiot 報告第 7 頁優先，不足依名次補），頁圖是 180 DPI、長邊上限 1600 的 PNG。送進模型的方式照後端與推論服務：同一 modality 一批、每批最多 8 筆、循序，`KM_RERANK_TILES=1`，token 上限依 modality。每組各自一個程序、先跑 1 題暖機；每組開跑前推論服務都沒有載入模型，Gemma（MLX、上限 2 GiB）常駐。這份候選每題 rerank 5.87s，比 §8.13 實際候選的 7.4s 短。
+
+| 每題 50 筆 | 平均 | 與 fp32 參考的 logit 最大差 | 前 6 名集合不同 | 前 6 名順序不同 | 使用中記憶體峰值（不含快取） |
+| --- | --- | --- | --- | --- | --- |
+| PyTorch MPS fp32（參考） | 18.16s | — | — | — | 9.12 GiB |
+| PyTorch MPS fp16（現行） | 5.87s | 0.0106 | 0/36 | 1 | 4.89 GiB |
+| PyTorch MPS fp16，逐筆不補 padding | 4.43s | 0.0094 | 0/36 | 1 | 3.89 GiB |
+| MLX fp32（`MLX_ENABLE_TF32=0`） | 18.33s | 0.00001 | 0/36 | 0 | 7.69 GiB |
+| MLX bf16 | 5.03s | 0.0776 | 0/36 | 2 | 3.85 GiB |
+| MLX fp16 | 5.09s | 0.0103 | 0/36 | 0 | 3.87 GiB |
+| MLX fp16，逐筆不補 padding | 3.79s | 0.0086 | 0/36 | 0 | 3.83 GiB |
+
+- 同一種批次方式下，MLX fp16 比 PyTorch MPS fp16 快 1.15 倍（補 padding）與 1.17 倍（不補）。最快的 MLX 比現行快 1.55 倍，其中 1.33 倍來自不補 padding，PyTorch 也做得到（#48）。#47 的門檻是 2 倍。
+- 這台的 PyTorch MPS 與 MLX 跑 matmul 一樣快（TFLOPS，`deploy/mac-mini/nemotron-vl-mlx/tools/matmul_peak.py`）：
+
+  | M×K×N | MLX fp16 | MPS fp16 | MLX bf16 | MPS bf16 |
+  | --- | --- | --- | --- | --- |
+  | 4096×4096×4096 | 18.0 | 18.7 | 19.1 | 18.7 |
+  | 19200×2048×8192 | 18.2 | 18.8 | 19.6 | 18.8 |
+  | 600×2048×8192 | 13.6 | 16.7 | 13.8 | 15.6 |
+  | 600×8192×2048 | 10.2 | 13.4 | 12.1 | 13.0 |
+
+  每題有效 token 約 2.0 萬、補齊後約 3.2 萬（有效 63%），約 79 TFLOP；PyTorch MPS fp16 每題 5.87s 相當於約 13.5 TFLOPS。
+- 精度：PyTorch MPS fp32 和 CPU fp32 在 4 個固定批次上差 1e-5，MLX fp32 和它們也差 1e-5。MLX 在 M6 上預設讓 float32 matmul 走 TF32（`MLX_ENABLE_TF32`），沒關掉時差 0.0036，比 PyTorch fp16 還大。
+- 記憶體要看程序的 phys_footprint（`top` 的 MEM）：macOS 的 RSS 不算 GPU buffer，`mx.get_peak_memory()` 不算 MLX 的 buffer cache。MLX 的 buffer cache 預設沒有實際上限，每筆長度不同，釋放的 buffer 被留著重用，36 題後長到 13.8 GiB。單獨跑 rerank、逐筆不補 padding、fp16（`rerank-cache-20261006-030622/`）：
+
+  | | 每題 | 程序 footprint |
+  | --- | --- | --- |
+  | MLX，預設 cache | 3.80s | 17 GB |
+  | MLX，cache 上限 0 | 3.99s | 3.6 GB |
+  | MLX，cache 上限 256 MB | 3.88s | 3.8 GB |
+  | MLX，cache 上限 1 GB | 3.88s | 4.6 GB |
+  | PyTorch MPS | 4.34s | 5.0 GB |
+
+- 推論服務本身（`server.py` 加 `KM_RERANK_BACKEND`，在 9502 埠另跑一份，正式服務沒動）：先 embed 一次查詢讓 embed 常駐，等同有人在問的狀態，再用 HTTP 照後端格式送 36 題（`nemotron-vl-mlx/tools/knowva/server-test.sh`）。
+
+  | `KM_RERANK_BACKEND` | 每題 rerank | footprint 峰值 | 跑完時 footprint | 記憶體壓力 |
+  | --- | --- | --- | --- | --- |
+  | torch | 5.90s | 10.0 GB | 9.2 GB | normal |
+  | mlx，`KM_MLX_CACHE_MB=256` | 3.96s | 9.9 GB | 8.4 GB | normal |
+  | mlx，沒設上限 | 4.08s | 23 GB | — | warn，swap 增加 4.1 GB |
+
+  embed 仍跑 PyTorch，程序裡還是有 PyTorch runtime 與 MPS 快取，所以峰值幾乎一樣。結果在 `rerank-server2-20261006-025831/`（沒設上限）與 `rerank-server3-20261006-031952/`。
+- MLX 第一版載入時同時持有 bf16 原檔與 fp16 副本，可用記憶體一度剩 0.15 GiB、記憶體壓力 critical 2 秒、swap 增加 2.3 GiB；改成逐個 tensor 轉換後沒有再出現。
+- 移植與量測工具在 `deploy/mac-mini/nemotron-vl-mlx/`（`tools/knowva/build_sets.py` 組候選、`bench_sets.py` 量時間與 logit、`compare_runs.py` 比較、`run-sets.sh` 依序執行並取樣記憶體、`cache-sweep.sh` 與 `server-test.sh`）。以上結果都在 `knowva-mac:~/knowva-inference/bench-results/` 底下，36 題的比較在 `rerank-sets-20261006-015536/` 與 `rerank-sets2-20261006-023640/`。
+
+正式推論服務 09:40 改成 `KM_RERANK_BACKEND=mlx`、`KM_MLX_CACHE_MB=256`（embed 仍是 PyTorch），照 §8.13 跑一輪 e2e（`mlx-rerank-e2e-20261006-094336/`），對照同一天 PyTorch 的 `km1-20261006-002433/`。這一輪 app 的 rerank 請求經過 `tools/knowva/capture-proxy.ts` 轉送，原樣記下請求與回應（`capture-e2e.sh`，跑完路由改回直連）。
+
+| | MLX rerank | PyTorch（km1） |
+| --- | --- | --- |
+| 1／2／3／4 人同時提問，每分鐘答完 | 5.15／4.44／3.98／4.18 | 4.03／3.86／3.30／3.65 |
+| 同時提問時每題 rerank 平均／最長 | 14.6s／26.2s | 21.5s／33.9s |
+| examples／realistic 答對 | 30/34、33/39 | 29/34、32/39 |
+| 首字中位數 examples／realistic | 13.4s／12.9s | 16.8s／16.2s |
+| 記憶體壓力 warn 的取樣比例 | 2.8% | 36% |
+| 跑的期間 swap | 1.5→2.7 GiB | 1.4→5.2 GiB |
+
+- 同時提問時，各人的 rerank 批次在推論服務裡排隊（一次一個 forward），所以每題 rerank 比單人時長；單人時 MLX 每題約 5.8s。
+- swap 最高 9.7 GiB 是開跑前留下的（第一筆取樣時推論服務還沒載入模型），跑的期間一路降到 1.5 GiB 再回升。
+- 答對題不同的有 jpg-brand、xlsx-peak-month（MLX 對、km1 錯）與 poster-machine-causes、poster-hoisting-hazards（兩邊都錯，缺的關鍵字不同）。用下面的重播比，只有 poster-machine-causes 的前 6 名和 PyTorch fp16 不同（第 3、4 名對調）；其他三題前 6 名相同，差異來自 rerank 之後。
+
+擷取到的 520 個請求是 73 題（examples 34、realistic 39）、每題 50 筆的實際候選，3650 筆裡 524 筆帶頁圖（24 張不同的圖），以 `tools/knowva/capture_to_sets.py` 轉成 `bench_sets.py` 的格式。MLX 照服務設定（TF32 開、cache 256 MB）重播時，73 題的 logit 和服務當時回傳的完全相同，所以重播能代表正式服務。結果在 `rerank-captured-20261006/`：
+
+| 實際候選，每題 50 筆 | 平均 | 與 fp32 參考的 logit 最大差 | 前 6 名集合不同 | 前 6 名順序不同 | 程序 footprint |
+| --- | --- | --- | --- | --- | --- |
+| PyTorch MPS fp32（參考） | 22.12s | — | — | — | 12 GB |
+| PyTorch MPS fp16（原本的服務） | 7.18s | 0.0082 | 2/73 | 0 | 7.3 GB |
+| MLX fp16（服務設定） | 4.91s | 0.0104 | 1/73 | 1 | 4.0 GB |
+
+- 前 6 名集合不同的題目，參考值的第 6、7 名只差 0.0018 與 0.0003；MLX 不同的那一題，PyTorch fp16 也一樣換掉。MLX 和 PyTorch fp16 之間 logit 最大差 0.0107，前 6 名集合不同 1 題（pptx-content，第 6 名）、順序不同 1 題（poster-machine-causes）。
+- MLX 比 PyTorch fp16 快 1.46 倍（中位數 1.54 倍）。實際候選比合成的長（PyTorch 每題 7.18s 對 5.87s）。
+- TF32 開或關，fp16 的 logit 完全相同：fp16 模型裡只有 score head 是 float32 matmul。
+- 頁面文字的 `\r\n` 要原樣送：工具一開始用文字模式讀候選，換行被改成 `\n`，重播和服務的 logit 差到 0.45、前 6 名 18 題不同。合成候選（`build_sets.py`）同樣把 `\r\n` 換成 `\n`；各組拿到的文字相同，前面的比較仍成立，只是和 app 送出的差在換行。
+
+Embed VL 用同一套移植（`Embedder`）：和 sentence-transformers 一樣的 `query: `／`passage: ` prompt、4096 token 截斷、不正規化的 mean pooling；前處理和原版逐 token、逐 pixel 相同（`tools/check_embed_processing.py`）。量測用 `bench-pages/` 的 14 頁（iiot 報告，頁圖與文字層）和 `realistic.json` 前 20 題，每筆各送一次，和後端一樣；`KM_MAX_TILES=6`，每組各自一個程序，開跑前推論服務沒有載入模型（`tools/knowva/run-embed.sh`，結果在 `embed-20261006/`）。
+
+| 每筆 | 查詢 | 文字頁 | 頁圖 | 頁圖＋文字 | 程序 footprint | 與 PyTorch fp32 的 cosine 最小值 |
+| --- | --- | --- | --- | --- | --- | --- |
+| PyTorch MPS fp32（參考） | 0.054s | 0.196s | 2.78s | 2.99s | 9.9 GB | — |
+| PyTorch MPS fp16（原本的服務） | 0.026s | 0.068s | 1.00s | 1.06s | 4.7 GB | 0.999992 |
+| MLX fp16 | 0.022s | 0.055s | 0.84s | 0.91s | 4.3 GB | 0.999990 |
+| MLX fp32（`MLX_ENABLE_TF32=0`） | 0.038s | 0.189s | 2.74s | 2.94s | 7.4 GB | 1.000000 |
+
+- 用每題查詢向量對 14 頁取 cosine 前 5 頁（`tools/compare_embed.py`）：MLX fp16 和 PyTorch fp16 一樣，在文字頁、頁圖、頁圖＋文字各有 0–1 題的前 5 名集合和 fp32 參考不同。
+- 不用重新 embed：MLX fp16 的查詢向量去比 PyTorch fp16 的頁向量（也就是資料庫裡現有的），三種頁的前 5 名都和 PyTorch fp16 自己比的完全相同（0/20）。
+- 推論服務在 9502 埠另跑一份、embed 與 rerank 都設 MLX：後端會送的四種輸入（查詢、文字、頁圖、頁圖＋文字）經 HTTP 拿到的向量和直接呼叫 `Embedder` 逐位相同；程序沒有載入任何 PyTorch 函式庫，兩個模型都載入後 footprint 6.95 GB（`embed-service-smoke-20261006/`）。
+
+接著正式推論服務改成 `KM_EMBED_BACKEND=mlx`（rerank 已是 MLX），之後的 e2e 不改任何設定（`tools/knowva/acceptance-e2e.sh`，`mlx-all-e2e-20261006-112335/`）：examples、realistic、1–4 人同時提問，再上傳兩份文件的複本、同時 4 人各問 3 輪（`stress-upload.ts`，上傳完即刪除，和 km1 的上傳階段相同）。
+
+| | PyTorch（km1） | Rerank MLX | 全 MLX |
+| --- | --- | --- | --- |
+| 1／2／3／4 人同時提問，每分鐘答完 | 4.03／3.86／3.30／3.65 | 5.15／4.44／3.98／4.18 | 5.11／4.36／3.85／4.34 |
+| 同時提問時每題 rerank 平均／最長 | 21.5s／33.9s | 14.6s／26.2s | 14.8s／25.3s |
+| examples／realistic 答對 | 29/34、32/39 | 30/34、33/39 | 28/34、32/39 |
+| 首字中位數 examples／realistic | 16.8s／16.2s | 13.4s／12.9s | 13.3s／12.9s |
+| 推論服務 footprint 中位數／最高 | — | 8.7／10.2 GB | 7.5／8.4 GB |
+
+| 上傳 + 4 人各問 3 輪 | PyTorch（km1） | 全 MLX（兩次） |
+| --- | --- | --- |
+| 每分鐘答完 | 3.19 | 3.93、3.83 |
+| 首字平均 | 56.7s | 44.4s、47.4s |
+| 每題 rerank 平均 | 34.6s | 24.2s、25.0s |
+| pptx（75 頁）可問答 | 54.3s | 88.4s、92.4s |
+| PDF（32 頁）可問答 | 69.4s | 69.3s、68.3s |
+| 記憶體壓力 warn 的取樣比例 | 57% | 20%（第一次） |
+| 階段中 swap 增加 | 0.8 GiB | 0.4 GiB（第一次） |
+
+- 全 MLX 和 rerank MLX 的 73 題取到的來源完全相同；和 km1 比只有 pptx-content、poster-machine-causes 兩題不同（就是重播裡前 6 名和 PyTorch fp16 不同的兩題，三輪都答錯）。答對題不同的 jpg-brand、jpg-task、xlsx-peak-month 來源都相同，是 Gemma 對同樣的來源給了不同答案，例如 jpg-brand 一次讀成 KUKA、一次讀成 FANUC。
+- pptx 在有人提問時變慢：同一份 pptx 沒人提問時 23.1s 可問答，其中 embed 11.6s。有人提問時 embed 要 48s，推論服務的存取紀錄顯示上傳的 embed 和 4 人的 rerank 批次輪流取得 GPU（約 4 個 embed、4 個 rerank 交替），上傳的進度被 rerank 綁住；km1 沒留推論服務紀錄，無法比較它當時的順序。第二次在 `mlx-all-upload-20261006/`，沒有取樣記憶體。同一段時間答題變多、首字變快，PDF 沒有變慢。
+- 推論服務不再載入 PyTorch，footprint 中位數少 1.2 GB、最高少 1.8 GB。上傳階段推論服務最高 8.3 GB。
+
+之後權重改從 Hugging Face 的 `Laysi-ai/llama-nemotron-{embed,rerank}-vl-1b-v2-mlx` 下載（`setup/fetch-models.ts`）。這是 NVIDIA 權重換成移植的參數名稱與版面，bf16 數值不變。切換前後，推論服務對同一組請求的回應逐位相同：15 個 embed（查詢、文字、頁圖、頁圖＋文字）和 9 個 rerank（文字、頁圖、頁圖＋文字各 3 題）。切換前同一份服務連跑兩次也逐位相同，所以這個比對有效。切換後透過 app 問 realistic 第一題，答案正確，答案用到的頁排第一。比對工具是 `tools/knowva/service_outputs.py`，結果在 `hf-weights-switch-20261006/`。
