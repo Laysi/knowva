@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Embed VL on MPS and Rerank VL on MLX, plus chat passed through to Ollama: the
+<!-- Embed VL and Rerank VL on MLX, plus chat passed through to Ollama: the
      one endpoint the application's MODEL_BASE_URL points at. Weights are read
      from the verified local snapshots only; nothing is fetched at runtime. -->
 <plist version="1.0">
@@ -34,6 +34,8 @@
     <string>1</string>
     <key>KM_RERANK_INPUT</key>
     <string>both</string>
+    <key>KM_EMBED_BACKEND</key>
+    <string>mlx</string>
     <key>KM_RERANK_BACKEND</key>
     <string>mlx</string>
     <key>KM_MLX_CACHE_MB</key>
