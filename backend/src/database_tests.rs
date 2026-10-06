@@ -2585,3 +2585,657 @@ async fn unlocked_database_with_documents_requires_reinitialization(
     assert_eq!(rows, 0);
     Ok(())
 }
+
+// Conversation history (issue #52).
+
+struct ConversationReply {
+    status: StatusCode,
+    set_cookie: Option<String>,
+    body: Value,
+}
+
+impl ConversationReply {
+    /// The `knowva_client` token this reply issued.
+    fn issued_token(&self) -> String {
+        self.set_cookie
+            .as_deref()
+            .and_then(|cookie| cookie.strip_prefix("knowva_client="))
+            .and_then(|rest| rest.split(';').next())
+            .expect("the reply issues a client cookie")
+            .to_owned()
+    }
+}
+
+/// One conversation API call as the browser holding `token` would make it.
+async fn conversation_call(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> anyhow::Result<ConversationReply> {
+    let mut request = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        request = request.header("cookie", format!("knowva_client={token}"));
+    }
+    let request = match body {
+        Some(body) => request
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body)?))?,
+        None => request.body(Body::empty())?,
+    };
+    let response = app.clone().oneshot(request).await?;
+    let status = response.status();
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()?;
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+    };
+    Ok(ConversationReply {
+        status,
+        set_cookie,
+        body,
+    })
+}
+
+async fn create_conversation_for(app: &Router, token: &str) -> anyhow::Result<String> {
+    let reply = conversation_call(app, "POST", "/api/conversations", Some(token), None).await?;
+    assert_eq!(reply.status, StatusCode::CREATED, "{:?}", reply.body);
+    Ok(reply.body["conversation"]["id"]
+        .as_str()
+        .expect("conversation id")
+        .to_owned())
+}
+
+fn user_message(id: &str, text: &str) -> Value {
+    serde_json::json!({
+        "id": id,
+        "role": "user",
+        "createdAt": "2026-10-06T08:00:00.000Z",
+        "content": [{ "type": "text", "text": text }],
+        "attachments": [],
+        "metadata": { "custom": {} }
+    })
+}
+
+fn assistant_message(id: &str, text: &str, sources: Value) -> Value {
+    serde_json::json!({
+        "id": id,
+        "role": "assistant",
+        "createdAt": "2026-10-06T08:00:05.000Z",
+        "content": [
+            { "type": "text", "text": text },
+            { "type": "data", "name": "sources", "data": sources }
+        ],
+        "status": { "type": "complete", "reason": "unknown" },
+        "metadata": {
+            "unstable_state": null,
+            "unstable_annotations": [],
+            "unstable_data": [],
+            "steps": [],
+            "custom": {}
+        }
+    })
+}
+
+async fn save_conversation_message(
+    app: &Router,
+    token: &str,
+    conversation_id: &str,
+    parent_id: Option<&str>,
+    message: Value,
+) -> anyhow::Result<ConversationReply> {
+    conversation_call(
+        app,
+        "POST",
+        &format!("/api/conversations/{conversation_id}/messages"),
+        Some(token),
+        Some(serde_json::json!({ "parentId": parent_id, "message": message })),
+    )
+    .await
+}
+
+fn conversation_ids(reply: &ConversationReply) -> Vec<String> {
+    reply
+        .body
+        .as_array()
+        .expect("conversation list")
+        .iter()
+        .map(|conversation| conversation["id"].as_str().expect("id").to_owned())
+        .collect()
+}
+
+#[sqlx::test]
+async fn conversations_keep_every_message_part_in_save_order(pool: PgPool) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let token = crate::conversations::test_support::new_token();
+    let id = create_conversation_for(&app, &token).await?;
+    let sources = serde_json::json!([
+        { "sourceId": "S1", "documentId": "00000000-0000-0000-0000-000000000001",
+          "unitId": 137, "unitIndex": 36, "filename": "設備保養手冊.pdf",
+          "pageNumber": 37, "kind": "page" },
+        { "sourceId": "S2", "documentId": "00000000-0000-0000-0000-000000000002",
+          "unitId": 202, "filename": "維運交接筆記.md", "pageNumber": null, "kind": "text" }
+    ]);
+    let question = user_message("q1", "馬達多久保養一次？");
+    let answer = assistant_message("a1", "每三個月保養一次。", sources);
+    let mut failed = assistant_message("a2", "請先", serde_json::json!([]));
+    failed["content"] = serde_json::json!([{ "type": "text", "text": "請先" }]);
+    failed["status"] = serde_json::json!({
+        "type": "incomplete", "reason": "error", "error": "回覆傳輸中斷，請重新送出問題。"
+    });
+    let follow_up = user_message("q2", "交接要注意什麼？");
+    for (parent_id, message) in [
+        (None, &question),
+        (Some("q1"), &answer),
+        (Some("a1"), &follow_up),
+        (Some("q2"), &failed),
+    ] {
+        let reply =
+            save_conversation_message(&app, &token, &id, parent_id, message.clone()).await?;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    }
+
+    let reply = conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{id}/messages"),
+        Some(&token),
+        None,
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        reply.body,
+        serde_json::json!([
+            { "parentId": null, "message": question },
+            { "parentId": "q1", "message": answer },
+            { "parentId": "a1", "message": follow_up },
+            { "parentId": "q2", "message": failed }
+        ])
+    );
+    assert_eq!(reply.set_cookie, None, "a valid cookie is never replaced");
+    Ok(())
+}
+
+#[sqlx::test]
+async fn conversations_of_another_browser_answer_404(pool: PgPool) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let alice = crate::conversations::test_support::new_token();
+    let bob = crate::conversations::test_support::new_token();
+    let alices = create_conversation_for(&app, &alice).await?;
+    let saved =
+        save_conversation_message(&app, &alice, &alices, None, user_message("q1", "甲的問題"))
+            .await?;
+    assert_eq!(saved.status, StatusCode::OK);
+    let bobs = create_conversation_for(&app, &bob).await?;
+
+    let listed = conversation_call(&app, "GET", "/api/conversations", Some(&bob), None).await?;
+    assert_eq!(conversation_ids(&listed), std::slice::from_ref(&bobs));
+    for (method, uri, body) in [
+        ("GET", format!("/api/conversations/{alices}"), None),
+        ("GET", format!("/api/conversations/{alices}/messages"), None),
+        (
+            "POST",
+            format!("/api/conversations/{alices}/messages"),
+            Some(
+                serde_json::json!({ "parentId": "q1", "message": user_message("q2", "乙的問題") }),
+            ),
+        ),
+        ("DELETE", format!("/api/conversations/{alices}"), None),
+    ] {
+        let reply = conversation_call(&app, method, &uri, Some(&bob), body).await?;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method} {uri}");
+        assert_eq!(reply.body, Value::String("找不到這串對話。".to_owned()));
+    }
+    let missing = conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{}", Uuid::new_v4()),
+        Some(&alice),
+        None,
+    )
+    .await?;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.body, Value::String("找不到這串對話。".to_owned()));
+    let malformed = conversation_call(
+        &app,
+        "GET",
+        "/api/conversations/not-a-uuid",
+        Some(&alice),
+        None,
+    )
+    .await?;
+    assert_eq!(malformed.status, StatusCode::NOT_FOUND);
+
+    let cleared = conversation_call(&app, "DELETE", "/api/conversations", Some(&bob), None).await?;
+    assert_eq!(cleared.status, StatusCode::NO_CONTENT);
+    let alices_list =
+        conversation_call(&app, "GET", "/api/conversations", Some(&alice), None).await?;
+    assert_eq!(
+        conversation_ids(&alices_list),
+        std::slice::from_ref(&alices)
+    );
+    let messages: i64 = sqlx::query_scalar("SELECT count(*) FROM conversation_messages")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        messages, 1,
+        "clearing one browser keeps the other's messages"
+    );
+
+    let deleted = conversation_call(
+        &app,
+        "DELETE",
+        &format!("/api/conversations/{alices}"),
+        Some(&alice),
+        None,
+    )
+    .await?;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM conversations")
+        .fetch_one(&pool)
+        .await?;
+    let remaining_messages: i64 = sqlx::query_scalar("SELECT count(*) FROM conversation_messages")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!((remaining, remaining_messages), (0, 0));
+    Ok(())
+}
+
+/// Collects everything the fmt subscriber writes while it is the default.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[sqlx::test]
+async fn the_client_token_never_reaches_the_log(pool: PgPool) -> anyhow::Result<()> {
+    let log = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+
+    let created = conversation_call(&app, "POST", "/api/conversations", None, None).await?;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let token = created.issued_token();
+    let id = created.body["conversation"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    for message in [
+        user_message("q1", "權杖不能外流嗎？"),
+        // Invalid, oversized and misplaced saves go through the error paths too.
+        serde_json::json!({ "id": "bad", "role": "system", "content": [] }),
+    ] {
+        save_conversation_message(&app, &token, &id, None, message).await?;
+    }
+    save_conversation_message(&app, &token, &id, Some("missing"), user_message("q9", "x")).await?;
+    conversation_call(&app, "GET", "/api/conversations", Some(&token), None).await?;
+    conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{}", Uuid::new_v4()),
+        Some(&token),
+        None,
+    )
+    .await?;
+    // A dropped connection mid-request still must not log the token.
+    pool.close().await;
+    let unavailable =
+        conversation_call(&app, "GET", "/api/conversations", Some(&token), None).await?;
+    assert_eq!(unavailable.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        unavailable.body,
+        Value::String("對話紀錄暫時無法使用，請稍後再試。".to_owned())
+    );
+
+    let log = String::from_utf8(log.0.lock().expect("log lock").clone())?;
+    assert!(log.contains("issued an anonymous client cookie"), "{log}");
+    assert!(log.contains("conversation query failed"), "{log}");
+    assert!(!log.contains(&token), "the log holds the client token");
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn conversations_store_only_the_token_hash_as_an_anonymous_owner(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let created = conversation_call(&app, "POST", "/api/conversations", None, None).await?;
+    let token = created.issued_token();
+    let id = created.body["conversation"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    save_conversation_message(&app, &token, &id, None, user_message("q1", "第一個問題")).await?;
+    create_conversation_for(&app, &crate::conversations::test_support::new_token()).await?;
+
+    let owners: Vec<(String, String)> =
+        sqlx::query_as("SELECT owner_kind, owner_id FROM conversations ORDER BY created_at")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(owners.len(), 2);
+    assert_eq!(
+        owners[0].1,
+        crate::conversations::test_support::hash(&token)
+    );
+    assert!(owners.iter().all(|(kind, _)| kind == "anonymous"));
+    let rows_with_token: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM conversations c WHERE c::text LIKE '%' || $1 || '%') \
+              + (SELECT count(*) FROM conversation_messages m WHERE m::text LIKE '%' || $1 || '%')",
+    )
+    .bind(&token)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(rows_with_token, 0);
+
+    // The schema refuses an unknown owner kind and an anonymous owner that is not a hash.
+    for (kind, owner_id) in [
+        ("robot", crate::conversations::test_support::hash(&token)),
+        ("anonymous", token.clone()),
+    ] {
+        let insert =
+            sqlx::query("INSERT INTO conversations (owner_kind, owner_id) VALUES ($1, $2)")
+                .bind(kind)
+                .bind(&owner_id)
+                .execute(&pool)
+                .await;
+        assert!(insert.is_err(), "{kind} {owner_id} must be rejected");
+    }
+    sqlx::query("INSERT INTO conversations (owner_kind, owner_id) VALUES ('user', 'account-42')")
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+#[sqlx::test]
+async fn the_51st_conversation_deletes_the_least_recently_updated(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let token = crate::conversations::test_support::new_token();
+    let other = crate::conversations::test_support::new_token();
+    let others = create_conversation_for(&app, &other).await?;
+    let mut ids = Vec::new();
+    for _ in 0..crate::conversations::MAX_CONVERSATIONS {
+        ids.push(create_conversation_for(&app, &token).await?);
+    }
+    // The second one gets a message so its messages must go with it; the first one is
+    // updated last, so the second is now the stalest.
+    save_conversation_message(&app, &token, &ids[1], None, user_message("q1", "舊的問題")).await?;
+    save_conversation_message(
+        &app,
+        &token,
+        &ids[0],
+        None,
+        user_message("q1", "最近的問題"),
+    )
+    .await?;
+    let stalest = ids[2].clone();
+
+    let created = conversation_call(&app, "POST", "/api/conversations", Some(&token), None).await?;
+    assert_eq!(created.status, StatusCode::CREATED);
+    assert_eq!(created.body["removedIds"], serde_json::json!([stalest]));
+    let newest = created.body["conversation"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let listed = conversation_call(&app, "GET", "/api/conversations", Some(&token), None).await?;
+    let listed = conversation_ids(&listed);
+    assert_eq!(listed.len(), 50);
+    assert_eq!(listed[0], newest);
+    assert_eq!(listed[1], ids[0]);
+    assert!(!listed.contains(&stalest));
+    assert!(listed.contains(&ids[1]));
+    let others_list =
+        conversation_call(&app, "GET", "/api/conversations", Some(&other), None).await?;
+    assert_eq!(conversation_ids(&others_list), [others]);
+
+    // Once more: now the third-created one goes, taking its messages with it.
+    save_conversation_message(&app, &token, &ids[3], None, user_message("q1", "x")).await?;
+    let created = conversation_call(&app, "POST", "/api/conversations", Some(&token), None).await?;
+    assert_eq!(created.body["removedIds"], serde_json::json!([ids[4]]));
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM conversations WHERE owner_id = $1")
+        .bind(crate::conversations::test_support::hash(&token))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(total, 50);
+    Ok(())
+}
+
+#[sqlx::test]
+async fn conversation_messages_are_capped_checked_and_idempotent(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let token = crate::conversations::test_support::new_token();
+    let id = create_conversation_for(&app, &token).await?;
+
+    let limit = crate::conversations::MAX_MESSAGES_PER_CONVERSATION as usize;
+    let mut parent: Option<String> = None;
+    for index in 0..limit {
+        let message_id = format!("m{index}");
+        let message = if index % 2 == 0 {
+            user_message(&message_id, &format!("問題 {index}"))
+        } else {
+            assistant_message(&message_id, &format!("回答 {index}"), serde_json::json!([]))
+        };
+        let reply =
+            save_conversation_message(&app, &token, &id, parent.as_deref(), message).await?;
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "message {index}: {:?}",
+            reply.body
+        );
+        parent = Some(message_id);
+    }
+
+    let over = save_conversation_message(
+        &app,
+        &token,
+        &id,
+        parent.as_deref(),
+        user_message("m-over", "第 201 則"),
+    )
+    .await?;
+    assert_eq!(over.status, StatusCode::CONFLICT);
+    assert_eq!(
+        over.body,
+        Value::String("這串對話已達 200 則訊息，無法再保存。".to_owned())
+    );
+
+    // Resending a saved id replaces it in place, even at the limit.
+    let resent = save_conversation_message(
+        &app,
+        &token,
+        &id,
+        None,
+        user_message("m0", "改寫過的第一個問題"),
+    )
+    .await?;
+    assert_eq!(resent.status, StatusCode::OK);
+    let stored: Vec<(String, i32, Value)> = sqlx::query_as(
+        "SELECT message_id, position, message FROM conversation_messages \
+         WHERE conversation_id = $1::uuid ORDER BY position",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(stored.len(), limit);
+    assert_eq!(stored[0].0, "m0");
+    assert_eq!(stored[0].1, 0);
+    assert_eq!(stored[0].2["content"][0]["text"], "改寫過的第一個問題");
+    assert!(
+        stored
+            .iter()
+            .enumerate()
+            .all(|(index, row)| row.1 == index as i32)
+    );
+
+    let fresh = create_conversation_for(&app, &token).await?;
+    let missing_parent = save_conversation_message(
+        &app,
+        &token,
+        &fresh,
+        Some("nowhere"),
+        user_message("q1", "x"),
+    )
+    .await?;
+    assert_eq!(missing_parent.status, StatusCode::CONFLICT);
+    let invalid = save_conversation_message(
+        &app,
+        &token,
+        &fresh,
+        None,
+        serde_json::json!({ "id": "q1", "role": "tool", "content": [] }),
+    )
+    .await?;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid.body,
+        Value::String("訊息格式不正確，無法保存。".to_owned())
+    );
+    let not_json = conversation_call(
+        &app,
+        "POST",
+        &format!("/api/conversations/{fresh}/messages"),
+        Some(&token),
+        Some(Value::String("not an object".to_owned())),
+    )
+    .await?;
+    assert_eq!(not_json.status, StatusCode::BAD_REQUEST);
+
+    let max = crate::conversations::MAX_MESSAGE_BYTES;
+    let mut at_limit = user_message("q1", "");
+    let overhead = serde_json::to_vec(&at_limit)?.len();
+    at_limit["content"][0]["text"] = Value::String("a".repeat(max - overhead));
+    assert_eq!(serde_json::to_vec(&at_limit)?.len(), max);
+    let accepted = save_conversation_message(&app, &token, &fresh, None, at_limit).await?;
+    assert_eq!(accepted.status, StatusCode::OK);
+    for extra in [1, 64 * 1024] {
+        let mut too_large = user_message("q2", "");
+        too_large["content"][0]["text"] = Value::String("a".repeat(max - overhead + extra));
+        let rejected =
+            save_conversation_message(&app, &token, &fresh, Some("q1"), too_large).await?;
+        assert_eq!(
+            rejected.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "+{extra} bytes"
+        );
+        assert_eq!(
+            rejected.body,
+            Value::String("單則訊息超過 256 KiB，無法保存。".to_owned())
+        );
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM conversation_messages WHERE conversation_id = $1::uuid",
+    )
+    .bind(&fresh)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[sqlx::test]
+async fn the_first_question_titles_a_conversation_without_any_model_request(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (models, mock, server) = spawn_embedding_mock(false).await;
+    let app = api_router(test_state(&pool, models, Storage::memory()));
+    let token = crate::conversations::test_support::new_token();
+    let id = create_conversation_for(&app, &token).await?;
+
+    let question = "  𠀋𡈽三號廠區\n\n冷卻水塔今年第三季有哪些異常紀錄、各自如何處理、負責人是誰？";
+    let saved =
+        save_conversation_message(&app, &token, &id, None, user_message("q1", question)).await?;
+    let title = "𠀋𡈽三號廠區 冷卻水塔今年第三季有哪些異常紀錄、各自如何處理";
+    assert_eq!(title.chars().count(), 30);
+    assert_eq!(saved.body["conversation"]["title"], title);
+
+    for (parent, message) in [
+        ("q1", assistant_message("a1", "回答", serde_json::json!([]))),
+        ("a1", user_message("q2", "第二個問題不會改標題")),
+    ] {
+        let reply = save_conversation_message(&app, &token, &id, Some(parent), message).await?;
+        assert_eq!(reply.body["conversation"]["title"], title);
+    }
+    let fetched = conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{id}"),
+        Some(&token),
+        None,
+    )
+    .await?;
+    assert_eq!(fetched.body["title"], title);
+
+    for requests in [
+        &mock.requests,
+        &mock.summary_requests,
+        &mock.rerank_requests,
+    ] {
+        assert!(
+            requests.lock().expect("mock requests").is_empty(),
+            "titling must not reach a model endpoint"
+        );
+    }
+    server.abort();
+    Ok(())
+}

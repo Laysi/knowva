@@ -1,4 +1,5 @@
 pub mod cloud_models;
+mod conversations;
 mod document_summary;
 mod embedding;
 pub mod evaluation;
@@ -156,6 +157,7 @@ fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/documents/{id}", delete(ingest::delete_document))
         .route("/api/chat", post(chat))
+        .merge(conversations::router())
         .layer(DefaultBodyLimit::max(ingest::MULTIPART_BODY_LIMIT_BYTES))
         .with_state(state)
 }
