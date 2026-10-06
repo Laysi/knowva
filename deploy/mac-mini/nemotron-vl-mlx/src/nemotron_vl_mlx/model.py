@@ -384,6 +384,10 @@ class LlamaNemotronVLReranker(nn.Module):
         return self.head(self.model.pooled_unpadded(sequences, pixel_values))
 
 
+# safetensors metadata "format" of checkpoints that convert.py wrote.
+CONVERTED_FORMAT = "nemotron-vl-mlx"
+
+
 def sanitize(weights: dict[str, mx.array]) -> dict[str, mx.array]:
     """Maps checkpoint names and layouts onto the modules above."""
     out = {}
@@ -400,7 +404,11 @@ def sanitize(weights: dict[str, mx.array]) -> dict[str, mx.array]:
 
 
 def _load(module, model_dir: Path, dtype) -> None:
-    weights = sanitize(mx.load(str(model_dir / "model.safetensors")))
+    weights, metadata = mx.load(str(model_dir / "model.safetensors"), return_metadata=True)
+    # convert.py's output is already in this layout; sanitize would transpose
+    # the patch convolution a second time.
+    if metadata.get("format") != CONVERTED_FORMAT:
+        weights = sanitize(weights)
     # Converted and evaluated one tensor at a time, dropping each checkpoint
     # tensor as soon as it is copied, so loading never holds the model twice.
     converted = []

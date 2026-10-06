@@ -19,7 +19,7 @@ def unit(x):
 
 
 def top(queries, pages):
-    # Knowva's dense search orders by cosine distance.
+    # Dense retrieval orders by cosine similarity.
     return [list(np.argsort(-row, kind="stable")[:TOP_K]) for row in unit(queries) @ unit(pages).T]
 
 

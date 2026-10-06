@@ -23,9 +23,9 @@
     <key>HF_HUB_OFFLINE</key>
     <string>1</string>
     <key>KM_EMBED_PATH</key>
-    <string>/Users/knowva/knowva-inference/models/llama-nemotron-embed-vl-1b-v2</string>
+    <string>/Users/knowva/knowva-inference/models/llama-nemotron-embed-vl-1b-v2-mlx</string>
     <key>KM_RERANK_PATH</key>
-    <string>/Users/knowva/knowva-inference/models/llama-nemotron-rerank-vl-1b-v2</string>
+    <string>/Users/knowva/knowva-inference/models/llama-nemotron-rerank-vl-1b-v2-mlx</string>
     <key>KM_IDLE_SECS</key>
     <string>600</string>
     <key>KM_MAX_TILES</key>

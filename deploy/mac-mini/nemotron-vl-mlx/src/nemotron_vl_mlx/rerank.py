@@ -9,7 +9,7 @@ import mlx.core as mx
 import numpy as np
 
 from .model import load_reranker
-from .processing import IMG_CONTEXT_ID, TOKENS_PER_TILE, Passage, RerankProcessor
+from .processing import IMG_CONTEXT_ID, RERANK_MAX_LENGTH, TOKENS_PER_TILE, Passage, RerankProcessor
 
 
 class Reranker:
@@ -23,9 +23,10 @@ class Reranker:
         self.processor = RerankProcessor(model_dir, max_input_tiles=max_input_tiles,
                                          use_thumbnail=use_thumbnail)
 
-    def __call__(self, query: str, passages: Sequence[Passage], max_length: int) -> np.ndarray:
-        """Logits in passage order. ``max_length`` is the token budget for the
-        whole batch, which Knowva sets per modality."""
+    def __call__(self, query: str, passages: Sequence[Passage],
+                 max_length: int = RERANK_MAX_LENGTH) -> np.ndarray:
+        """Logits in passage order. ``max_length`` is the token budget per
+        query-passage pair; see ``processing.RERANK_MAX_LENGTH``."""
         batch = self.processor(query, passages, max_length)
         tiles = 0 if batch.pixel_values is None else batch.pixel_values.shape[0]
         image_tokens = int((batch.input_ids == IMG_CONTEXT_ID).sum())

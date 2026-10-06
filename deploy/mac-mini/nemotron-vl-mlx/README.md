@@ -1,12 +1,18 @@
 # nemotron-vl-mlx
 
 MLX port of NVIDIA's `llama-nemotron-rerank-vl-1b-v2` and
-`llama-nemotron-embed-vl-1b-v2`, loaded straight from the original
-`model.safetensors`. The Mac mini inference service runs them on it with
-`KM_RERANK_BACKEND=mlx` and `KM_EMBED_BACKEND=mlx` (`../inference/server.py`),
-where it is a path dependency; it lives here until it is published on its
-own (#47).
+`llama-nemotron-embed-vl-1b-v2`. The Mac mini inference service runs them on
+it with `KM_RERANK_BACKEND=mlx` and `KM_EMBED_BACKEND=mlx`
+(`../inference/server.py`), where it is a path dependency.
 
+It is published as github.com/Laysi/llama-nemotron-vl-mlx, with the weights
+on Hugging Face as `Laysi-ai/llama-nemotron-{rerank,embed}-vl-1b-v2-mlx`
+(`../setup/fetch-models.ts` downloads them). `src/` and `tools/*.py` here
+match it (it also has `tools/prepare_hub.py` and the model cards);
+`tools/knowva/` holds the Knowva measurements.
+
+- The loader reads either the converted weights or NVIDIA's original
+  snapshots; `python -m nemotron_vl_mlx.convert SRC DST` converts one.
 - `processing.py` reproduces the models' transformers processors without
   PyTorch: identical token ids, attention mask and pixel values
   (`tools/check_processing.py`, `tools/check_embed_processing.py`).

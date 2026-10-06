@@ -1,6 +1,6 @@
 """Checks that nemotron_vl_mlx's EmbedProcessor builds exactly the inputs
-sentence-transformers gives llama-nemotron-embed-vl-1b-v2, the way Knowva's Mac
-inference service calls it: token ids (padding removed) and pixel values.
+sentence-transformers gives llama-nemotron-embed-vl-1b-v2 through encode_query and
+encode_document: token ids (padding removed) and pixel values.
 
     uv run --group reference tools/check_embed_processing.py MODEL_DIR PAGES_DIR
 """

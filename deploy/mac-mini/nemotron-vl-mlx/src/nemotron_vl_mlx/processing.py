@@ -108,6 +108,12 @@ def tile_pixels(tile: Image.Image, image_size=IMAGE_SIZE) -> np.ndarray:
     return (pixels - np.float32(0.5)) / np.float32(0.5)
 
 
+# The tokenizer's model_max_length, which the original truncates to unless
+# told otherwise. NVIDIA's model card suggests 2048 for image passages, 8192
+# for text and 10240 for image plus text.
+RERANK_MAX_LENGTH = 10240
+
+
 class RerankProcessor:
     def __init__(self, model_dir: str | Path, max_input_tiles: int = 6, use_thumbnail: bool = True):
         self.tokenizer = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
@@ -130,7 +136,8 @@ class RerankProcessor:
             content = content.replace("<image>", "", 1)
         return content, tiles
 
-    def __call__(self, query: str, passages: Sequence[Passage], max_length: int) -> Batch:
+    def __call__(self, query: str, passages: Sequence[Passage],
+                 max_length: int = RERANK_MAX_LENGTH) -> Batch:
         prompts = []
         pixel_values = []
         for passage in passages:

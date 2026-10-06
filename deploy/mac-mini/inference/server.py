@@ -9,8 +9,10 @@ both on MLX the service never imports PyTorch.
 
     KM_DEVICE           mps (default) | cpu, for the models on PyTorch
     KM_DTYPE            float16 (default) | bfloat16 | float32
-    KM_EMBED_PATH       local snapshot of nvidia/llama-nemotron-embed-vl-1b-v2
-    KM_RERANK_PATH      local snapshot of nvidia/llama-nemotron-rerank-vl-1b-v2
+    KM_EMBED_PATH       local snapshot of Laysi-ai/llama-nemotron-embed-vl-1b-v2-mlx
+                        (MLX), or of nvidia/llama-nemotron-embed-vl-1b-v2 (either)
+    KM_RERANK_PATH      local snapshot of Laysi-ai/llama-nemotron-rerank-vl-1b-v2-mlx
+                        (MLX), or of nvidia/llama-nemotron-rerank-vl-1b-v2 (either)
     KM_MAX_TILES        image tiles per page for embedding, 6 = model default
     KM_RERANK_TILES     tiles for rerank only, defaults to KM_MAX_TILES
     KM_RERANK_INPUT     both (default) | text | image: what of a page to rank

@@ -1,5 +1,6 @@
-"""Small fixed rerank cases over the bench pages, shaped like Knowva's calls:
-one query, up to eight passages per request, one modality per request."""
+"""Small fixed rerank cases over a directory of pages (p-NN.jpg with
+p-NN.txt beside it), shaped like a retrieval service's calls: one query, up to
+eight passages per request, one modality per request."""
 
 from pathlib import Path
 
