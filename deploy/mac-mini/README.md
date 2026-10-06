@@ -5,7 +5,7 @@
 | 元件 | 跑在哪 | 位址 | 開機啟動 |
 | --- | --- | --- | --- |
 | app（前後端）+ PostgreSQL | Colima VM（vz，4 CPU / 3 GiB） | `127.0.0.1:8080` | `io.laysi.knowva.colima` |
-| 推論服務：Embed VL、Rerank VL（MPS float16），chat 轉給 Ollama | macOS | `127.0.0.1:9500` | `io.laysi.knowva.inference` |
+| 推論服務：Embed VL（MPS float16）、Rerank VL（MLX float16），chat 轉給 Ollama | macOS | `127.0.0.1:9500` | `io.laysi.knowva.inference` |
 | Gemma 4 12B（`gemma4:12b-mlx`） | macOS，Ollama（自編，見下）的 MLX runner | `127.0.0.1:11434` | `io.laysi.knowva.ollama` |
 
 容器經 `host.docker.internal`（192.168.5.2，lima 轉到主機 loopback）連推論服務，所以三個服務都只綁 loopback，區網看不到。三個都是 LaunchDaemon（`UserName=knowva`）：這台開機不登入，LaunchAgent 不會啟動。
@@ -17,6 +17,7 @@
 - **chat 模型 12B，MLX 版**（`gemma4:12b-mlx`）：26B-A4B 單獨就佔 20 GB，超過 GPU 可用的 17.8 GiB；和檢索模型同時存在時，編碼頁圖會 Metal OOM，回答為空。E2B 首字較快，但瓶頸是看圖，12B 只慢幾秒、品質高一級。同一個 12B，Ollama 的 MLX runner 比 llama.cpp 跑的 QAT 版讀入快約 40%（約 550 對 390 tok/s）、生成快約 60%（約 28 對 18 tok/s），多人同時提問每分鐘多答約 30%，examples／realistic 答對 29/34、32/39（QAT 31/34、32/39）。QAT（`gemma4:12b-it-qat`）是退路：它是 Google 針對 int4 訓練的版本，比 q4_K_M 解碼慢（17 對 24 tok/s），但品質較接近原始權重。
 - **頁圖縮到長邊 1280 再給 Gemma**（`KM_CHAT_IMAGE_MAX_SIDE`）：QAT 版的圖片 token 跟像素成正比，後端送的 1600px 一頁約 860 tokens，佔首字延遲三分之二；1280 時一頁約 570 tokens，6 頁的首字延遲從約 22s 降到約 19s；768 已經會把「IL050」讀成「11050」。MLX 版的圖片 token 分 280／560／1120 三檔，1280 落在 1120 檔（約 1104 tokens）；縮到 1152 會落進 560 檔，但首字與吞吐沒有變快、答對率少 1 題，所以維持 1280。縮圖是決定性的，相同的 prompt 仍命中 prompt cache。
 - **Rerank 用圖 + 文、1 tile**（`KM_RERANK_TILES=1`）：50 筆候選從 57s（6 tiles）降到 12.6s，最相關的頁仍排第一（只量一題）。只用文字更快（4.9s），但掃描頁與圖表頁會失去影像訊號。後端從 #38 起逐頁決定送不送圖（`needs_vision`），文字頁本來就只送文字，所以 `KM_RERANK_INPUT` 維持 `both`；設成 `text` 會連需要看圖的頁也拿掉圖。
+- **Rerank 跑 MLX**（`KM_RERANK_BACKEND=mlx`、`KM_MLX_CACHE_MB=256`）：移植在 `nemotron-vl-mlx/`，直接讀同一份權重，前處理和原版逐 token、逐 pixel 相同。每筆各自計算、不補 padding，推論服務裡每題 50 筆候選從 5.90s 降到 3.96s，前 6 名和 PyTorch 相同（36 題）。MLX 的 buffer cache 預設不設限，36 題會長到 13.8 GiB，所以限制在 256 MB（只慢 2%）。embed 仍在 PyTorch，記憶體峰值和全用 PyTorch 差不多（約 10 GB）。改回 PyTorch：`KM_RERANK_BACKEND=torch`。量測見 `docs/measurements/README.md` §8.14。
 - **Embed / Rerank 閒置 10 分鐘才卸載**（`KM_IDLE_SECS=600`）：每題都卸載實測是虧的。Gemma 常駐時權重會被擠出檔案快取，每次重新載入 embed 4–5s、rerank 約 5s，比省下的 Gemma prefill（4–5s）還多；對話中兩個模型保持載入，第 2、3 輪首字從 39–44s 降到 30s。沒人用 10 分鐘後歸還約 6 GB。
 - **自編 Ollama，MLX 的 prompt 快照上限 2 GiB**（`OLLAMA_MLX_MAX_PAGED_OUT_BYTES`）：官方 MLX runner 把每題的 KV 快照留著給之後開頭相同的 prompt，上限寫死 8 GiB；每題約 0.7 GiB，十來題就滿，Ollama 佔 16 GB、swap 到 12.5 GiB，上傳加 4 人同時提問時記憶體壓力會短暫到 critical。知識庫的 prompt 之間幾乎只共用系統提示（平均只重用 6.7% 的 token），上限 2 GiB 時速度、答對率、追問首字都沒變，Ollama 降到 9.8 GB、swap 5.2 GiB。上游不收這個設定（ollama/ollama#18556 被關，#18131 未解），所以 `setup/install-ollama.sh` 從 release 的同一個 commit 套 `ollama/prefix-cache-budget.patch` 重編 Go 執行檔（`v0.35.0-km1`），MLX 與 llama.cpp 的函式庫沿用 release 附的。上游內建上限後就改回官方版。
 - **Ollama prompt cache 上限 2 GB**（`LLAMA_ARG_CACHE_RAM`，只作用於 QAT 等 llama.cpp 模型）：預設 8 GB，llama-server 實體佔用 10.8 GB，是 swap 的主因；2 GB 時 3.3 GB，仍保留最近約兩份 prompt 給追問；交替 A/B 量不出速度差。Gemma 4 sliding-window 層的 context checkpoint 每個 320 MB、預設上限 32，同理設 `LLAMA_ARG_CTX_CHECKPOINTS=4`。

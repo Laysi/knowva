@@ -422,7 +422,7 @@ Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重）�
 | MLX fp16，逐筆不補 padding | 3.79s | 0.0086 | 0/36 | 0 | 3.83 GiB |
 
 - 同一種批次方式下，MLX fp16 比 PyTorch MPS fp16 快 1.15 倍（補 padding）與 1.17 倍（不補）。最快的 MLX 比現行快 1.55 倍，其中 1.33 倍來自不補 padding，PyTorch 也做得到（#48）。#47 的門檻是 2 倍。
-- 這台的 PyTorch MPS 與 MLX 跑 matmul 一樣快（TFLOPS，`nemotron-vl-mlx/tools/matmul_peak.py`）：
+- 這台的 PyTorch MPS 與 MLX 跑 matmul 一樣快（TFLOPS，`deploy/mac-mini/nemotron-vl-mlx/tools/matmul_peak.py`）：
 
   | M×K×N | MLX fp16 | MPS fp16 | MLX bf16 | MPS bf16 |
   | --- | --- | --- | --- | --- |
@@ -443,7 +443,7 @@ Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重）�
   | MLX，cache 上限 1 GB | 3.88s | 4.6 GB |
   | PyTorch MPS | 4.34s | 5.0 GB |
 
-- 推論服務本身（`server.py` 加 `KM_RERANK_BACKEND`，在 9502 埠另跑一份，正式服務沒動）：先 embed 一次查詢讓 embed 常駐，等同有人在問的狀態，再用 HTTP 照後端格式送 36 題（`tools/knowva/server-test.sh`）。
+- 推論服務本身（`server.py` 加 `KM_RERANK_BACKEND`，在 9502 埠另跑一份，正式服務沒動）：先 embed 一次查詢讓 embed 常駐，等同有人在問的狀態，再用 HTTP 照後端格式送 36 題（`nemotron-vl-mlx/tools/knowva/server-test.sh`）。
 
   | `KM_RERANK_BACKEND` | 每題 rerank | footprint 峰值 | 跑完時 footprint | 記憶體壓力 |
   | --- | --- | --- | --- | --- |
@@ -453,4 +453,4 @@ Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重）�
 
   embed 仍跑 PyTorch，程序裡還是有 PyTorch runtime 與 MPS 快取，所以峰值幾乎一樣。結果在 `rerank-server2-20261006-025831/`（沒設上限）與 `rerank-server3-20261006-031952/`。
 - MLX 第一版載入時同時持有 bf16 原檔與 fp16 副本，可用記憶體一度剩 0.15 GiB、記憶體壓力 critical 2 秒、swap 增加 2.3 GiB；改成逐個 tensor 轉換後沒有再出現。
-- 移植與量測工具在 `knowva-mac:~/knowva-inference/nemotron-vl-mlx/`（`tools/knowva/build_sets.py` 組候選、`bench_sets.py` 量時間與 logit、`compare_runs.py` 比較、`run-sets.sh` 依序執行並取樣記憶體、`cache-sweep.sh` 與 `server-test.sh`）。以上結果都在 `knowva-mac:~/knowva-inference/bench-results/` 底下，36 題的比較在 `rerank-sets-20261006-015536/` 與 `rerank-sets2-20261006-023640/`。
+- 移植與量測工具在 `deploy/mac-mini/nemotron-vl-mlx/`（`tools/knowva/build_sets.py` 組候選、`bench_sets.py` 量時間與 logit、`compare_runs.py` 比較、`run-sets.sh` 依序執行並取樣記憶體、`cache-sweep.sh` 與 `server-test.sh`）。以上結果都在 `knowva-mac:~/knowva-inference/bench-results/` 底下，36 題的比較在 `rerank-sets-20261006-015536/` 與 `rerank-sets2-20261006-023640/`。
