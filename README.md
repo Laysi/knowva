@@ -224,19 +224,23 @@ proto run npm -- run dev          # default 主題，http://localhost:5173，pro
 
 ```bash
 cd frontend
-proto run npm -- run build        # 輸出到 frontend/dist/
+proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸出到 frontend/dist/<theme>/
 ```
+
+後端提供部署 profile 指定的主題，也就是 `frontend/dist/<theme>/`（default 主題是 `frontend/dist/default/`）。`frontend/dist/` 存在但缺少該主題時後端不會啟動，所以舊版留下的平鋪 `frontend/dist/index.html` 要用根目錄的 `run build` 重建；各主題自己的 build 只清空自己的目錄，不會刪到其他主題。
 
 `frontend/` 是 npm workspaces，lockfile 只有根目錄的 `frontend/package-lock.json`，指令一律在 `frontend/` 執行：
 
 | Workspace | 內容 |
 |---|---|
-| `packages/core`（`@knowva/core`） | `BackendAdapter`、`DocumentModel`、`useDocuments`（文件列表、輪詢、上傳、刪除）與安全化的錯誤訊息；不含 CSS 與版面。`@knowva/core/testing` 提供主題契約測試，`@knowva/core/vite` 提供擋外部網址的 build plugin |
-| `themes/default`（`@knowva/theme-default`） | 現行介面：元件、CSS、`index.html` 與 `main.tsx` |
+| `packages/core`（`@knowva/core`） | `BackendAdapter`、`DocumentModel`、`useDocuments`（文件列表、輪詢、上傳、刪除）、`useProfile`（讀 `GET /api/profile`）與安全化的錯誤訊息；不含 CSS 與版面。`@knowva/core/testing` 提供主題契約測試，`@knowva/core/vite` 提供擋外部網址的 build plugin |
+| `themes/default`（`@knowva/theme-default`） | 現行介面：元件、CSS、`index.html` 與 `main.tsx`；輸出到 `frontend/dist/default/` |
 
 根目錄的 `run lint`、`run test`、`run build` 依序跑過每個 workspace；`run dev` 與 `run preview` 啟動 default 主題，也可以用 `proto run npm -- run dev --workspace @knowva/theme-default` 指定。
 
-每個主題的 vitest 都要呼叫 `describeThemeContract`，用主題自己的元件確認產品承諾：回答完成後列出每個來源的檔名、分頁來源另列頁碼；SSE `error` 或連線失敗時顯示 core 的安全化訊息；串流途中可以停止生成；不支援的副檔名或超過 50 MiB 的檔案顯示 core 的訊息而且不送出請求。主題也要在 `:root` 宣告 `--theme-text`、`--theme-background`、`--theme-brand`、`--theme-on-brand`、`--theme-success`、`--theme-warning`、`--theme-error`，契約測試會檢查內文與三種狀態色在底色上、`on-brand` 在品牌色上的對比都達到 WCAG AA（4.5:1）。正式環境是離線 appliance，主題的 HTML、SVG 與 CSS 不能從其他主機載入字型、圖片或樣式，build 遇到這類 `src`、`href`、`url()`、`@import` 會直接失敗。
+主題不寫死品牌名稱與標語、頁面標題與說明、建議問題和輸入框提示，一律由 `useProfile()` 從 `GET /api/profile` 讀取。它回傳 `status` 為 `loading`、`ready`（附 `profile`）或 `error`（附 core 的安全化 `message`）的狀態，以及重新載入用的 `reload()`。default 主題在載入期間保留版面但不顯示文案；載入失敗時在頁首顯示該訊息與「重新載入」按鈕，問答與文件功能照常可用。載入完成後的畫面與改版前相同，分頁標題也改用 profile 的品牌名稱與標語。
+
+每個主題的 vitest 都要呼叫 `describeThemeContract`，用主題自己的元件確認產品承諾：回答完成後列出每個來源的檔名、分頁來源另列頁碼；SSE `error` 或連線失敗時顯示 core 的安全化訊息；串流途中可以停止生成；不支援的副檔名或超過 50 MiB 的檔案顯示 core 的訊息而且不送出請求；問答頁標題與建議問題來自 `/api/profile`；`/api/profile` 失敗時顯示 core 的安全化訊息，問答仍可使用。主題也要在 `:root` 宣告 `--theme-text`、`--theme-background`、`--theme-brand`、`--theme-on-brand`、`--theme-success`、`--theme-warning`、`--theme-error`，契約測試會檢查內文與三種狀態色在底色上、`on-brand` 在品牌色上的對比都達到 WCAG AA（4.5:1）。正式環境是離線 appliance，主題的 HTML、SVG 與 CSS 不能從其他主機載入字型、圖片或樣式，build 遇到這類 `src`、`href`、`url()`、`@import` 會直接失敗。
 
 ## API
 
