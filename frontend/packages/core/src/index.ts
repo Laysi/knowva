@@ -12,20 +12,21 @@ export type {
   UploadResult,
 } from "./useDocuments";
 export {
-  browserConversationStorage,
-  CONVERSATION_INDEX_KEY,
+  CONVERSATION_LOAD_FAILED_MESSAGE,
   CONVERSATION_NOT_SAVED_MESSAGE,
-  CONVERSATION_STORAGE_PREFIX,
   CONVERSATION_TITLE_LENGTH,
-  conversationMessagesKey,
-  ConversationStore,
+  conversationRequestErrorMessage,
   conversationTitle,
-  MAX_STORED_CONVERSATIONS,
-} from "./conversationStore";
-export type { StoredConversation } from "./conversationStore";
-export { createConversationListAdapter } from "./conversationAdapter";
+  MAX_CONVERSATIONS,
+} from "./conversationApi";
+export type { ConversationAction, ConversationSummary } from "./conversationApi";
+export type { ConversationListStatus } from "./conversationAdapter";
 export { useKnowvaRuntime } from "./useKnowvaRuntime";
-export type { ConversationHistory, KnowvaRuntime } from "./useKnowvaRuntime";
+export type {
+  ConversationActionResult,
+  ConversationHistory,
+  KnowvaRuntime,
+} from "./useKnowvaRuntime";
 export { isProfile, profileRequestErrorMessage, useProfile } from "./useProfile";
 export type {
   Profile,

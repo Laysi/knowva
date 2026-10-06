@@ -2,19 +2,60 @@ import { useMemo } from "react";
 import type { PropsWithChildren } from "react";
 import { RuntimeAdapterProvider, useAui } from "@assistant-ui/react";
 import type {
-  AssistantClient,
+  ExportedMessageRepository,
+  ExportedMessageRepositoryItem,
   RemoteThreadListAdapter,
   ThreadHistoryAdapter,
 } from "@assistant-ui/react";
 import { createAssistantStream } from "assistant-stream";
-import type { ConversationStore, StoredConversation } from "./conversationStore";
+import {
+  CONVERSATION_LOAD_FAILED_MESSAGE,
+  CONVERSATION_NOT_SAVED_MESSAGE,
+  ConversationRequestError,
+  conversationRequestErrorMessage,
+  conversationTitle,
+  createConversation,
+  deleteConversation,
+  fetchConversation,
+  firstQuestion,
+  isTransientFailure,
+  listConversations,
+  loadMessages,
+  saveMessage,
+} from "./conversationApi";
+import type { ConversationSummary } from "./conversationApi";
+
+export type ConversationListStatus = "loading" | "ready" | "error";
 
 type ConversationMetadata = Awaited<ReturnType<RemoteThreadListAdapter["fetch"]>>;
 
-const metadata = (conversation: StoredConversation): ConversationMetadata => ({
+/** What a conversation's history adapter needs from its list item. */
+export type ConversationListItem = {
+  remoteId: () => string | undefined;
+  /** Resolves with the server id, creating the conversation the first time. */
+  initialize: () => Promise<{ remoteId: string }>;
+  /**
+   * Asks the list adapter for the title again. assistant-ui types it as void
+   * but hands back the promise, which is awaited so a failure stays caught.
+   */
+  generateTitle: () => unknown;
+};
+
+/**
+ * A conversation the server never created. Its id never leaves the page and
+ * nothing of it is saved.
+ */
+const LOCAL_ID_PREFIX = "local:";
+let localIds = 0;
+const localId = () =>
+  `${LOCAL_ID_PREFIX}${Date.now().toString(36)}-${(localIds += 1)}`;
+export const isLocalConversationId = (id: string): boolean =>
+  id.startsWith(LOCAL_ID_PREFIX);
+
+const metadata = (conversation: ConversationSummary): ConversationMetadata => ({
   status: "regular",
   remoteId: conversation.id,
-  title: conversation.title || undefined,
+  title: conversation.title ?? undefined,
   lastMessageAt: new Date(conversation.updatedAt),
 });
 
@@ -22,75 +63,272 @@ const metadata = (conversation: StoredConversation): ConversationMetadata => ({
 const unsupported = (action: string) => () =>
   Promise.reject(new Error(`Conversations cannot be ${action}.`));
 
-/** Reads and writes the messages of the conversation it is mounted for. */
-const conversationHistory = (
-  store: ConversationStore,
-  aui: AssistantClient,
-): ThreadHistoryAdapter => ({
-  async load() {
-    const { remoteId } = aui.threadListItem().getState();
-    return remoteId === undefined ? { messages: [] } : store.load(remoteId);
-  },
-  async append(item) {
-    // The runtime does not await every append and awaits the last one inside
-    // its own error handling, so this must never reject.
-    try {
-      const { remoteId } = await aui.threadListItem().initialize();
-      store.append(remoteId, item);
-      // Show the title now rather than when the first answer ends.
-      if (item.parentId === null && item.message.role === "user") {
-        aui.threadListItem().generateTitle();
-      }
-    } catch {
-      // The store reports anything it could not keep.
-    }
-  },
-});
+type QueuedMessage = { item: ExportedMessageRepositoryItem; saved: boolean };
 
 /**
- * The conversation list for `useRemoteThreadListRuntime`, kept in `store`. Each
- * conversation's runtime gets a history adapter for its own messages, with
- * every message part, `sources` included, so a follow-up after a reload sends
- * the same `previousSources` as one without.
+ * What this page knows of the server's conversations, shared by the list
+ * adapter and the history adapter of every conversation. A failure never
+ * rejects into assistant-ui: it becomes `listStatus` and `listError`, or a
+ * conversation's `notice`, and chat keeps working.
  */
-export function createConversationListAdapter(
-  store: ConversationStore,
-): RemoteThreadListAdapter {
-  function ConversationHistoryProvider({ children }: PropsWithChildren) {
-    const aui = useAui();
-    const adapters = useMemo(
-      () => ({ history: conversationHistory(store, aui) }),
-      [aui],
-    );
-    return (
-      <RuntimeAdapterProvider adapters={adapters}>{children}</RuntimeAdapterProvider>
-    );
+export class ConversationSync {
+  private status: ConversationListStatus = "loading";
+  private error: string | null = null;
+  private readonly titles = new Map<string, string>();
+  /** Deleted, evicted or cleared: nothing is sent for it again. */
+  private readonly gone = new Set<string>();
+  /** Saving stopped for good in this page, with the line to show. */
+  private readonly stopped = new Map<string, string>();
+  /** A save failed for now; it goes again before the next message. */
+  private readonly retrying = new Set<string>();
+  private readonly queues = new Map<string, QueuedMessage[]>();
+  /** Each conversation's saves run one at a time, in the order they came. */
+  private readonly chains = new Map<string, Promise<void>>();
+  private readonly listeners = new Set<() => void>();
+  private readonly removedListeners = new Set<(ids: readonly string[]) => void>();
+
+  get listStatus(): ConversationListStatus {
+    return this.status;
   }
 
-  return {
-    unstable_Provider: ConversationHistoryProvider,
-    async list() {
-      return { threads: store.list().map(metadata) };
-    },
-    async fetch(id) {
-      const conversation = store.get(id);
-      if (!conversation) throw new Error("Conversation not found.");
-      return metadata(conversation);
-    },
-    async initialize() {
-      return { remoteId: store.newId(), externalId: undefined };
-    },
-    async delete(id) {
-      store.remove(id);
-    },
-    async generateTitle(id, messages) {
-      const title = store.titleFor(id, messages);
-      return createAssistantStream((controller) => {
-        controller.appendText(title);
-      });
-    },
-    rename: unsupported("renamed"),
-    archive: unsupported("archived"),
-    unarchive: unsupported("unarchived"),
-  };
+  /** Safe text for the last failed list load, otherwise null. */
+  get listError(): string | null {
+    return this.error;
+  }
+
+  /** The line to show for the conversation with this server id, or null. */
+  notice(remoteId: string | undefined): string | null {
+    if (remoteId === undefined) return null;
+    const stopped = this.stopped.get(remoteId);
+    if (stopped !== undefined) return stopped;
+    return this.retrying.has(remoteId) ? CONVERSATION_NOT_SAVED_MESSAGE : null;
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  /** Called with the server ids of conversations deleted to stay at the limit. */
+  onRemoved(listener: (ids: readonly string[]) => void): () => void {
+    this.removedListeners.add(listener);
+    return () => this.removedListeners.delete(listener);
+  }
+
+  /** Forgets a conversation the server no longer has. */
+  markGone(remoteId: string): void {
+    this.gone.add(remoteId);
+    this.titles.delete(remoteId);
+    this.queues.delete(remoteId);
+    const wasStopped = this.stopped.delete(remoteId);
+    const wasRetrying = this.retrying.delete(remoteId);
+    if (wasStopped || wasRetrying) this.emit();
+  }
+
+  /** Resolves once every save asked for so far in this conversation has finished. */
+  settled(remoteId: string): Promise<void> {
+    return this.chains.get(remoteId) ?? Promise.resolve();
+  }
+
+  /**
+   * Queues one message behind the earlier ones of its conversation. Resolves
+   * true once it is saved and false otherwise; never rejects.
+   */
+  save(remoteId: string, item: ExportedMessageRepositoryItem): Promise<boolean> {
+    if (this.gone.has(remoteId) || this.stopped.has(remoteId)) {
+      return Promise.resolve(false);
+    }
+    const queued: QueuedMessage = { item, saved: false };
+    const queue = this.queues.get(remoteId) ?? [];
+    queue.push(queued);
+    this.queues.set(remoteId, queue);
+    const run = this.settled(remoteId)
+      .then(() => this.flush(remoteId))
+      .catch(() => undefined);
+    this.chains.set(remoteId, run);
+    return run.then(() => queued.saved);
+  }
+
+  /** Stops saving a conversation for the rest of this page's life. */
+  stop(remoteId: string, notice: string): void {
+    this.queues.delete(remoteId);
+    this.retrying.delete(remoteId);
+    this.stopped.set(remoteId, notice);
+    this.emit();
+  }
+
+  private async flush(remoteId: string): Promise<void> {
+    const queue = this.queues.get(remoteId) ?? [];
+    while (queue.length > 0) {
+      if (this.gone.has(remoteId) || this.stopped.has(remoteId)) return;
+      const next = queue[0]!;
+      try {
+        const conversation = await saveMessage(remoteId, next.item);
+        if (conversation.title) this.titles.set(remoteId, conversation.title);
+      } catch (error) {
+        if (isTransientFailure(error)) {
+          // Kept, in order, for the next message of this conversation.
+          this.setRetrying(remoteId, true);
+        } else {
+          // Refused for good: over a limit, gone, or out of order.
+          this.stop(remoteId, CONVERSATION_NOT_SAVED_MESSAGE);
+        }
+        return;
+      }
+      queue.shift();
+      next.saved = true;
+    }
+    this.setRetrying(remoteId, false);
+  }
+
+  private setRetrying(remoteId: string, retrying: boolean): void {
+    if (this.retrying.has(remoteId) === retrying) return;
+    if (retrying) this.retrying.add(remoteId);
+    else this.retrying.delete(remoteId);
+    this.emit();
+  }
+
+  private setList(status: ConversationListStatus, error: string | null): void {
+    if (this.status === status && this.error === error) return;
+    this.status = status;
+    this.error = error;
+    this.emit();
+  }
+
+  private emit(): void {
+    for (const listener of this.listeners) listener();
+  }
+
+  /** The conversation list for `useRemoteThreadListRuntime`. */
+  listAdapter(): RemoteThreadListAdapter {
+    // Each conversation's runtime gets a history adapter bound to its list item.
+    const ConversationHistoryProvider = ({ children }: PropsWithChildren) => {
+      const aui = useAui();
+      const adapters = useMemo(
+        () => ({
+          history: this.historyAdapter({
+            remoteId: () => aui.threadListItem().getState().remoteId,
+            initialize: () => aui.threadListItem().initialize(),
+            generateTitle: () => aui.threadListItem().generateTitle(),
+          }),
+        }),
+        [aui],
+      );
+      return (
+        <RuntimeAdapterProvider adapters={adapters}>{children}</RuntimeAdapterProvider>
+      );
+    };
+
+    return {
+      unstable_Provider: ConversationHistoryProvider,
+      list: async () => {
+        this.setList("loading", null);
+        try {
+          const conversations = await listConversations();
+          for (const { id, title } of conversations) {
+            if (title) this.titles.set(id, title);
+          }
+          this.setList("ready", null);
+          return {
+            threads: conversations
+              .filter(({ id }) => !this.gone.has(id))
+              .map(metadata),
+          };
+        } catch (error) {
+          const status =
+            error instanceof ConversationRequestError ? error.status : undefined;
+          this.setList("error", conversationRequestErrorMessage("list", status));
+          // assistant-ui keeps the list it already had.
+          throw error;
+        }
+      },
+      fetch: async (remoteId) => {
+        if (this.gone.has(remoteId) || isLocalConversationId(remoteId)) {
+          throw new ConversationRequestError(404);
+        }
+        return metadata(await fetchConversation(remoteId));
+      },
+      initialize: async () => {
+        try {
+          const { conversation, removedIds } = await createConversation();
+          if (removedIds.length > 0) {
+            for (const id of removedIds) this.markGone(id);
+            for (const listener of this.removedListeners) listener(removedIds);
+          }
+          return { remoteId: conversation.id, externalId: undefined };
+        } catch {
+          // Sending waits on this, so it never fails: answer, and say it is not kept.
+          const remoteId = localId();
+          this.stop(remoteId, CONVERSATION_NOT_SAVED_MESSAGE);
+          return { remoteId, externalId: undefined };
+        }
+      },
+      delete: async (remoteId) => {
+        if (!this.gone.has(remoteId) && !isLocalConversationId(remoteId)) {
+          try {
+            await deleteConversation(remoteId);
+          } catch (error) {
+            // Already gone is what was asked for.
+            const missing =
+              error instanceof ConversationRequestError && error.status === 404;
+            if (!missing) throw error;
+          }
+        }
+        this.markGone(remoteId);
+      },
+      generateTitle: async (remoteId, messages) => {
+        // The server titles a conversation as its first question is saved.
+        await this.settled(remoteId);
+        const title =
+          this.titles.get(remoteId) ?? conversationTitle(firstQuestion(messages));
+        // An empty stream would clear the title, so there is always a part.
+        return createAssistantStream((controller) => {
+          controller.appendText(title);
+        });
+      },
+      rename: unsupported("renamed"),
+      archive: unsupported("archived"),
+      unarchive: unsupported("unarchived"),
+    };
+  }
+
+  /**
+   * Reads and saves the messages of one conversation, every part included, so
+   * a follow-up after a reload sends the same `previousSources` as one without.
+   */
+  historyAdapter(listItem: ConversationListItem): ThreadHistoryAdapter {
+    return {
+      load: async (): Promise<ExportedMessageRepository> => {
+        const remoteId = listItem.remoteId();
+        if (
+          remoteId === undefined ||
+          isLocalConversationId(remoteId) ||
+          this.gone.has(remoteId)
+        ) {
+          return { messages: [] };
+        }
+        try {
+          return await loadMessages(remoteId);
+        } catch {
+          // Saving on top of a conversation that did not load would split it.
+          this.stop(remoteId, CONVERSATION_LOAD_FAILED_MESSAGE);
+          return { messages: [] };
+        }
+      },
+      // The runtime does not await every append and awaits the last one inside
+      // its own error handling, so this never rejects.
+      append: async (item) => {
+        try {
+          const { remoteId } = await listItem.initialize();
+          const saved = await this.save(remoteId, item);
+          // Show the server's title now rather than when the first answer ends.
+          if (saved && item.parentId === null && item.message.role === "user") {
+            await listItem.generateTitle();
+          }
+        } catch {
+          // Reported through `notice`.
+        }
+      },
+    };
+  }
 }

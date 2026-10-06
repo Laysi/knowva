@@ -15,15 +15,10 @@ import type { MockInstance } from "vitest";
 import { CHAT_ERROR_MESSAGES, chatRequestErrorMessage } from "../BackendAdapter";
 import type { ChatSource } from "../BackendAdapter";
 import {
-  CONVERSATION_INDEX_KEY,
   CONVERSATION_NOT_SAVED_MESSAGE,
-  CONVERSATION_STORAGE_PREFIX,
   CONVERSATION_TITLE_LENGTH,
-  conversationMessagesKey,
-  ConversationStore,
-  MAX_STORED_CONVERSATIONS,
-} from "../conversationStore";
-import type { StoredConversation } from "../conversationStore";
+  conversationRequestErrorMessage,
+} from "../conversationApi";
 import { MAX_UPLOAD_BYTES, validateUploadFile } from "../DocumentModel";
 import { profileRequestErrorMessage } from "../useProfile";
 import type { Profile } from "../useProfile";
@@ -35,13 +30,13 @@ export type ThemeContractHarness = {
   /**
    * The theme's chat surface with its own runtime wiring (`useKnowvaRuntime`),
    * usually the whole app opened on chat. Rendering it again after `cleanup`
-   * stands for a reload. The contract drives it like a person: it types into
-   * the only textbox, presses the button named 送出, and stops with the button
-   * named 停止. For conversation history it presses the button named 新對話,
-   * opens a conversation with the button named by its title, deletes one with
-   * the button whose name holds 刪除 and the title, and clears them all with
-   * 清除全部對話 followed by 確定清除 in the page. It reads storage through
-   * jsdom's localStorage and clears it around every test.
+   * stands for a reload; the contract's in-memory copy of the
+   * `/api/conversations` routes keeps what was saved. The contract drives it
+   * like a person: it types into the only textbox, presses the button named
+   * 送出, and stops with the button named 停止. For conversation history it
+   * presses the button named 新對話, opens a conversation with the button named
+   * by its title, deletes one with the button whose name holds 刪除 and the
+   * title, and clears them all with 清除全部對話 followed by 確定清除 in the page.
    */
   renderChat: () => ReactElement;
   /**
@@ -134,20 +129,161 @@ const hangingSseResponse = (text: string, signal: AbortSignal) =>
 
 type Handler = (init: RequestInit | undefined) => Response | Promise<Response>;
 
+type StoredConversation = {
+  id: string;
+  title: string | null;
+  createdAt: string;
+  updatedAt: string;
+  messages: { parentId: string | null; message: Record<string, unknown> }[];
+};
+
+const MOCK_CONVERSATION_LIMIT = 50;
+const CONVERSATION_ROUTE = /^\/api\/conversations(?:\/([^/]+)(\/messages)?)?$/;
+
+/**
+ * The backend's conversation routes, in memory, for one test: one browser's
+ * list, titled from the first question, with saves that need their parent
+ * saved first. A re-render talks to the same copy, so it stands for a reload.
+ */
+class ConversationServer {
+  readonly conversations: StoredConversation[] = [];
+  /** When set, answers every message save instead. */
+  saveFailure: (() => Response) | null = null;
+  /** When set, answers every request to start a conversation instead. */
+  createFailure: (() => Response) | null = null;
+  private clock = Date.UTC(2026, 0, 1);
+  private created = 0;
+
+  /** Most recently updated first. */
+  list(): StoredConversation[] {
+    return [...this.conversations].sort((a, b) =>
+      b.updatedAt.localeCompare(a.updatedAt),
+    );
+  }
+
+  /** Everything saved, as text, to wait for a save to land. */
+  text(): string {
+    return JSON.stringify(this.conversations);
+  }
+
+  handle(method: string, path: string, init: RequestInit | undefined): Response | null {
+    const match = CONVERSATION_ROUTE.exec(path);
+    if (!match) return null;
+    const [, id, messages] = match;
+    if (id === undefined) {
+      if (method === "GET") return Response.json(this.list().map(summary));
+      if (method === "POST") return this.create();
+      if (method === "DELETE") {
+        this.conversations.length = 0;
+        return new Response(null, { status: 204 });
+      }
+      return new Response(null, { status: 405 });
+    }
+    const conversation = this.conversations.find((stored) => stored.id === id);
+    if (!conversation) return new Response("找不到這串對話。", { status: 404 });
+    if (messages === undefined) {
+      if (method === "GET") return Response.json(summary(conversation));
+      if (method === "DELETE") {
+        this.conversations.splice(this.conversations.indexOf(conversation), 1);
+        return new Response(null, { status: 204 });
+      }
+      return new Response(null, { status: 405 });
+    }
+    if (method === "GET") {
+      return Response.json(
+        conversation.messages.map(({ parentId, message }) => ({ parentId, message })),
+      );
+    }
+    if (method === "POST") return this.save(conversation, init);
+    return new Response(null, { status: 405 });
+  }
+
+  private tick(): string {
+    this.clock += 1000;
+    return new Date(this.clock).toISOString();
+  }
+
+  private create(): Response {
+    if (this.createFailure) return this.createFailure();
+    this.created += 1;
+    const now = this.tick();
+    const conversation: StoredConversation = {
+      id: `00000000-0000-4000-8000-${String(this.created).padStart(12, "0")}`,
+      title: null,
+      createdAt: now,
+      updatedAt: now,
+      messages: [],
+    };
+    this.conversations.push(conversation);
+    const removed = this.list().slice(MOCK_CONVERSATION_LIMIT);
+    for (const old of removed) {
+      this.conversations.splice(this.conversations.indexOf(old), 1);
+    }
+    return Response.json(
+      {
+        conversation: summary(conversation),
+        removedIds: removed.map(({ id }) => id),
+      },
+      { status: 201 },
+    );
+  }
+
+  private save(conversation: StoredConversation, init: RequestInit | undefined): Response {
+    if (this.saveFailure) return this.saveFailure();
+    const { parentId, message } = JSON.parse(String(init?.body)) as {
+      parentId: string | null;
+      message: Record<string, unknown>;
+    };
+    const saved = conversation.messages;
+    if (parentId !== null && !saved.some((entry) => entry.message.id === parentId)) {
+      return new Response("前一則訊息尚未保存，這則訊息無法保存。", { status: 409 });
+    }
+    const at = saved.findIndex((entry) => entry.message.id === message.id);
+    if (at >= 0) saved[at] = { parentId, message };
+    else saved.push({ parentId, message });
+    if (conversation.title === null && message.role === "user") {
+      const question = (message.content as { type: string; text?: string }[])
+        .flatMap((part) => (part.type === "text" && part.text ? [part.text] : []))
+        .join("\n");
+      const title = Array.from(question.trim().replace(/\s+/g, " "))
+        .slice(0, CONVERSATION_TITLE_LENGTH)
+        .join("");
+      conversation.title = title || null;
+    }
+    conversation.updatedAt = this.tick();
+    return Response.json({ conversation: summary(conversation) });
+  }
+}
+
+const summary = ({ id, title, createdAt, updatedAt }: StoredConversation) => ({
+  id,
+  title,
+  createdAt,
+  updatedAt,
+});
+
 /**
  * Unlisted routes answer 404. `GET /api/profile` answers the contract profile
- * unless a test lists it.
+ * and `/api/conversations` goes to `conversations` unless a test lists the
+ * exact route.
  */
-const stubFetch = (handlers: Record<string, Handler>) => {
+const stubFetch = (
+  handlers: Record<string, Handler>,
+  conversations: ConversationServer = new ConversationServer(),
+) => {
   const routes: Record<string, Handler> = {
     "GET /api/profile": () => Response.json(CONTRACT_PROFILE),
     ...handlers,
   };
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const key = `${init?.method ?? "GET"} ${String(input)}`;
+    const method = init?.method ?? "GET";
+    const key = `${method} ${String(input)}`;
     const handler = routes[key];
-    if (!handler) return new Response(null, { status: 404 });
-    return handler(init);
+    if (handler) return handler(init);
+    return (
+      conversations.handle(method, String(input), init) ??
+      new Response(null, { status: 404 })
+    );
   });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
@@ -250,38 +386,23 @@ const answerEvents = (text: string, sources: readonly ChatSource[]) => [
 ];
 
 /** Answers the n-th chat request with `answers[n]`, cycling, and keeps every body. */
-const stubChat = (answers: readonly (readonly unknown[])[]) => {
+const stubChat = (
+  answers: readonly (readonly unknown[])[],
+  conversations: ConversationServer = new ConversationServer(),
+  handlers: Record<string, Handler> = {},
+) => {
   const bodies: unknown[] = [];
-  const fetchMock = stubFetch({
-    "POST /api/chat": (init) => {
-      bodies.push(JSON.parse(String(init?.body)));
-      return sseResponse(answers[(bodies.length - 1) % answers.length]!);
+  const fetchMock = stubFetch(
+    {
+      "POST /api/chat": (init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return sseResponse(answers[(bodies.length - 1) % answers.length]!);
+      },
+      ...handlers,
     },
-  });
-  return { fetchMock, bodies };
-};
-
-const storedKeys = (): string[] => {
-  const keys: string[] = [];
-  for (let index = 0; index < localStorage.length; index += 1) {
-    const key = localStorage.key(index);
-    if (key?.startsWith(CONVERSATION_STORAGE_PREFIX)) keys.push(key);
-  }
-  return keys.sort();
-};
-
-/** Everything kept, as text, to wait for a write to land. */
-const storedText = () =>
-  storedKeys()
-    .map((key) => localStorage.getItem(key))
-    .join("\n");
-
-/** The stored list, most recently updated first. */
-const storedConversations = (): StoredConversation[] => {
-  const raw = localStorage.getItem(CONVERSATION_INDEX_KEY);
-  return raw
-    ? (JSON.parse(raw) as { conversations: StoredConversation[] }).conversations
-    : [];
+    conversations,
+  );
+  return { fetchMock, bodies, conversations };
 };
 
 const conversationButtons = (title: string) =>
@@ -294,64 +415,6 @@ const deleteButton = (title: string) =>
     name: (name) => name.includes("刪除") && name.includes(title),
   });
 
-/** Makes every use of localStorage throw, as a browser blocking site data does. */
-const blockStorage = () => {
-  const own = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
-  Object.defineProperty(globalThis, "localStorage", {
-    configurable: true,
-    get() {
-      throw new DOMException("The operation is insecure.", "SecurityError");
-    },
-  });
-  return () => {
-    if (own) Object.defineProperty(globalThis, "localStorage", own);
-    else delete (globalThis as { localStorage?: Storage }).localStorage;
-  };
-};
-
-/**
- * `count` answered conversations, a minute apart from 2026-01-01 on, so the
- * first is the least recently updated.
- */
-const seedConversations = (count: number) => {
-  let clock = Date.UTC(2026, 0, 1);
-  const store = new ConversationStore(localStorage, () => clock);
-  return Array.from({ length: count }, (_, index) => {
-    clock += 60_000;
-    const id = store.newId();
-    const title = `舊對話 ${String(index + 1).padStart(2, "0")}`;
-    store.append(id, {
-      parentId: null,
-      message: {
-        id: `question-${index}`,
-        role: "user",
-        createdAt: new Date(clock),
-        content: [{ type: "text", text: title }],
-        attachments: [],
-        metadata: { custom: {} },
-      },
-    });
-    store.append(id, {
-      parentId: `question-${index}`,
-      message: {
-        id: `answer-${index}`,
-        role: "assistant",
-        createdAt: new Date(clock),
-        content: [{ type: "text", text: `舊回答 ${index + 1}` }],
-        status: { type: "complete", reason: "stop" },
-        metadata: {
-          unstable_state: null,
-          unstable_annotations: [],
-          unstable_data: [],
-          steps: [],
-          custom: {},
-        },
-      },
-    });
-    return { id, title };
-  });
-};
-
 /**
  * The product promises every theme keeps, run against the theme's own
  * components. Call it once from a test file in each theme that sets
@@ -362,7 +425,6 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
     let alert: MockInstance<typeof window.alert>;
     let confirm: MockInstance<typeof window.confirm>;
     let removeLayoutStubs: () => void = () => undefined;
-    let unblockStorage: () => void = () => undefined;
 
     beforeEach(() => {
       if (typeof document === "undefined") {
@@ -370,8 +432,6 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
           "the theme contract needs a DOM: add `// @vitest-environment jsdom` to the test file",
         );
       }
-      // Conversations from one test must not show up in the next.
-      localStorage.clear();
       removeLayoutStubs = installLayoutStubs();
       alert = vi.spyOn(window, "alert").mockImplementation(() => undefined);
       confirm = vi.spyOn(window, "confirm").mockImplementation(() => true);
@@ -380,11 +440,8 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
     afterEach(() => {
       cleanup();
       removeLayoutStubs();
-      unblockStorage();
-      unblockStorage = () => undefined;
       vi.restoreAllMocks();
       vi.unstubAllGlobals();
-      localStorage.clear();
     });
 
     it("shows every source's filename, and the page of a page source, once the answer completes", async () => {
@@ -528,7 +585,7 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
     const FOLLOW_UP_ANSWER = "請依照交接筆記逐項確認。";
 
     it("keeps both questions, answers and their sources after a reload", async () => {
-      stubChat([
+      const { conversations } = stubChat([
         answerEvents(FIRST_ANSWER, [PAGE_SOURCE]),
         answerEvents(FOLLOW_UP_ANSWER, [TEXT_SOURCE]),
       ]);
@@ -538,14 +595,16 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
       await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
       await ask(FOLLOW_UP);
       await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
-      await waitFor(() => expect(storedText()).toContain(FOLLOW_UP_ANSWER));
+      await waitFor(() => expect(conversations.text()).toContain(FOLLOW_UP_ANSWER));
 
       cleanup();
       render(harness.renderChat());
 
       await waitFor(() => {
         for (const text of [
+          FIRST_QUESTION,
           FIRST_ANSWER,
+          FOLLOW_UP,
           FOLLOW_UP_ANSWER,
           PAGE_SOURCE.filename,
           TEXT_SOURCE.filename,
@@ -560,7 +619,7 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
     });
 
     it("sends the same follow-up request after a reload as without one", async () => {
-      const { bodies } = stubChat([
+      const { bodies, conversations } = stubChat([
         answerEvents(FIRST_ANSWER, [PAGE_SOURCE, TEXT_SOURCE]),
         answerEvents(FOLLOW_UP_ANSWER, [TEXT_SOURCE]),
       ]);
@@ -571,13 +630,15 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
       await ask(FOLLOW_UP);
       await waitFor(() => expect(bodies).toHaveLength(2));
       await waitFor(() => expect(pageText()).toContain(FOLLOW_UP_ANSWER));
+      await waitFor(() => expect(conversations.text()).toContain(FOLLOW_UP_ANSWER));
       cleanup();
-      localStorage.clear();
+      // Start over from an empty history, so nothing is reopened yet.
+      conversations.conversations.length = 0;
 
       render(harness.renderChat());
       await ask(FIRST_QUESTION);
       await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
-      await waitFor(() => expect(storedText()).toContain(FIRST_ANSWER));
+      await waitFor(() => expect(conversations.text()).toContain(FIRST_ANSWER));
       cleanup();
       render(harness.renderChat());
       await waitFor(() => expect(pageText()).toContain(FIRST_ANSWER));
@@ -590,8 +651,8 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
       });
     });
 
-    it("starts, switches, deletes and clears conversations along with their storage", async () => {
-      stubChat([
+    it("starts, switches, deletes and clears conversations on the server", async () => {
+      const { conversations } = stubChat([
         answerEvents(FIRST_ANSWER, [PAGE_SOURCE]),
         answerEvents(FOLLOW_UP_ANSWER, [TEXT_SOURCE]),
       ]);
@@ -603,21 +664,14 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
       await waitFor(() => expect(pageText()).not.toContain(FIRST_ANSWER));
       await ask(FOLLOW_UP);
       await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
-      await waitFor(() =>
-        expect(storedConversations().map(({ title }) => title)).toEqual([
+      await waitFor(() => {
+        expect(conversations.list().map(({ title }) => title)).toEqual([
           FOLLOW_UP,
           FIRST_QUESTION,
-        ]),
-      );
-      const [second, first] = storedConversations();
-      await waitFor(() => expect(storedText()).toContain(FOLLOW_UP_ANSWER));
-      expect(storedKeys()).toEqual(
-        [
-          CONVERSATION_INDEX_KEY,
-          conversationMessagesKey(first!.id),
-          conversationMessagesKey(second!.id),
-        ].sort(),
-      );
+        ]);
+        expect(conversations.text()).toContain(FOLLOW_UP_ANSWER);
+      });
+      const [second, first] = conversations.list();
 
       await waitFor(() => expect(conversationButtons(FIRST_QUESTION)).toHaveLength(1));
       fireEvent.click(conversationButtons(FIRST_QUESTION)[0]!);
@@ -628,17 +682,16 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
 
       fireEvent.click(deleteButton(FOLLOW_UP));
       await waitFor(() =>
-        expect(localStorage.getItem(conversationMessagesKey(second!.id))).toBeNull(),
+        expect(conversations.list().map(({ id }) => id)).toEqual([first!.id]),
       );
       await waitFor(() => expect(conversationButtons(FOLLOW_UP)).toHaveLength(0));
-      expect(storedConversations().map(({ id }) => id)).toEqual([first!.id]);
-      expect(localStorage.getItem(conversationMessagesKey(first!.id))).not.toBeNull();
+      expect(conversations.text()).not.toContain(second!.id);
       expect(pageText()).toContain(FIRST_ANSWER);
 
       fireEvent.click(screen.getByRole("button", { name: /清除全部對話/ }));
-      expect(storedKeys()).toHaveLength(2);
+      expect(conversations.list()).toHaveLength(1);
       fireEvent.click(await screen.findByRole("button", { name: /確定清除/ }));
-      await waitFor(() => expect(storedKeys()).toEqual([]));
+      await waitFor(() => expect(conversations.list()).toEqual([]));
       await waitFor(() => {
         expect(conversationButtons(FIRST_QUESTION)).toHaveLength(0);
         expect(pageText()).not.toContain(FIRST_ANSWER);
@@ -646,7 +699,7 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
       expect(confirm).not.toHaveBeenCalled();
     });
 
-    it("titles a conversation with the first 30 characters of its first question, without a request", async () => {
+    it("shows the title the server made from the first 30 characters of the first question, without a model request", async () => {
       // Two characters outside the BMP: 30 characters are 32 UTF-16 units.
       const question =
         "𠀋𡈽三號廠區冷卻水塔今年第三季有哪些異常紀錄、各自如何處理、負責人是誰？";
@@ -654,7 +707,9 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
       expect(characters.length).toBeGreaterThan(CONVERSATION_TITLE_LENGTH);
       const title = characters.slice(0, CONVERSATION_TITLE_LENGTH).join("");
       const tooLong = characters.slice(0, CONVERSATION_TITLE_LENGTH + 1).join("");
-      const { fetchMock } = stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
+      const { fetchMock, conversations } = stubChat([
+        answerEvents(FIRST_ANSWER, [PAGE_SOURCE]),
+      ]);
       render(harness.renderChat());
 
       await ask(question);
@@ -662,110 +717,80 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
       await waitFor(() => expect(conversationButtons(title)).toHaveLength(1));
 
       expect(conversationButtons(tooLong)).toHaveLength(0);
-      await waitFor(() =>
-        expect(storedConversations().map((stored) => stored.title)).toEqual([title]),
-      );
+      expect(conversations.list().map((stored) => stored.title)).toEqual([title]);
       expect(
-        sentRequests(fetchMock).filter((request) => request !== "GET /api/profile"),
+        sentRequests(fetchMock).filter(
+          (request) =>
+            request !== "GET /api/profile" &&
+            !request.includes(" /api/conversations"),
+        ),
       ).toEqual(["POST /api/chat"]);
     });
 
-    it(`deletes the least recently updated conversation when a ${MAX_STORED_CONVERSATIONS + 1}st one starts`, async () => {
-      const seeded = seedConversations(MAX_STORED_CONVERSATIONS);
-      const oldest = seeded[0]!;
-      const next = seeded[1]!;
-      stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
-      render(harness.renderChat());
-      await waitFor(() => expect(conversationButtons(oldest.title)).toHaveLength(1));
+    const saveFailures = [
+      {
+        title: "the server cannot save a message",
+        fail: (server: ConversationServer) => {
+          server.saveFailure = () => new Response(RAW_SECRET, { status: 500 });
+        },
+      },
+      {
+        title: "a message is over the server's limit",
+        fail: (server: ConversationServer) => {
+          server.saveFailure = () => new Response(RAW_SECRET, { status: 413 });
+        },
+      },
+      {
+        title: "the server cannot start the conversation",
+        fail: (server: ConversationServer) => {
+          server.createFailure = () => new Response(RAW_SECRET, { status: 503 });
+        },
+      },
+    ];
 
-      fireEvent.click(await screen.findByRole("button", { name: "新對話" }));
-      await ask(FIRST_QUESTION);
-      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
-
-      await waitFor(() => expect(conversationButtons(oldest.title)).toHaveLength(0));
-      expect(localStorage.getItem(conversationMessagesKey(oldest.id))).toBeNull();
-      expect(localStorage.getItem(conversationMessagesKey(next.id))).not.toBeNull();
-      expect(conversationButtons(next.title)).toHaveLength(1);
-      await waitFor(() => {
-        const stored = storedConversations();
-        expect(stored).toHaveLength(MAX_STORED_CONVERSATIONS);
-        expect(stored[0]!.title).toBe(FIRST_QUESTION);
-        expect(stored.map(({ id }) => id)).not.toContain(oldest.id);
-      });
-    });
-
-    it("ignores and removes corrupt stored history, and still answers", async () => {
-      localStorage.setItem(CONVERSATION_INDEX_KEY, '{"version":1,"conversations":[');
-      localStorage.setItem(conversationMessagesKey("corrupt"), "{not json");
-      stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
-      render(harness.renderChat());
-
-      await ask(FIRST_QUESTION);
-      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
-
-      await waitFor(() => expect(storedConversations()).toHaveLength(1));
-      expect(localStorage.getItem(conversationMessagesKey("corrupt"))).toBeNull();
-      expect(pageText()).not.toContain(CONVERSATION_NOT_SAVED_MESSAGE);
-    });
-
-    it("ignores and removes history of an unknown version, and still answers", async () => {
-      localStorage.setItem(
-        CONVERSATION_INDEX_KEY,
-        JSON.stringify({
-          version: 2,
-          conversations: [
-            { id: "future", title: "新版本留下的對話", createdAt: 1, updatedAt: 2 },
+    for (const { title, fail } of saveFailures) {
+      it(`keeps answering and says the conversation is not saved when ${title}`, async () => {
+        const conversations = new ConversationServer();
+        fail(conversations);
+        const { bodies } = stubChat(
+          [
+            answerEvents(FIRST_ANSWER, [PAGE_SOURCE]),
+            answerEvents(FOLLOW_UP_ANSWER, [TEXT_SOURCE]),
           ],
-        }),
-      );
-      localStorage.setItem(
-        conversationMessagesKey("future"),
-        JSON.stringify({ version: 2, headId: "m1", messages: [] }),
-      );
-      stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
-      render(harness.renderChat());
+          conversations,
+        );
+        render(harness.renderChat());
 
-      await ask(FIRST_QUESTION);
-      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
+        await ask(FIRST_QUESTION);
+        await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
+        await waitFor(() =>
+          expect(pageText()).toContain(CONVERSATION_NOT_SAVED_MESSAGE),
+        );
+        await ask(FOLLOW_UP);
+        await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
 
-      expect(pageText()).not.toContain("新版本留下的對話");
-      expect(localStorage.getItem(conversationMessagesKey("future"))).toBeNull();
-      await waitFor(() =>
-        expect(storedConversations().map(({ title }) => title)).toEqual([
-          FIRST_QUESTION,
-        ]),
-      );
-    });
-
-    it("answers without saving, and says so, when the browser blocks storage", async () => {
-      unblockStorage = blockStorage();
-      stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
-      render(harness.renderChat());
-
-      await waitFor(() =>
-        expect(pageText()).toContain(CONVERSATION_NOT_SAVED_MESSAGE),
-      );
-      await ask(FIRST_QUESTION);
-      await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
-      expect(pageText()).toContain(FIRST_ANSWER);
-      expect(pageText()).toContain(CONVERSATION_NOT_SAVED_MESSAGE);
-    });
-
-    it("answers without saving, and says so, when storage is full", async () => {
-      vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-        throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+        expect(bodies).toHaveLength(2);
+        expect(pageText()).toContain(FIRST_ANSWER);
+        expect(pageText()).toContain(FOLLOW_UP_ANSWER);
+        expect(pageText()).toContain(CONVERSATION_NOT_SAVED_MESSAGE);
+        expect(pageText()).not.toContain(RAW_SECRET);
       });
-      stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])]);
+    }
+
+    it("shows core's safe message and keeps chat usable when the conversation list cannot load", async () => {
+      const { conversations } = stubChat([answerEvents(FIRST_ANSWER, [PAGE_SOURCE])], undefined, {
+        "GET /api/conversations": () => new Response(RAW_SECRET, { status: 500 }),
+      });
       render(harness.renderChat());
 
-      expect(pageText()).not.toContain(CONVERSATION_NOT_SAVED_MESSAGE);
+      await expectShown(conversationRequestErrorMessage("list", 500), alert);
+      expect(pageText()).not.toContain(RAW_SECRET);
       await ask(FIRST_QUESTION);
       await waitFor(() => expect(pageText()).toContain(PAGE_SOURCE.filename));
-      await waitFor(() =>
-        expect(pageText()).toContain(CONVERSATION_NOT_SAVED_MESSAGE),
-      );
+
       expect(pageText()).toContain(FIRST_ANSWER);
-      expect(storedKeys()).toEqual([]);
+      expect(pageText()).not.toContain(RAW_SECRET);
+      await waitFor(() => expect(conversations.text()).toContain(FIRST_ANSWER));
     });
 
     it("declares --theme-* colours whose pairs meet WCAG AA", () => {

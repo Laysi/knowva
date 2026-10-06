@@ -1,10 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
-import {
-  CONVERSATION_NOT_SAVED_MESSAGE,
-  useKnowvaRuntime,
-  useProfile,
-} from "@knowva/core";
+import { useKnowvaRuntime, useProfile } from "@knowva/core";
 import type { ProfileSuggestion } from "@knowva/core";
 import { Thread } from "./Thread";
 import { Documents } from "./Documents";
@@ -89,9 +85,9 @@ function App() {
               <div className="chat">
                 <Conversations history={history} />
                 <div className="chat-main">
-                  {!history.saved && (
+                  {history.notice && (
                     <p className="history-notice" role="status">
-                      {CONVERSATION_NOT_SAVED_MESSAGE}
+                      {history.notice}
                     </p>
                   )}
                   <Thread

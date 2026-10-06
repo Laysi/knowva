@@ -4,13 +4,20 @@ import {
   ThreadListPrimitive,
   useAuiState,
 } from "@assistant-ui/react";
-import { MAX_STORED_CONVERSATIONS } from "@knowva/core";
-import type { ConversationHistory } from "@knowva/core";
+import { MAX_CONVERSATIONS } from "@knowva/core";
+import type { ConversationActionResult, ConversationHistory } from "@knowva/core";
 import { ChevronDownIcon, HistoryIcon, PlusIcon, TrashIcon } from "./Icons";
 
 const UNTITLED = "未命名對話";
 
-const ConversationItem = ({ onOpen }: { onOpen: () => void }) => {
+const ConversationItem = ({
+  onOpen,
+  onDelete,
+}: {
+  onOpen: () => void;
+  onDelete: (id: string) => void;
+}) => {
+  const id = useAuiState((s) => s.threadListItem.id);
   const title = useAuiState((s) => s.threadListItem.title) || UNTITLED;
 
   return (
@@ -22,13 +29,15 @@ const ConversationItem = ({ onOpen }: { onOpen: () => void }) => {
       >
         <span className="conversation-title">{title}</span>
       </ThreadListItemPrimitive.Trigger>
-      <ThreadListItemPrimitive.Delete
+      <button
+        type="button"
         className="conversation-delete"
         aria-label={`刪除對話「${title}」`}
         title="刪除"
+        onClick={() => onDelete(id)}
       >
         <TrashIcon />
-      </ThreadListItemPrimitive.Delete>
+      </button>
     </ThreadListItemPrimitive.Root>
   );
 };
@@ -39,7 +48,7 @@ const ClearAll = ({
   onClear,
 }: {
   count: number;
-  onClear: () => Promise<void>;
+  onClear: () => void;
 }) => {
   const [confirming, setConfirming] = useState(false);
   const cancelRef = useRef<HTMLButtonElement>(null);
@@ -82,7 +91,7 @@ const ClearAll = ({
           className="conversations-confirm-clear"
           onClick={() => {
             setConfirming(false);
-            void onClear();
+            onClear();
           }}
         >
           確定清除
@@ -95,9 +104,23 @@ const ClearAll = ({
 export const Conversations = ({ history }: { history: ConversationHistory }) => {
   // Only narrow layouts fold the list away; wide ones always show it.
   const [open, setOpen] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const panelId = useId();
   const count = useAuiState((s) => s.threads.threadIds.length);
   const close = () => setOpen(false);
+
+  const report = (result: ConversationActionResult) =>
+    setActionError(result.ok ? null : result.message);
+  const remove = (id: string) => {
+    setActionError(null);
+    void history.remove(id).then(report);
+  };
+  const clearAll = () => {
+    setActionError(null);
+    void history.clearAll().then(report);
+  };
+
+  const listError = history.status === "error" ? history.error : null;
 
   return (
     <aside
@@ -128,18 +151,38 @@ export const Conversations = ({ history }: { history: ConversationHistory }) => 
 
       <div id={panelId} className="conversations-panel">
         <h2 className="conversations-heading">對話紀錄</h2>
-        {count === 0 ? (
-          <p className="conversations-empty">
-            問過的問題會留在這個瀏覽器，最多 {MAX_STORED_CONVERSATIONS} 串。
+        {listError && (
+          <div className="conversations-alert" role="alert">
+            <span>{listError}</span>
+            <button type="button" onClick={history.reload}>
+              重新載入
+            </button>
+          </div>
+        )}
+        {actionError && (
+          <p className="conversations-alert" role="alert">
+            {actionError}
           </p>
+        )}
+        {count === 0 ? (
+          history.status === "loading" ? (
+            <p className="conversations-empty">正在載入對話紀錄…</p>
+          ) : (
+            !listError && (
+              <p className="conversations-empty">
+                問過的問題會保存在伺服器上，以這個瀏覽器區分，最多{" "}
+                {MAX_CONVERSATIONS} 串。
+              </p>
+            )
+          )
         ) : (
           <>
             <ThreadListPrimitive.Root className="conversation-list">
               <ThreadListPrimitive.Items>
-                {() => <ConversationItem onOpen={close} />}
+                {() => <ConversationItem onOpen={close} onDelete={remove} />}
               </ThreadListPrimitive.Items>
             </ThreadListPrimitive.Root>
-            <ClearAll count={count} onClear={history.clearAll} />
+            <ClearAll count={count} onClear={clearAll} />
           </>
         )}
       </div>

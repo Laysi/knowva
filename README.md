@@ -240,18 +240,25 @@ proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸�
 
 主題不寫死品牌名稱與標語、頁面標題與說明、建議問題和輸入框提示，一律由 `useProfile()` 從 `GET /api/profile` 讀取。它回傳 `status` 為 `loading`、`ready`（附 `profile`）或 `error`（附 core 的安全化 `message`）的狀態，以及重新載入用的 `reload()`。default 主題在載入期間保留版面但不顯示文案；載入失敗時在頁首顯示該訊息與「重新載入」按鈕，問答與文件功能照常可用。載入完成後的畫面與改版前相同，分頁標題也改用 profile 的品牌名稱與標語。
 
-每個主題的 vitest 都要呼叫 `describeThemeContract`，用主題自己的元件確認產品承諾：回答完成後列出每個來源的檔名、分頁來源另列頁碼；SSE `error` 或連線失敗時顯示 core 的安全化訊息；串流途中可以停止生成；不支援的副檔名或超過 50 MiB 的檔案顯示 core 的訊息而且不送出請求；問答頁標題與建議問題來自 `/api/profile`；`/api/profile` 失敗時顯示 core 的安全化訊息，問答仍可使用；重新整理後對話與來源都還在、追問送出的 `previousSources` 和沒重新整理時相同；新對話、切換、刪除單一對話與畫面內確認的「清除全部對話」會一併移除對應的 localStorage key；標題取第一個問題前 30 個字元而且不發請求；第 51 串對話會刪掉最久沒更新的一串；損毀或其他版本的資料被忽略並刪除；localStorage 被封鎖或已滿時問答照常並顯示 core 的無法保存提示。主題也要在 `:root` 宣告 `--theme-text`、`--theme-background`、`--theme-brand`、`--theme-on-brand`、`--theme-success`、`--theme-warning`、`--theme-error`，契約測試會檢查內文與三種狀態色在底色上、`on-brand` 在品牌色上的對比都達到 WCAG AA（4.5:1）。正式環境是離線 appliance，主題的 HTML、SVG 與 CSS 不能從其他主機載入字型、圖片或樣式，build 遇到這類 `src`、`href`、`url()`、`@import` 會直接失敗。
+每個主題的 vitest 都要呼叫 `describeThemeContract`，用主題自己的元件確認產品承諾：回答完成後列出每個來源的檔名、分頁來源另列頁碼；SSE `error` 或連線失敗時顯示 core 的安全化訊息；串流途中可以停止生成；不支援的副檔名或超過 50 MiB 的檔案顯示 core 的訊息而且不送出請求；問答頁標題與建議問題來自 `/api/profile`；`/api/profile` 失敗時顯示 core 的安全化訊息，問答仍可使用；重新整理後對話與來源都還在、追問送出的 `previousSources` 和沒重新整理時相同；新對話、切換、刪除單一對話與畫面內確認的「清除全部對話」都反映在伺服器上；清單顯示後端用第一個問題前 30 個字元產生的標題，除了 `/api/chat` 之外不發模型請求；保存失敗時問答照常並顯示 core 的無法保存提示；對話清單載入失敗時顯示 core 的安全化訊息，問答照常。契約用記憶體裡的 `/api/conversations` 假後端代替伺服器，重新 render 就是重新整理。主題也要在 `:root` 宣告 `--theme-text`、`--theme-background`、`--theme-brand`、`--theme-on-brand`、`--theme-success`、`--theme-warning`、`--theme-error`，契約測試會檢查內文與三種狀態色在底色上、`on-brand` 在品牌色上的對比都達到 WCAG AA（4.5:1）。正式環境是離線 appliance，主題的 HTML、SVG 與 CSS 不能從其他主機載入字型、圖片或樣式，build 遇到這類 `src`、`href`、`url()`、`@import` 會直接失敗。
 
 ### 對話紀錄
 
-問答頁的對話紀錄只存在使用者瀏覽器的 localStorage，後端不保存任何對話，`/api/chat` 維持無狀態。系統沒有登入，後端若保存對話就分不出是誰的；代價是紀錄只留在同一台電腦的同一個瀏覽器裡，換電腦、換瀏覽器或清除網站資料就沒有了，也沒有跨裝置同步。
+問答頁的對話紀錄存在伺服器的 PostgreSQL（migration `0008_conversations.sql`），以瀏覽器 cookie 區分擁有者，每個瀏覽器最多 50 串。`/api/chat` 維持無狀態：回答完成後，前端另外呼叫 `/api/conversations` 保存每一則訊息。系統沒有登入，部署前請先了解這種做法的代價：
 
-- 最多保留 50 串對話；開始第 51 串時，刪除最久沒更新的那一串。
-- 標題是第一個問題的前 30 個 Unicode 字元（連續空白併成一個空格），不呼叫模型、不發請求。
-- 每則回答連同 `sources` 一起保存，串流中斷或出錯的回答也會保存；重新整理後追問，送出的 `previousSources` 和沒重新整理時相同。重新整理後會回到最近更新的那串對話。
-- key 都以 `knowva:v1:` 開頭：`knowva:v1:conversations` 存清單（id、標題、建立與更新時間），`knowva:v1:conversation:<id>` 存該串的訊息。讀到損毀的 JSON、格式不符或版本不是 v1 的資料會直接忽略並刪除。
-- 瀏覽器容量不足時，從最久沒更新的對話開始刪到寫得進去；只剩畫面上這一串還寫不進去，或 localStorage 被封鎖時，問答照常，畫面顯示一行「瀏覽器無法保存這串對話」的提示。
-- **共用電腦會看到前一位使用者的紀錄**：同一個瀏覽器設定檔裡，誰打開問答頁都看得到之前的對話。共用的電腦請在離開前按「清除全部對話」，或讓每位使用者使用自己的瀏覽器設定檔。
+- **換瀏覽器或清除網站資料，就找不回原本的對話。** 擁有者是後端發給瀏覽器的 `knowva_client` cookie；換電腦、換瀏覽器或清除 cookie 之後就是另一個擁有者，也沒有跨裝置同步。原本的對話仍留在伺服器，直到被數量上限或刪除清掉。
+- **共用電腦的同一個瀏覽器，會看到前一位使用者的紀錄。** 同一個瀏覽器設定檔共用同一個 cookie，誰打開問答頁都看得到之前的對話。共用的電腦請在離開前按「清除全部對話」，或讓每位使用者使用自己的瀏覽器設定檔。
+- **能存取資料庫的人，讀得到問答內容。** 問題與回答以明文存在 `conversations` 與 `conversation_messages` 兩張表；資料庫只存 cookie token 的 SHA-256，不存 token 本身。
+
+其餘行為：
+
+- 上限：每個瀏覽器最多 50 串，建立第 51 串時刪除最久沒更新的那一串；每串最多 200 則訊息；單則訊息的 JSON 最多 256 KiB。超過時 API 回 4xx 與固定的安全化訊息，這串對話不再保存，問答照常。
+- Cookie：對話 API 收到沒有 `knowva_client` cookie（或格式不對）的請求時，產生 256 位元的隨機 token，以 `HttpOnly`、`SameSite=Strict`、`Path=/api`、`Max-Age` 400 天的 cookie 回傳；請求經由 HTTPS 進來（直接 HTTPS 或 `X-Forwarded-Proto: https`）時再加 `Secure`。正式環境可能是純 HTTP 的內網，所以不一律加 `Secure`。log 與錯誤訊息不會出現 token。
+- 隔離完全靠 token 保密。每個查詢都限定目前 cookie 的擁有者，存取不屬於自己或不存在的對話一律回 404，不透露那串對話是否存在。資料表以 `owner_kind`（`anonymous` 或 `user`，目前只寫入 `anonymous`）與 `owner_id` 表示擁有者，之後加入登入時可以用一個 `UPDATE` 把匿名對話轉給帳號。
+- 標題由後端在保存第一則使用者訊息時產生：去掉頭尾空白、連續空白併成一個空格，再取前 30 個 Unicode 字元，不呼叫模型。
+- 每則回答連同 `sources` data part 一起保存，串流中斷或出錯的回答也照樣保存（狀態為 `incomplete`）；重新整理後追問，送出的 `previousSources` 和沒重新整理時相同。重新整理後會回到最近更新的那串對話。
+- 保存失敗時問答照常，畫面顯示一行「這串對話無法保存」的提示。連線失敗、408、429 與 5xx 會在這串對話的下一則訊息前重送；其他 4xx 讓這串對話在這個頁面裡停止保存。對話清單載入失敗時，清單位置顯示 core 的安全化訊息與「重新載入」按鈕。
+- 不做重新命名、封存、搜尋、匯出、自動過期與速率限制。
 
 ## API
 
@@ -263,6 +270,13 @@ proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸�
 | POST | `/api/documents` | multipart 上傳（單一 `file` 欄位），立即回 id，背景處理 |
 | DELETE | `/api/documents/{id}` | 刪除 `{id}/` 前綴下所有物件（原檔、轉出 PDF、頁圖、manifest）後才刪 DB row；清除失敗時保留 row，可重送 DELETE |
 | POST | `/api/chat` | SSE 串流問答（`text-delta` / `sources` / `done` / `error`） |
+| GET | `/api/conversations` | 這個瀏覽器的對話清單，依 `updatedAt` 新到舊 |
+| POST | `/api/conversations` | 新增對話（201），id 由後端產生；回傳 `conversation` 與為了維持 50 串上限而刪除的 `removedIds` |
+| DELETE | `/api/conversations` | 清除這個瀏覽器的全部對話（204） |
+| GET | `/api/conversations/{id}` | 單串對話的 id、標題與時間 |
+| DELETE | `/api/conversations/{id}` | 刪除一串（204） |
+| GET | `/api/conversations/{id}/messages` | 依保存順序讀出 `{ parentId, message }` |
+| POST | `/api/conversations/{id}/messages` | 保存一則 `{ parentId, message }`；同一個 `message.id` 重送時覆寫（冪等），並更新對話的 `updatedAt`；回傳 `{ conversation }` |
 
 `GET /api/profile` 的形狀與 `profile.json` 相同，但多了 profile `id`，拿掉 `catalogKeywords`；產業段 prompt 與總覽關鍵字只留在後端。default profile 的回應如下：
 
@@ -311,6 +325,19 @@ proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸�
 `POST /api/chat` 的 request body 是 `{"messages": [...], "previousSources": [...]}`。`previousSources` 可省略，內容是上一則 assistant 訊息收到的 `sources` 事件原樣回送（只讀 `unitId`，其餘欄位忽略），用來決定本輪 context 區塊的排列順序；它不影響檢索到哪些來源，也不會把沒被檢索到的來源加回 context。
 
 `/api/chat` 的純文字串流契約維持不變；有檢索來源時，`sources` 一定在 `done` 前送出。模型端 HTTP 錯誤包含 status、最多 500 字的安全 response snippet 與可重試狀態；timeout 也會以統一錯誤回傳。
+
+對話 API 只作用在目前 `knowva_client` cookie 的擁有者身上，回應一律帶 `Cache-Control: no-store`；失敗時回傳固定的繁中純文字。`message` 是 assistant-ui 的完整訊息（JSON 物件，`role` 為 `user` 或 `assistant`），`parentId` 必須是這串對話裡已保存的訊息。保存第一個問題後的回應如下：
+
+```json
+{
+  "conversation": {
+    "id": "6f1c2a8e-3b7d-4c55-9a43-0d2e8f61b9a7",
+    "title": "馬達多久保養一次？",
+    "createdAt": "2026-10-06T08:00:00Z",
+    "updatedAt": "2026-10-06T08:00:05Z"
+  }
+}
+```
 
 分頁 source 的 `pageNumber` 是 1-based；文字 source 的 `pageNumber` 固定為 JSON `null`，並以 0-based `unitIndex` 標識文字單元（UI 顯示時加一）。同文件的不同頁不會去重，完整 SSE 範例如下：
 
