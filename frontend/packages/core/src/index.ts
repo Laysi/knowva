@@ -1,4 +1,8 @@
-export { BackendAdapter, chatRequestErrorMessage } from "./BackendAdapter";
+export {
+  BackendAdapter,
+  CHAT_ERROR_MESSAGES,
+  chatRequestErrorMessage,
+} from "./BackendAdapter";
 export type { ChatSource } from "./BackendAdapter";
 export * from "./DocumentModel";
 export { DOCUMENT_POLL_INTERVAL_MS, useDocuments } from "./useDocuments";
