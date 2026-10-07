@@ -68,15 +68,13 @@ function App() {
         <div className="content">
           <header className="content-header">
             <h1 className="content-title">{page?.title ?? PENDING}</h1>
-            {profileState.status === "error" ? (
+            {profileState.status === "error" && (
               <div className="profile-error" role="alert">
                 <span>{profileState.message}</span>
                 <button type="button" onClick={profileState.reload}>
                   重新載入
                 </button>
               </div>
-            ) : (
-              <p className="content-desc">{page?.description ?? PENDING}</p>
             )}
           </header>
           <main className="content-body">

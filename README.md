@@ -160,7 +160,7 @@ profiles/<id>/
 |---|---|
 | `theme` | 前端主題名稱，後端提供 `../frontend/dist/<theme>`；同一個主題可以給多個 profile 共用。只允許小寫英數與 `-` |
 | `brand.name`、`brand.tagline` | 品牌名稱與標語 |
-| `pages.chat`、`pages.documents` | 問答頁與文件頁的 `title`、`description` |
+| `pages.chat`、`pages.documents` | 問答頁與文件頁的 `title` |
 | `suggestions` | 建議問題 `{ "text", "catalog" }`；`catalog: true` 表示這題會走總覽（全庫文件清單）路徑，測試會逐一驗證標記與實際判斷一致 |
 | `composerPlaceholder` | 輸入框提示 |
 | `catalogKeywords.scope`、`catalogKeywords.intent` | 總覽關鍵字：問題同時含一個 scope 詞與一個 intent 詞時，改以全庫文件清單回答；比對不分大小寫。只留在後端，不會送到瀏覽器 |
@@ -261,11 +261,8 @@ proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸�
   "theme": "default",
   "brand": { "name": "Knowva 知星", "tagline": "點亮你的知識星系" },
   "pages": {
-    "chat": { "title": "知識問答", "description": "查詢已建立索引的公司文件。" },
-    "documents": {
-      "title": "文件管理",
-      "description": "上傳後，知星會讀完文件、整理摘要，並建立索引供查詢。"
-    }
+    "chat": { "title": "知識問答" },
+    "documents": { "title": "文件管理" }
   },
   "suggestions": [
     { "text": "知識庫裡有哪些主題？", "catalog": true },

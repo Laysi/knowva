@@ -931,14 +931,8 @@ mod tests {
                 "theme": "default",
                 "brand": { "name": "Knowva 知星", "tagline": "點亮你的知識星系" },
                 "pages": {
-                    "chat": {
-                        "title": "知識問答",
-                        "description": "查詢已建立索引的公司文件。"
-                    },
-                    "documents": {
-                        "title": "文件管理",
-                        "description": "上傳後，知星會讀完文件、整理摘要，並建立索引供查詢。"
-                    }
+                    "chat": { "title": "知識問答" },
+                    "documents": { "title": "文件管理" }
                 },
                 "suggestions": [
                     { "text": "知識庫裡有哪些主題？", "catalog": true },
