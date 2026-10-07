@@ -73,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
         embed_endpoint = %model_config.embed_endpoint(),
         rerank_endpoint = %model_config.rerank_endpoint(),
         request_timeout_secs = model_config.request_timeout().as_secs(),
+        retrieval_mode = model_config.retrieval_mode().as_str(),
+        rerank_enabled = model_config.rerank_enabled(),
         rerank_candidate_top_k = model_config.rerank_candidate_top_k(),
         rerank_top_n = model_config.rerank_top_n(),
         rerank_batch_size = model_config.rerank_batch_size(),

@@ -1,7 +1,7 @@
 use crate::AppState;
 use crate::cloud_models::{
     CloudModelClient, CloudModelError, CloudModelResult, MAX_EMBED_IMAGE_BYTES, RerankPassage,
-    RerankResponse,
+    RerankResponse, RetrievalMode,
 };
 use crate::page_vision::page_uses_image;
 use crate::storage::{IO_CONCURRENCY, Storage, StorageError};
@@ -966,45 +966,85 @@ pub async fn retrieve_ab_observed(
     .await
 }
 
-/// Retrieves a stable RRF pool, reranks it with the locked VL model, and
-/// returns the configured top 3-8 candidates. Exhausted transient model
-/// failures fall back to the unchanged RRF prefix; contract/artifact failures
-/// remain diagnostic errors.
+/// Retrieves the configured candidate pool and returns its top 3-8 candidates
+/// through the configured stages. By default the pool is the stable RRF fusion
+/// of dense and BM25 candidates, reranked with the locked VL model.
 pub async fn retrieve(
     state: &AppState,
     query: &str,
 ) -> Result<Vec<RetrievalCandidate>, RetrieveError> {
-    let rerank_config = RerankConfig::from_client(&state.models);
-    let route_top_k = DEFAULT_DENSE_TOP_K.max(rerank_config.candidate_top_k);
-    let retrieval_config = RetrievalConfig::new(
-        route_top_k,
-        DEFAULT_BM25_TOP_K.max(rerank_config.candidate_top_k),
-        rerank_config.candidate_top_k,
-    )
-    .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Configuration(error)))?;
-    let debug = retrieve_debug(state, query, retrieval_config)
-        .await
-        .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Dense(error)))?;
-    rerank_candidates(
+    let backend = PostgresRetrievalBackend { state };
+    retrieve_with_backends(
+        &backend,
         &state.models,
         query,
-        &debug.fused,
         &state.storage,
-        rerank_config,
+        state.models.retrieval_mode(),
+        state.models.rerank_enabled(),
+        RerankConfig::from_client(&state.models),
     )
     .await
-    .map_err(RetrieveError::Rerank)
 }
 
-/// Runs the production PostgreSQL stages while retaining both route rankings
-/// for diagnostics and evaluation fixtures.
-pub async fn retrieve_debug(
-    state: &AppState,
+/// `RetrievalMode::Dense` takes the pool from the dense ranking alone and
+/// never queries BM25. With rerank disabled the pool order is kept and its
+/// first `top_n` are returned. Exhausted transient rerank failures fall back
+/// to the unchanged pool prefix; contract/artifact failures remain diagnostic
+/// errors.
+async fn retrieve_with_backends<
+    C: CandidateRetrievalBackend + ?Sized,
+    R: RerankBackend + ?Sized,
+>(
+    candidate_backend: &C,
+    rerank_backend: &R,
     query: &str,
-    config: RetrievalConfig,
-) -> anyhow::Result<RetrievalDebug> {
-    let backend = PostgresRetrievalBackend { state };
-    retrieve_with_backend(&backend, query, config).await
+    storage: &Storage,
+    mode: RetrievalMode,
+    rerank: bool,
+    rerank_config: RerankConfig,
+) -> Result<Vec<RetrievalCandidate>, RetrieveError> {
+    // Without rerank only the candidates that reach the context are needed.
+    let pool_size = if rerank {
+        rerank_config.candidate_top_k
+    } else {
+        rerank_config.top_n
+    };
+    let pool = match mode {
+        RetrievalMode::Hybrid => {
+            let retrieval_config = RetrievalConfig::new(
+                DEFAULT_DENSE_TOP_K.max(pool_size),
+                DEFAULT_BM25_TOP_K.max(pool_size),
+                pool_size,
+            )
+            .map_err(|error| {
+                RetrieveError::Candidates(CandidateRetrievalError::Configuration(error))
+            })?;
+            retrieve_with_backend(candidate_backend, query, retrieval_config)
+                .await
+                .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Dense(error)))?
+                .fused
+        }
+        RetrievalMode::Dense => {
+            let started = Instant::now();
+            let dense = candidate_backend
+                .dense_candidates(query, pool_size)
+                .await
+                .map_err(RetrieveError::Candidates)?;
+            tracing::info!(
+                stage = "dense",
+                candidate_count = dense.len(),
+                latency_ms = started.elapsed().as_millis() as u64,
+                "retrieval stage completed"
+            );
+            ranked_route_candidates(&dense, true)
+        }
+    };
+    if !rerank {
+        return Ok(pool.into_iter().take(rerank_config.top_n).collect());
+    }
+    rerank_candidates(rerank_backend, query, &pool, storage, rerank_config)
+        .await
+        .map_err(RetrieveError::Rerank)
 }
 
 pub async fn rerank_candidates<B: RerankBackend + ?Sized>(
@@ -2423,6 +2463,134 @@ mod tests {
         let mut calls = backend.calls.lock().expect("calls lock").clone();
         calls.sort_unstable();
         assert_eq!(calls, vec![("bm25", 50), ("dense", 50)]);
+    }
+
+    fn eight_dense_one_bm25() -> FakeBackend {
+        FakeBackend {
+            dense: (1..=8)
+                .map(|id| text_ranked(id, id as usize, 1.0 - id as f64 / 10.0))
+                .collect(),
+            bm25: vec![text_ranked(9, 1, 3.0)],
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn sorted_calls(backend: &FakeBackend) -> Vec<(&'static str, usize)> {
+        let mut calls = backend.calls.lock().expect("calls lock").clone();
+        calls.sort_unstable();
+        calls
+    }
+
+    #[tokio::test]
+    async fn unset_retrieval_settings_keep_bm25_rrf_and_rerank() {
+        let config = crate::cloud_models::CloudModelConfig::from_lookup(|name| match name {
+            "GEMMA_4_MODEL_ID" => Some("hosted/gemma-4-test".to_owned()),
+            "MODEL_BASE_URL" => Some("http://127.0.0.1:9".to_owned()),
+            _ => None,
+        })
+        .expect("default model config");
+        let client = CloudModelClient::new(config).expect("cloud client");
+        let backend = eight_dense_one_bm25();
+        let reranker = FakeReranker::new(Vec::new());
+
+        let output = retrieve_with_backends(
+            &backend,
+            &reranker,
+            "fixture query",
+            &Storage::memory(),
+            client.retrieval_mode(),
+            client.rerank_enabled(),
+            RerankConfig::from_client(&client),
+        )
+        .await
+        .expect("hybrid reranked retrieval");
+
+        assert_eq!(sorted_calls(&backend), vec![("bm25", 50), ("dense", 50)]);
+        // All nine fused text candidates are reranked, eight per request.
+        assert_eq!(reranker.requests.lock().expect("requests lock").len(), 2);
+        assert_eq!(output.len(), 6);
+        assert!(
+            output
+                .iter()
+                .all(|candidate| candidate.rerank_rank.is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn dense_mode_skips_bm25_and_reranks_the_dense_pool() {
+        let backend = eight_dense_one_bm25();
+        let reranker = FakeReranker::new(Vec::new());
+
+        let output = retrieve_with_backends(
+            &backend,
+            &reranker,
+            "fixture query",
+            &Storage::memory(),
+            RetrievalMode::Dense,
+            true,
+            RerankConfig::new(12, 6, 8).expect("rerank config"),
+        )
+        .await
+        .expect("dense reranked retrieval");
+
+        assert_eq!(sorted_calls(&backend), vec![("dense", 12)]);
+        assert_eq!(reranker.requests.lock().expect("requests lock").len(), 1);
+        assert_eq!(output.len(), 6);
+        assert!(
+            output.iter().all(|candidate| {
+                candidate.rerank_rank.is_some() && candidate.bm25_rank.is_none()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_rerank_returns_the_pool_prefix_without_calling_the_reranker() {
+        let backend = eight_dense_one_bm25();
+        let reranker = FakeReranker::new(Vec::new());
+        let output = retrieve_with_backends(
+            &backend,
+            &reranker,
+            "fixture query",
+            &Storage::memory(),
+            RetrievalMode::Dense,
+            false,
+            RerankConfig::new(50, 6, 8).expect("rerank config"),
+        )
+        .await
+        .expect("dense retrieval");
+        assert_eq!(sorted_calls(&backend), vec![("dense", 6)]);
+        assert_eq!(
+            output
+                .iter()
+                .map(|candidate| candidate.unit_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+
+        let backend = eight_dense_one_bm25();
+        let output = retrieve_with_backends(
+            &backend,
+            &reranker,
+            "fixture query",
+            &Storage::memory(),
+            RetrievalMode::Hybrid,
+            false,
+            RerankConfig::new(50, 6, 8).expect("rerank config"),
+        )
+        .await
+        .expect("hybrid retrieval");
+        assert_eq!(sorted_calls(&backend), vec![("bm25", 50), ("dense", 50)]);
+        assert_eq!(
+            output,
+            reciprocal_rank_fusion(&backend.dense, &backend.bm25, 6)
+        );
+
+        assert!(reranker.requests.lock().expect("requests lock").is_empty());
+        assert!(
+            output
+                .iter()
+                .all(|candidate| candidate.rerank_rank.is_none())
+        );
     }
 
     #[tokio::test]
