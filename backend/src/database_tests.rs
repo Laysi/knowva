@@ -2241,6 +2241,289 @@ async fn delete_keeps_a_retry_handle_when_storage_cleanup_fails(
     Ok(())
 }
 
+/// A ready document with its original, as ingestion leaves it published.
+async fn ready_document_with_original(
+    pool: &PgPool,
+    storage: &Storage,
+    filename: &str,
+    original: &[u8],
+) -> anyhow::Result<Uuid> {
+    let (document_id, _) = store_original(pool, storage, filename, original.to_vec()).await?;
+    sqlx::query(
+        "UPDATE documents SET status = 'ready', artifact_status = 'ready', \
+         mime_type = 'application/pdf' WHERE id = $1",
+    )
+    .bind(document_id)
+    .execute(pool)
+    .await?;
+    Ok(document_id)
+}
+
+async fn insert_page_unit_at(
+    pool: &PgPool,
+    document_id: Uuid,
+    page_number: i32,
+    content: Option<&str>,
+    image_path: &str,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "INSERT INTO document_units \
+         (document_id, kind, unit_index, page_number, content, image_path, needs_vision, \
+          embedding) \
+         VALUES ($1, 'page', $2, $3, $4, $5, $6, $7) RETURNING id",
+    )
+    .bind(document_id)
+    .bind(page_number - 1)
+    .bind(page_number)
+    .bind(content)
+    .bind(image_path)
+    .bind(content.is_none())
+    .bind(vector_with(&[(0, 1.0)]))
+    .fetch_one(pool)
+    .await
+}
+
+async fn get_document_file(
+    app: &Router,
+    uri: &str,
+) -> anyhow::Result<(StatusCode, axum::http::HeaderMap, Vec<u8>)> {
+    let response = app
+        .clone()
+        .oneshot(Request::get(uri).body(Body::empty())?)
+        .await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    Ok((status, headers, body.to_vec()))
+}
+
+fn assert_private(headers: &axum::http::HeaderMap) {
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+}
+
+#[sqlx::test]
+async fn cited_files_are_served_exactly_from_local_storage(pool: PgPool) -> anyhow::Result<()> {
+    let files_dir = std::env::temp_dir().join(format!("knowva-cited-local-{}", Uuid::new_v4()));
+    cited_files_are_served_exactly(pool, Storage::local(&files_dir)?).await?;
+    std::fs::remove_dir_all(files_dir)?;
+    Ok(())
+}
+
+#[sqlx::test]
+async fn cited_files_are_served_exactly_from_in_memory_storage(pool: PgPool) -> anyhow::Result<()> {
+    cited_files_are_served_exactly(pool, Storage::memory()).await
+}
+
+/// The page image, the texts and the original come back byte for byte, with
+/// the headers that keep them private and inert.
+async fn cited_files_are_served_exactly(pool: PgPool, storage: Storage) -> anyhow::Result<()> {
+    let original = b"%PDF-1.7 cited original".to_vec();
+    let document_id =
+        ready_document_with_original(&pool, &storage, "設備保養手冊.pdf", &original).await?;
+    let image_key = format!("{document_id}/artifacts-run/pages/0001.png");
+    let page_image = png_bytes(3, 2, [20, 40, 60, 255]);
+    storage.put(&image_key, page_image.clone()).await?;
+    let page_unit =
+        insert_page_unit_at(&pool, document_id, 1, Some("第一頁的文字層"), &image_key).await?;
+    let text_unit = insert_text_unit(
+        &pool,
+        document_id,
+        0,
+        "保養週期為六個月。",
+        &vector_with(&[(1, 1.0)]),
+    )
+    .await?;
+    let app = api_router(test_state(&pool, CloudModelClient::for_test(), storage));
+
+    let (status, headers, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{page_unit}/image"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, page_image);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(
+        headers["content-length"],
+        page_image.len().to_string().as_str()
+    );
+    assert_private(&headers);
+
+    let (status, headers, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{text_unit}/text"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8(body)?, "保養週期為六個月。");
+    assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+    assert_private(&headers);
+
+    let (status, _, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{page_unit}/text"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8(body)?, "第一頁的文字層");
+
+    let (status, headers, body) =
+        get_document_file(&app, &format!("/api/documents/{document_id}/file")).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, original);
+    assert_eq!(headers["content-type"], "application/pdf");
+    assert_eq!(
+        headers["content-length"],
+        original.len().to_string().as_str()
+    );
+    assert_eq!(
+        headers["content-disposition"],
+        "attachment; filename=\"______.pdf\"; \
+         filename*=UTF-8''%E8%A8%AD%E5%82%99%E4%BF%9D%E9%A4%8A%E6%89%8B%E5%86%8A.pdf"
+    );
+    assert_eq!(headers["content-security-policy"], "sandbox");
+    assert_private(&headers);
+
+    sqlx::query(
+        "UPDATE documents SET summary = '設備保養重點', tags = ARRAY['保養', '馬達'] \
+         WHERE id = $1",
+    )
+    .bind(document_id)
+    .execute(&pool)
+    .await?;
+    let catalog = search::catalog_candidates(&pool).await?;
+    let cited_unit = catalog[0].unit_id;
+    assert_eq!(cited_unit, page_unit.min(text_unit));
+    let (status, headers, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{cited_unit}/catalog"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        String::from_utf8(body)?,
+        "文件名稱：設備保養手冊.pdf\n摘要：設備保養重點\n標籤：保養、馬達"
+    );
+    assert_eq!(
+        catalog[0].content.as_deref(),
+        Some("文件名稱：設備保養手冊.pdf\n摘要：設備保養重點\n標籤：保養、馬達"),
+        "the card is the text the catalog answer saw"
+    );
+    assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+    assert_private(&headers);
+
+    // Only the document's first unit names its card: a citation from before the
+    // document was processed again names a unit that is gone.
+    let (status, _, _) = get_document_file(
+        &app,
+        &format!(
+            "/api/documents/{document_id}/units/{}/catalog",
+            page_unit.max(text_unit)
+        ),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    sqlx::query("DELETE FROM document_units WHERE id = $1")
+        .bind(cited_unit)
+        .execute(&pool)
+        .await?;
+    let (status, _, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{cited_unit}/catalog"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(String::from_utf8(body)?, "找不到這個來源。");
+    Ok(())
+}
+
+#[sqlx::test]
+async fn document_files_answer_one_not_found_for_anything_retrieval_would_not_use(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let storage = Storage::memory();
+    let document_id =
+        ready_document_with_original(&pool, &storage, "manual.pdf", b"%PDF manual").await?;
+    let image_key = format!("{document_id}/artifacts-run/pages/0001.png");
+    storage
+        .put(&image_key, png_bytes(1, 1, [0, 0, 0, 255]))
+        .await?;
+    let scanned_page = insert_page_unit_at(&pool, document_id, 1, None, &image_key).await?;
+    let text_unit =
+        insert_text_unit(&pool, document_id, 0, "段落", &vector_with(&[(1, 1.0)])).await?;
+
+    let other_id =
+        ready_document_with_original(&pool, &storage, "other.pdf", b"%PDF other secret").await?;
+    let other_key = format!("{other_id}/artifacts-run/pages/0001.png");
+    storage
+        .put(&other_key, png_bytes(1, 1, [9, 9, 9, 255]))
+        .await?;
+    let other_page = insert_page_unit_at(&pool, other_id, 1, Some("其他文件"), &other_key).await?;
+    // A row whose key names another document's original must never read it.
+    let escaping_page = insert_page_unit_at(
+        &pool,
+        document_id,
+        2,
+        Some("跨文件"),
+        &format!("{other_id}/original.pdf"),
+    )
+    .await?;
+    let app = api_router(test_state(&pool, CloudModelClient::for_test(), storage));
+
+    let not_found = [
+        format!("/api/documents/{document_id}/units/{scanned_page}/text"),
+        format!("/api/documents/{document_id}/units/{text_unit}/image"),
+        format!("/api/documents/{document_id}/units/{other_page}/image"),
+        format!("/api/documents/{document_id}/units/{other_page}/text"),
+        format!("/api/documents/{document_id}/units/999999999/image"),
+        format!("/api/documents/{document_id}/units/not-a-unit/text"),
+        format!("/api/documents/{}/units/{text_unit}/text", Uuid::new_v4()),
+        format!("/api/documents/not-a-uuid/units/{text_unit}/text"),
+        format!("/api/documents/{}/file", Uuid::new_v4()),
+        "/api/documents/not-a-uuid/file".to_string(),
+        format!(
+            "/api/documents/{}/units/{text_unit}/catalog",
+            Uuid::new_v4()
+        ),
+        format!("/api/documents/{document_id}/units/not-a-unit/catalog"),
+        "/api/documents/not-a-uuid/units/1/catalog".to_string(),
+    ];
+    for uri in &not_found {
+        let (status, headers, body) = get_document_file(&app, uri).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(String::from_utf8(body)?, "找不到這個來源。", "{uri}");
+        assert_private(&headers);
+    }
+
+    let (status, _, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{escaping_page}/image"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(String::from_utf8(body)?, "來源暫時無法讀取，請稍後再試。");
+
+    for status in ["processing", "failed"] {
+        sqlx::query("UPDATE documents SET status = $2 WHERE id = $1")
+            .bind(document_id)
+            .bind(status)
+            .execute(&pool)
+            .await?;
+        for uri in [
+            format!("/api/documents/{document_id}/units/{scanned_page}/image"),
+            format!("/api/documents/{document_id}/units/{text_unit}/text"),
+            format!("/api/documents/{document_id}/file"),
+            format!("/api/documents/{document_id}/units/{scanned_page}/catalog"),
+        ] {
+            let (response_status, _, body) = get_document_file(&app, &uri).await?;
+            assert_eq!(response_status, StatusCode::NOT_FOUND, "{status} {uri}");
+            assert_eq!(String::from_utf8(body)?, "找不到這個來源。");
+        }
+    }
+    Ok(())
+}
+
 #[sqlx::test]
 async fn markdown_and_text_fixtures_keep_heading_aware_staging(pool: PgPool) -> anyhow::Result<()> {
     let root = std::env::temp_dir().join(format!("knowva-text-fixtures-{}", Uuid::new_v4()));

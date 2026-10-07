@@ -376,6 +376,19 @@ struct CatalogDocumentRow {
     unit_id: Option<i64>,
 }
 
+/// The text a catalog answer sees for one document. Opening that citation
+/// (`GET /api/documents/{id}/units/{unitId}/catalog`) shows the same text.
+pub fn catalog_card(filename: &str, summary: Option<&str>, tags: Option<&[String]>) -> String {
+    let mut content = format!("文件名稱：{filename}");
+    if let Some(summary) = summary.filter(|value| !value.trim().is_empty()) {
+        content.push_str(&format!("\n摘要：{}", summary.trim()));
+    }
+    if let Some(tags) = tags.filter(|values| !values.is_empty()) {
+        content.push_str(&format!("\n標籤：{}", tags.join("、")));
+    }
+    content
+}
+
 /// Returns one compact, text-only source per ready document for catalog questions.
 pub async fn catalog_candidates(pool: &sqlx::PgPool) -> anyhow::Result<Vec<RetrievalCandidate>> {
     let rows = sqlx::query_as::<_, CatalogDocumentRow>(
@@ -393,13 +406,7 @@ pub async fn catalog_candidates(pool: &sqlx::PgPool) -> anyhow::Result<Vec<Retri
         .into_iter()
         .enumerate()
         .map(|(index, row)| {
-            let mut content = format!("文件名稱：{}", row.filename);
-            if let Some(summary) = row.summary.filter(|value| !value.trim().is_empty()) {
-                content.push_str(&format!("\n摘要：{}", summary.trim()));
-            }
-            if let Some(tags) = row.tags.filter(|values| !values.is_empty()) {
-                content.push_str(&format!("\n標籤：{}", tags.join("、")));
-            }
+            let content = catalog_card(&row.filename, row.summary.as_deref(), row.tags.as_deref());
             let unit_id = row.unit_id.unwrap_or(0);
             RetrievalCandidate {
                 unit_id,

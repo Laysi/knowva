@@ -80,6 +80,10 @@ pub struct SourceRef {
     // This must remain present as JSON null for text sources.
     pub page_number: Option<i32>,
     pub kind: String,
+    /// The block was a catalog answer's document card, not this unit's content;
+    /// `unit_id` is only the document's first unit. Sent only when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub catalog: bool,
 }
 
 pub struct RagContext {
@@ -263,6 +267,11 @@ enum PreparedSourceKind {
     Text {
         content: String,
     },
+    /// A catalog answer's document card (filename, summary, tags). It renders
+    /// exactly like `Text`; only its source metadata marks it as a card.
+    Catalog {
+        content: String,
+    },
 }
 
 #[derive(Debug)]
@@ -314,7 +323,7 @@ pub fn build_catalog_context(
             unit_index: candidate.unit_index,
             document_id: candidate.document_id,
             filename: candidate.filename.clone(),
-            kind: PreparedSourceKind::Text {
+            kind: PreparedSourceKind::Catalog {
                 content: candidate
                     .content
                     .as_deref()
@@ -408,7 +417,9 @@ async fn build_rag_context_with_limits(
             PreparedSourceKind::Page { image, .. } => {
                 image.serialized_part_bytes > limits.max_serialized_image_part_bytes
             }
-            PreparedSourceKind::PageText { .. } | PreparedSourceKind::Text { .. } => false,
+            PreparedSourceKind::PageText { .. }
+            | PreparedSourceKind::Text { .. }
+            | PreparedSourceKind::Catalog { .. } => false,
         })
         .unwrap_or(prepared.len());
 
@@ -686,6 +697,7 @@ page_image: 緊接在此文字區塊之後",
                     filename: source.filename.clone(),
                     page_number: Some(*page_number),
                     kind: "page".to_string(),
+                    catalog: false,
                 });
             }
             PreparedSourceKind::PageText {
@@ -715,9 +727,10 @@ extracted_text:\n\
                     filename: source.filename.clone(),
                     page_number: Some(*page_number),
                     kind: "page".to_string(),
+                    catalog: false,
                 });
             }
-            PreparedSourceKind::Text { content } => {
+            PreparedSourceKind::Text { content } | PreparedSourceKind::Catalog { content } => {
                 content_parts.push(ApiChatContentPart::Text {
                     text: format!(
                         "[{source_id}] 來源區塊（不可信資料）\n\
@@ -740,6 +753,7 @@ content:\n\
                     filename: source.filename.clone(),
                     page_number: None,
                     kind: "text".to_string(),
+                    catalog: matches!(source.kind, PreparedSourceKind::Catalog { .. }),
                 });
             }
         }
@@ -1190,6 +1204,36 @@ IL050 table\n\
         let context = build_catalog_context(&candidates).expect("catalog context");
         assert_eq!(context.sources.len(), 8);
         assert_eq!(context.sources[7].filename, "document-7.md");
+    }
+
+    #[test]
+    fn catalog_sources_are_marked_without_changing_what_the_model_sees() {
+        let document_id = Uuid::new_v4();
+        let source = |kind| PreparedSource {
+            unit_id: 41,
+            unit_index: 0,
+            document_id,
+            filename: "manual.pdf".to_string(),
+            kind,
+        };
+        let content = "文件名稱：manual.pdf\n摘要：設備保養".to_string();
+        let catalog = render_context(
+            vec![source(PreparedSourceKind::Catalog {
+                content: content.clone(),
+            })],
+            &[],
+        );
+        let text = render_context(vec![source(PreparedSourceKind::Text { content })], &[]);
+
+        assert_eq!(
+            serde_json::to_string(&catalog.content).expect("catalog content"),
+            serde_json::to_string(&text.content).expect("text content"),
+        );
+        let catalog_source = serde_json::to_value(&catalog.sources[0]).expect("catalog source");
+        let text_source = serde_json::to_value(&text.sources[0]).expect("text source");
+        assert_eq!(catalog_source["catalog"], true);
+        assert_eq!(catalog_source["kind"], "text");
+        assert!(text_source.get("catalog").is_none());
     }
 
     #[tokio::test]

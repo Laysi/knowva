@@ -1,5 +1,6 @@
 pub mod cloud_models;
 mod conversations;
+mod document_files;
 mod document_summary;
 mod embedding;
 pub mod evaluation;
@@ -157,6 +158,7 @@ fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/documents/{id}", delete(ingest::delete_document))
         .route("/api/chat", post(chat))
+        .merge(document_files::router())
         .merge(conversations::router())
         .layer(DefaultBodyLimit::max(ingest::MULTIPART_BODY_LIMIT_BYTES))
         .with_state(state)
@@ -698,6 +700,7 @@ mod tests {
             filename: "source.pdf".to_string(),
             page_number: Some(1),
             kind: "page".to_string(),
+            catalog: false,
         }];
         let upstream = pending_upstream();
         let abort_handle = upstream.abort_handle();
