@@ -233,14 +233,14 @@ proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸�
 
 | Workspace | 內容 |
 |---|---|
-| `packages/core`（`@knowva/core`） | `BackendAdapter`、`useKnowvaRuntime`（問答 runtime 與對話紀錄）、`DocumentModel`、`useDocuments`（文件列表、輪詢、上傳、刪除）、`useProfile`（讀 `GET /api/profile`）與安全化的錯誤訊息；不含 CSS 與版面。`@knowva/core/testing` 提供主題契約測試，`@knowva/core/vite` 提供擋外部網址的 build plugin |
+| `packages/core`（`@knowva/core`） | `BackendAdapter`、`useKnowvaRuntime`（問答 runtime 與對話紀錄）、`DocumentModel`、`useDocuments`（文件列表、輪詢、上傳、刪除）、`useProfile`（讀 `GET /api/profile`）、`useSourcePreview`／`useMessageSources`／`remarkSourceMarkers`（引用來源的預覽與內文 `[S1]` 標記）與安全化的錯誤訊息；不含 CSS 與版面。`@knowva/core/testing` 提供主題契約測試，`@knowva/core/vite` 提供擋外部網址的 build plugin |
 | `themes/default`（`@knowva/theme-default`） | 現行介面：元件、CSS、`index.html` 與 `main.tsx`；輸出到 `frontend/dist/default/` |
 
 根目錄的 `run lint`、`run test`、`run build` 依序跑過每個 workspace；`run dev` 與 `run preview` 啟動 default 主題，也可以用 `proto run npm -- run dev --workspace @knowva/theme-default` 指定。
 
 主題不寫死品牌名稱與標語、頁面標題與說明、建議問題和輸入框提示，一律由 `useProfile()` 從 `GET /api/profile` 讀取。它回傳 `status` 為 `loading`、`ready`（附 `profile`）或 `error`（附 core 的安全化 `message`）的狀態，以及重新載入用的 `reload()`。default 主題在載入期間保留版面但不顯示文案；載入失敗時在頁首顯示該訊息與「重新載入」按鈕，問答與文件功能照常可用。載入完成後的畫面與改版前相同，分頁標題也改用 profile 的品牌名稱與標語。
 
-每個主題的 vitest 都要呼叫 `describeThemeContract`，用主題自己的元件確認產品承諾：回答完成後列出每個來源的檔名、分頁來源另列頁碼；SSE `error` 或連線失敗時顯示 core 的安全化訊息；串流途中可以停止生成；不支援的副檔名或超過 50 MiB 的檔案顯示 core 的訊息而且不送出請求；問答頁標題與建議問題來自 `/api/profile`；`/api/profile` 失敗時顯示 core 的安全化訊息，問答仍可使用；重新整理後對話與來源都還在、追問送出的 `previousSources` 和沒重新整理時相同；新對話、切換、刪除單一對話與畫面內確認的「清除全部對話」都反映在伺服器上；清單顯示後端用第一個問題前 30 個字元產生的標題，除了 `/api/chat` 之外不發模型請求；保存失敗時問答照常並顯示 core 的無法保存提示；對話清單載入失敗時顯示 core 的安全化訊息，問答照常。契約用記憶體裡的 `/api/conversations` 假後端代替伺服器，重新 render 就是重新整理。主題也要在 `:root` 宣告 `--theme-text`、`--theme-background`、`--theme-brand`、`--theme-on-brand`、`--theme-success`、`--theme-warning`、`--theme-error`，契約測試會檢查內文與三種狀態色在底色上、`on-brand` 在品牌色上的對比都達到 WCAG AA（4.5:1）。正式環境是離線 appliance，主題的 HTML、SVG 與 CSS 不能從其他主機載入字型、圖片或樣式，build 遇到這類 `src`、`href`、`url()`、`@import` 會直接失敗。
+每個主題的 vitest 都要呼叫 `describeThemeContract`，用主題自己的元件確認產品承諾：回答完成後列出每個來源的檔名、分頁來源另列頁碼；點來源清單的項目或內文的 `[S1]` 會讀出並顯示該單元的頁面圖或文字（總覽來源則是文件卡）、提供原檔下載連結，來源已不存在時顯示 core 的安全化訊息；SSE `error` 或連線失敗時顯示 core 的安全化訊息；串流途中可以停止生成；不支援的副檔名或超過 50 MiB 的檔案顯示 core 的訊息而且不送出請求；問答頁標題與建議問題來自 `/api/profile`；`/api/profile` 失敗時顯示 core 的安全化訊息，問答仍可使用；重新整理後對話與來源都還在、追問送出的 `previousSources` 和沒重新整理時相同；新對話、切換、刪除單一對話與畫面內確認的「清除全部對話」都反映在伺服器上；清單顯示後端用第一個問題前 30 個字元產生的標題，除了 `/api/chat` 之外不發模型請求；保存失敗時問答照常並顯示 core 的無法保存提示；對話清單載入失敗時顯示 core 的安全化訊息，問答照常。契約用記憶體裡的 `/api/conversations` 假後端代替伺服器，重新 render 就是重新整理。主題也要在 `:root` 宣告 `--theme-text`、`--theme-background`、`--theme-brand`、`--theme-on-brand`、`--theme-success`、`--theme-warning`、`--theme-error`，契約測試會檢查內文與三種狀態色在底色上、`on-brand` 在品牌色上的對比都達到 WCAG AA（4.5:1）。正式環境是離線 appliance，主題的 HTML、SVG 與 CSS 不能從其他主機載入字型、圖片或樣式，build 遇到這類 `src`、`href`、`url()`、`@import` 會直接失敗。
 
 ### 對話紀錄
 
@@ -261,6 +261,14 @@ proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸�
 - 保存失敗時問答照常，畫面顯示一行「這串對話無法保存」的提示。連線失敗、408、429 與 5xx 會在這串對話的下一則訊息前重送；其他 4xx 讓這串對話在這個頁面裡停止保存。對話清單載入失敗時，清單位置顯示 core 的安全化訊息與「重新載入」按鈕。
 - 不做重新命名、封存、搜尋、匯出、自動過期與速率限制。
 
+### 引用來源
+
+回答內文的 `[S1]`、`[S2]` 與下方「資料來源」清單的每一項都可以點，點了會開啟對話框顯示模型引用的內容：頁面來源（PDF、Office、圖片）顯示那一頁的頁面圖，文字來源（Markdown、純文字）顯示那一段文字，總覽問答的來源顯示文件卡（檔名、摘要、標籤）；對話框底部可以下載原檔。內文中對不到來源的 `[Sn]` 維持純文字。
+
+- 只讀得到問答目前會用到的內容：文件處理完成（`ready`）才讀得到，處理中、失敗或刪除中的文件一律當作不存在。文件刪除或重新處理後單元會換新，舊回答的來源會顯示「找不到這個來源，文件可能已刪除或重新處理。」
+- 頁面圖就是入庫時轉出的那張圖，圖上不標示引用的位置。原檔只提供下載，不在瀏覽器裡開啟；回應帶 `Content-Security-Policy: sandbox`，上傳的內容不會在本站執行。
+- 這些回應都帶 `Cache-Control: no-store`，瀏覽器不留快取，刪除的文件不會再從快取被看到。
+
 ## API
 
 | Method | Path | 說明 |
@@ -270,6 +278,10 @@ proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸�
 | GET | `/api/documents` | 文件列表（含文件／artifact 狀態、頁數與檢索單元數） |
 | POST | `/api/documents` | multipart 上傳（單一 `file` 欄位），立即回 id，背景處理 |
 | DELETE | `/api/documents/{id}` | 刪除 `{id}/` 前綴下所有物件（原檔、轉出 PDF、頁圖、manifest）後才刪 DB row；清除失敗時保留 row，可重送 DELETE |
+| GET | `/api/documents/{id}/file` | 下載原檔，串流回傳，`Content-Disposition: attachment`（中文檔名以 RFC 8187 編碼）；只限 `ready` 文件 |
+| GET | `/api/documents/{id}/units/{unitId}/catalog` | 總覽問答引用的文件卡（`text/plain`，檔名、摘要、標籤），與模型拿到的相同；`unitId` 必須仍是該文件第一個可檢索的單元，文件重新處理後舊引用回 404 |
+| GET | `/api/documents/{id}/units/{unitId}/image` | 來源單元的頁面圖；只限 `ready` 文件中可檢索的單元 |
+| GET | `/api/documents/{id}/units/{unitId}/text` | 來源單元的文字（`text/plain`），與模型拿到的相同；條件同上 |
 | POST | `/api/chat` | SSE 串流問答（`text-delta` / `sources` / `done` / `error`） |
 | GET | `/api/conversations` | 這個瀏覽器的對話清單，依 `updatedAt` 新到舊 |
 | POST | `/api/conversations` | 新增對話（201），id 由後端產生；回傳 `conversation` 與為了維持 50 串上限而刪除的 `removedIds` |
@@ -337,7 +349,7 @@ proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸�
 }
 ```
 
-分頁 source 的 `pageNumber` 是 1-based；文字 source 的 `pageNumber` 固定為 JSON `null`，並以 0-based `unitIndex` 標識文字單元（UI 顯示時加一）。同文件的不同頁不會去重，完整 SSE 範例如下：
+分頁 source 的 `pageNumber` 是 1-based；文字 source 的 `pageNumber` 固定為 JSON `null`，並以 0-based `unitIndex` 標識文字單元（UI 顯示時加一）。總覽問答（「知識庫裡有哪些主題？」這類問題）的 source 另帶 `"catalog": true`：模型拿到的是整份文件的文件卡（檔名、摘要、標籤），`unitId` 只是該文件的第一個單元，引用內容要用 `GET /api/documents/{id}/units/{unitId}/catalog` 讀；其他 source 不帶這個欄位。同文件的不同頁不會去重，完整 SSE 範例如下：
 
 ```text
 data: {"type":"text-delta","text":"答案 [S1]"}
