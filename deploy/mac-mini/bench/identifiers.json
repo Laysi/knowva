@@ -1,0 +1,188 @@
+{
+  "version": 1,
+  "notes": "Exact-term questions (part and model numbers, regulation sections, form and publication numbers, names, acronyms, code identifiers, directory lookups) over files the other two datasets already use: the iiot_* files are in example_file/, the rest download from the urls in realistic.json. Put both sets in one directory to ingest them with --files. Scoring fields are the same as examples.json.",
+  "files": [
+    {
+      "filename": "OSHA 3080 Hand and Power Tools.pdf",
+      "url": "https://www.osha.gov/sites/default/files/publications/OSHA3080.pdf",
+      "sha256": "f1cfa8f10e7603d0ffebf6548dd9d65ca9067c380f3643bdb9b0b964be0c1ae0",
+      "source": "U.S. OSHA publication 3080 (2002 revised); U.S. federal government work",
+      "pages": 32
+    },
+    {
+      "filename": "Machine Guarding.pptx",
+      "url": "https://www.osha.gov/sites/default/files/2021-05/Machine%20Guarding.pptx",
+      "sha256": "10a8930cf4069555d0beaf48ef5618e1c31233c5d4fb30141b7f57c6e745438d",
+      "source": "OSHA Susan Harwood Training Grant SH-05029-SH8 (Pueblo Community College) training deck, published on osha.gov",
+      "pages": 75
+    },
+    {
+      "filename": "iiot_industry_report.pdf",
+      "pages": 14,
+      "visionPages": [7]
+    },
+    {
+      "filename": "iiot_sensor_inventory.xlsx",
+      "pages": 2,
+      "visionPages": []
+    },
+    {
+      "filename": "iiot_sensor_alert.eml",
+      "pages": 0,
+      "visionPages": []
+    },
+    {
+      "filename": "固定式起重機每月自動檢查紀錄表.docx",
+      "url": "https://orgws.kcg.gov.tw/001/KcgOrgUploadFiles/405/relfile/73920/206261/5484f128-12fd-482b-bbf5-4eec0463409c.docx",
+      "sha256": "e1d62e62ce481422066a83c14df1123243eb4ecaa8f1129d40a6ac41127450b7",
+      "source": "高雄市政府勞工局勞動檢查處公開的參考表單"
+    },
+    {
+      "filename": "iiot_load_cell_sensor.stp",
+      "pages": 0,
+      "visionPages": []
+    },
+    {
+      "filename": "112年重大職災分析.xlsx",
+      "url": "https://www.osha.gov.tw/media/31goibwr/7_%E9%87%8D%E5%A4%A7%E8%81%B7%E7%81%BD%E5%88%86%E6%9E%90-%E8%A1%A87-1%E8%87%B37-3.xlsx?mediaDL=true",
+      "sha256": "817e916cd172a5b5a15156f9ea66090439a1b65e0d4673ea0602884355debc2e",
+      "source": "勞動部職業安全衛生署 112 年勞動檢查統計年報，表 7-1 至 7-3"
+    },
+    {
+      "filename": "open62541 README.md",
+      "url": "https://raw.githubusercontent.com/open62541/open62541/fc0bf5614e92ab149cd4351cb7f3fdbeba391e0a/README.md",
+      "sha256": "96db6ac9e868e72e8a7e03aaad6bb78e2ffd658aa7b53169fbd3dd935a4f394e",
+      "source": "open62541 README at commit fc0bf56; MPL-2.0",
+      "pages": 0,
+      "visionPages": []
+    }
+  ],
+  "cases": [
+    {
+      "id": "id-osha-3104",
+      "category": "id-form",
+      "turns": ["OSHA 3104 是哪一份出版品？GPO 訂購編號與售價是多少？"],
+      "source": { "filename": "OSHA 3080 Hand and Power Tools.pdf", "pages": [21] },
+      "mustInclude": [["compliance kit"], ["929-016-00200-6"]]
+    },
+    {
+      "id": "id-osha-birmingham",
+      "category": "id-directory",
+      "turns": ["OSHA 在 Birmingham, AL 的 Area Office 電話是多少？"],
+      "source": { "filename": "OSHA 3080 Hand and Power Tools.pdf", "pages": [28] },
+      "mustInclude": [["731-1534"]]
+    },
+    {
+      "id": "id-osha-region-v",
+      "category": "id-directory",
+      "turns": ["OSHA Region V 的辦公室地址在哪裡？"],
+      "source": { "filename": "OSHA 3080 Hand and Power Tools.pdf", "pages": [31] },
+      "mustInclude": [["dearborn"], ["chicago", "芝加哥"]]
+    },
+    {
+      "id": "id-osha-847-phone",
+      "category": "id-directory",
+      "turns": ["電話 (847) 297-4810 是 OSHA 哪個單位的？"],
+      "source": { "filename": "OSHA 3080 Hand and Power Tools.pdf", "pages": [20] },
+      "mustInclude": [["training institute", "訓練", "培訓"]]
+    },
+    {
+      "id": "id-mg-grant",
+      "category": "id-form",
+      "turns": ["補助編號 SH-05029-SH8 是哪個機關核發的？"],
+      "source": { "filename": "Machine Guarding.pptx", "pages": [2] },
+      "mustInclude": [["occupational safety and health administration", "osha", "職業安全衛生署", "職業安全與衛生署", "職業安全衛生管理局", "職業安全與健康管理局"], ["department of labor", "勞工部"]]
+    },
+    {
+      "id": "id-mg-1910-212",
+      "category": "id-regulation",
+      "turns": ["1910.212(a)(1) 舉了哪些護罩方法的例子？"],
+      "source": { "filename": "Machine Guarding.pptx", "pages": [15] },
+      "mustInclude": [["barrier", "屏障", "阻隔", "隔離"], ["two-hand", "two hand", "twohand", "雙手"], ["electronic", "電子"]]
+    },
+    {
+      "id": "id-mg-1926-300",
+      "category": "id-regulation",
+      "turns": ["1926.300(b)(2) 要求護罩符合哪一份 ANSI 標準？"],
+      "source": { "filename": "Machine Guarding.pptx", "pages": [17] },
+      "mustInclude": [["b15.1"]]
+    },
+    {
+      "id": "id-mg-1928-57",
+      "category": "id-regulation",
+      "turns": ["引用 1928.57(b)(1)(i) 的那題測驗問的是什麼？"],
+      "source": { "filename": "Machine Guarding.pptx", "pages": [22] },
+      "mustInclude": [["tractor", "拖拉機", "曳引機", "牽引機"], ["master shield", "主護罩", "主防護罩", "主擋板", "主遮罩", "主護盾", "護罩", "護盾"]]
+    },
+    {
+      "id": "id-mg-ansi-b11-19",
+      "category": "id-acronym",
+      "turns": ["ANSI B11.19 在 2010 年版有哪兩項根本改變？"],
+      "source": { "filename": "Machine Guarding.pptx", "pages": [60] },
+      "mustInclude": [["所有機械", "所有機器", "所有的機械", "所有的機器", "all machines", "全部機械", "所有機台", "所有機具", "所有設備"], ["point of operation", "操作點", "作業點"]]
+    },
+    {
+      "id": "id-iiot-enc28j60",
+      "category": "id-part",
+      "turns": ["ENC28J60 開發板是哪家廠商的？它在硬體配置中負責什麼？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [7] },
+      "mustInclude": [["olimex"], ["ethernet", "乙太網", "以太網"]]
+    },
+    {
+      "id": "id-iiot-an128",
+      "category": "id-acronym",
+      "turns": ["參考文獻中 AN128 應用報告的作者是誰？主題是什麼？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [14] },
+      "mustInclude": [["selvig"], ["gcc", "gdb"]]
+    },
+    {
+      "id": "id-iiot-bloomberg",
+      "category": "id-name",
+      "turns": ["Jason Bloomberg 那篇文章的標題是什麼？"],
+      "source": { "filename": "iiot_industry_report.pdf", "pages": [14] },
+      "mustInclude": [["architecting the internet of things"]]
+    },
+    {
+      "id": "id-xlsx-ocr-002",
+      "category": "id-part",
+      "turns": ["SKU OCR-002 是什麼品項？數量多少？"],
+      "source": { "filename": "iiot_sensor_inventory.xlsx", "pages": [1] },
+      "mustInclude": [["label", "標籤"], ["6"]]
+    },
+    {
+      "id": "id-eml-message-id",
+      "category": "id-code",
+      "turns": ["Message-ID 為 support-thread-2207 的郵件是什麼時候寄出的？"],
+      "source": { "filename": "iiot_sensor_alert.eml", "pages": [null] },
+      "mustInclude": [["2026"], ["3 月 14", "3月14", "march 14", "14 mar", "2026-03-14", "03-14", "3/14"]]
+    },
+    {
+      "id": "id-crane-article-80",
+      "category": "id-regulation",
+      "turns": ["依「職業安全衛生管理辦法」第八十條，固定式起重機每月自動檢查紀錄表要保存幾年？"],
+      "source": { "filename": "固定式起重機每月自動檢查紀錄表.docx" },
+      "mustInclude": [["三年", "3 年", "3年"]]
+    },
+    {
+      "id": "id-stp-93520",
+      "category": "id-part",
+      "turns": ["93520-GA DBBSMM Load Cell 的 STEP 檔是哪一天產生的？"],
+      "source": { "filename": "iiot_load_cell_sensor.stp", "pages": [null] },
+      "mustInclude": [["2026-06-01", "2026 年 6 月 1", "2026年6月1", "2026/06/01", "2026/6/1"]]
+    },
+    {
+      "id": "id-xlsx-table-7-2",
+      "category": "id-form",
+      "turns": ["112年重大職災分析的表 7-2 統計的是什麼？涵蓋哪幾年？"],
+      "source": { "filename": "112年重大職災分析.xlsx" },
+      "mustInclude": [["千人率"], ["103"]]
+    },
+    {
+      "id": "id-md-run-until-interrupt",
+      "category": "id-code",
+      "turns": ["範例程式裡的 UA_Server_runUntilInterrupt 做什麼用？"],
+      "source": { "filename": "open62541 README.md", "pages": [null] },
+      "mustInclude": [["ctrl-c", "ctrl+c", "中斷", "interrupt"]]
+    }
+  ]
+}
