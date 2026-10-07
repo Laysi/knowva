@@ -521,3 +521,52 @@ Embed VL 用同一套移植（`Embedder`）：和 sentence-transformers 一樣�
 - 推論服務不再載入 PyTorch，footprint 中位數少 1.2 GB、最高少 1.8 GB。上傳階段推論服務最高 8.3 GB。
 
 之後權重改從 Hugging Face 的 `Laysi-ai/llama-nemotron-{embed,rerank}-vl-1b-v2-mlx` 下載（`setup/fetch-models.ts`）。這是 NVIDIA 權重換成移植的參數名稱與版面，bf16 數值不變。切換前後，推論服務對同一組請求的回應逐位相同：15 個 embed（查詢、文字、頁圖、頁圖＋文字）和 9 個 rerank（文字、頁圖、頁圖＋文字各 3 題）。切換前同一份服務連跑兩次也逐位相同，所以這個比對有效。切換後透過 app 問 realistic 第一題，答案正確，答案用到的頁排第一。比對工具是 `tools/knowva/service_outputs.py`，結果在 `hf-weights-switch-20261006/`。
+
+### 8.15 EmbeddingGemma 2（MLX）對 Nemotron Embed VL（2026-10-08）
+
+Google 10/06 發布的 EmbeddingGemma 2（740M：文字 270M、視覺 170M、音訊 300M；768 維，可截成 512／256／128；Apache 2.0），用 mlx-community 的 MLX 轉檔（`embeddinggemma-2-bf16` revision 1a4ffdd、`embeddinggemma-2-mxfp8` 0536fa4；mlx-vlm 3d87e884、MLX 0.32.3、transformers 5.19.0）和現行的 Nemotron Embed VL（MLX fp16、6 tiles，§8.14）比。只換 dense 這一段，BM25、RRF 與 Nemotron rerank 都不變。
+
+- 語料：用 main（ed45d8b）的映像在開發機另起一份 Knowva、接全新的資料庫，依序上傳 §8.9 的 8 份範例與 §8.10 的 9 份真實文件；入庫的 Nemotron 向量經 SSH 通道由 knowva-mac 的正式推論服務計算，和正式環境同一條路。共 397 個 unit，25 個送圖（21 個頁圖＋文字、4 張只有圖），各文件的看圖頁和 §8.11 相同。
+- 題目：兩份題組中有標準來源的 61 題，用最後一輪的提問檢索（後端只看最後一則使用者訊息，所以兩題追問的第二輪沒有上下文）。命中的定義同題組：檔名相符，有 `pages` 時頁碼也要相符（`null` 是文字 unit）。
+- EG2 的輸入照模型卡：查詢加 `task: search result | query: `（另試 `task: question answering | query: `）；文字 unit 與不送圖的頁是 `title: none | text: ` 加內容；送圖的頁是同一段前綴、頁面文字、再接圖（順序同 Nemotron 的 text_image）；只有圖的不加前綴（前綴只用在文字）。圖片預設 280 soft tokens，另試 1120。
+- 和官方 PyTorch fp32（sentence-transformers 6.1.0）在 11 個 unit（四種輸入都有）與 8 題 × 2 種查詢前綴上比 cosine：MLX bf16 最小 0.99984，mxfp8 最小 0.9982；1120 的圖片輸入和 280 的參考只有 0.91–0.98，預算確實改變了圖片的表示。
+
+速度與記憶體（`embed_corpus.py`）：每筆一個 forward、循序，和入庫時每頁一個請求相同；每組各自一個程序，MLX cache 上限 256 MB 同推論服務；開跑前正式推論服務沒有載入模型，Gemma 常駐。`run_embeds.sh` 依序跑完全部各組；先前另跑過一輪，向量逐位相同，每種輸入的平均時間差最多 6.2%（那一輪的查詢時間沒算前處理，不比）。
+
+| 每筆平均 | 文字（372） | 頁圖＋文字（21） | 只有圖（4） | 查詢 | 397 筆合計 | 程序 footprint 載入後／最高 | MLX 峰值 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Nemotron MLX fp16，6 tiles（現行） | 0.087s | 0.870s | 0.772s | 0.021s | 53.9s | 3.25／4.40 GiB | 3.81 GiB |
+| EG2 bf16，280 | 0.047s | 0.175s | 0.209s | 0.006s | 21.9s | 2.30／3.35 GiB | 2.11 GiB |
+| EG2 bf16，280，不載音訊塔 | 0.047s | 0.177s | 0.204s | 0.006s | 21.9s | 1.44／2.49 GiB | 1.54 GiB |
+| EG2 mxfp8，280 | 0.051s | 0.184s | 0.215s | 0.008s | 23.5s | 2.05／3.09 GiB | 1.86 GiB |
+| EG2 mxfp8，280，不載音訊塔 | 0.051s | 0.185s | 0.216s | 0.008s | 23.6s | 1.19／2.26 GiB | 1.29 GiB |
+| EG2 bf16，1120 | 0.046s | 1.216s | 1.244s | 0.006s | 47.8s | 2.29／4.73 GiB | 3.38 GiB |
+
+- footprint 是程序的 phys_footprint（`proc_pid_rusage`），查詢與每筆時間都含前處理。EG2 的程序含 PyTorch 與 transformers（見下面的部署條件），Nemotron 的沒有，所以比記憶體要看 footprint，不是 MLX 峰值。
+- Nemotron 這組用推論服務自己的 venv 與 `nemotron_vl_mlx`，算出的向量和資料庫裡的完全相同（cosine 1.0），所以量到的是正式服務的路徑。
+- 不載音訊塔的向量和完整模型逐位相同。EG2 文字 unit 的 token 數中位數 1237。
+
+檢索（`eval.ts`）：dense 取前 50，BM25 直接跑 `search.rs` 的 SQL，RRF k=60 取前 50，送正式推論服務的 Nemotron rerank（同一 modality 一批、每批 8 筆）取前 6。向量照資料庫轉成 halfvec：沒轉時 dense 第 11 名以後的順序和資料庫不同，轉了以後 61 題的前 50 名和後端 SQL 逐名相同（`dense-check.ts`；這個規模 Postgres 走 seq scan）。同一個實例用 `/api/chat` 問 4 題（pdf-p7-figure、poster-machine-causes、eml-subject、osha-p12-air-hose），後端回傳的 6 個來源和重現結果逐名相同（`backend-check.ts`）。
+
+| 61 題，標準來源在前幾名 | dense 第 1 | dense 前 6 | dense 前 10 | dense 前 50 | dense MRR | RRF 前 6 | RRF 前 50（rerank 候選） | 最終第 1 | 最終前 6 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Nemotron（現行） | 48 | 57 | 59 | 60 | 0.851 | 45 | 60 | 51 | 60 |
+| EG2 bf16，280 | 47 | 58 | 58 | 60 | 0.841 | 45 | 60 | 51 | 60 |
+| EG2 bf16，280，256 維 | 47 | 57 | 58 | 60 | 0.830 | 43 | 59 | — | — |
+| EG2 bf16，280，QA 前綴 | 46 | 58 | 59 | 60 | 0.827 | 46 | 60 | — | — |
+| EG2 bf16，1120 | 48 | 56 | 57 | 60 | 0.834 | 45 | 60 | — | — |
+| EG2 mxfp8，280 | 47 | 58 | 59 | 60 | 0.840 | 45 | 60 | — | — |
+
+- rerank 之後完全打平；最終前 6 名找不到的都是 pptx-content（投影片只有 Lorem ipsum，#41）。兩邊的最終前 6 名有 28 題逐名相同，平均重疊 4.9 筆。每題 rerank 6.3s 對 6.7s。在這份語料上換 embed 不改變最終取到的來源，差別在入庫速度（合計 53.9s→21.9s，頁圖＋文字快 5.0 倍）與記憶體（程序 footprint 最高 4.40→3.35 GiB，不載音訊塔 2.49 GiB，已含 PyTorch 與 transformers）。問答時查詢 embed 只要 0.02s 對 0.006s，每題 rerank 6.3s，換 embed 對問答速度幾乎沒有影響。
+- dense 的差異：EG2 把 §8.10 取不回的「機械災害預防海報」兩題從第 17、10 名拉到第 1 名，但 rerank 後兩邊都只排第 5、3 名。EG2 較差的是 eml-subject（dense 7→20，最終 3→5）、jpg-task（dense 1→6，最終都是第 1）與 pdf-follow-up 的第二輪（dense 1→11）。
+- 語料只有 397 個 unit，dense 前 50 兩邊都已涵蓋 60/61。文件多的時候候選池要靠 dense 前段的名次，這次前 10 是 59 對 58，看不出差別。
+- 1120 對文字頁沒有影響，圖片題反而較差（png-logo dense 2→12、png-arm-color 2→18）。截成 256 維 dense 幾乎不變，但 RRF 前 50 少 1 題。
+- rerank 偏好送圖的 passage，兩個模型都一樣：答案在文字的 40 題，RRF 候選中送圖的 passage 佔 12.4%（EG2 17.5%），最終前 6 名佔 37.5%（EG2 42.9%）。例如 osha-p9-circular-saw 的前 3 名是 OSHA 的第 3 頁、封面與封底（都是看圖頁），答案的第 9 頁（文字頁）排第 4。EG2 帶進較多圖片 passage，送給 Gemma 的圖也會多一些。
+
+部署條件：
+
+- transformers 5.19 的 `EmbeddingGemma2Processor` 沒有 PyTorch 就載入不了。推論服務若改用 EG2 要裝回 PyTorch（§8.14 剛拿掉），或像 `nemotron_vl_mlx` 一樣把前處理改寫成 numpy。空程序逐步 import 的 footprint：mlx、numpy、PIL 0.02 GiB，加 torch 與 torchvision 0.23 GiB，再加 transformers 與 EG2 處理器（詞表 26 萬）0.59 GiB，前處理 5 張頁圖後 0.67 GiB；現行服務的 import（`nemotron_vl_mlx`、fastapi）是 0.05 GiB。改寫前處理只省得掉 torch 那一段，tokenizer 仍要載入。
+- 向量從 2048 維改成 768 維，`document_units.embedding`（`halfvec(2048)`）與索引都要改，所有文件要重新 embed。rerank 仍是 Nemotron，它的權重還是要留。
+- mlx-vlm 的 EG2 支援在 3d87e884 這個 commit，main 已合併但還沒發版（PyPI 最新 0.7.6）。
+
+工具在 `deploy/mac-mini/bench/embeddinggemma2/`：`upload.ts` 依序上傳、`export-corpus.sh` 匯出語料與題目、`run_embeds.sh` 在 knowva-mac 上依序跑各組（`embed_corpus.py`）與 PyTorch 參考（`reference.py`）、`eval.ts` 重現檢索、`summarize.ts` 彙總、`dense-check.ts` 與 `backend-check.ts` 核對重現結果。結果在 `knowva-mac:~/knowva-inference/bench-results/embeddinggemma2-20261008/`，同一目錄另有入庫後的資料庫 dump（`knowva_eg2.dump`，`pg_dump -Fc`）與它的 FILES_DIR（`knowva_eg2-files.tgz`），還原後不必重新入庫就能重跑 `eval.ts`。
