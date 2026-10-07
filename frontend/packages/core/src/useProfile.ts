@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 /** A page's heading and the sentence under it. */
-export type ProfilePage = { title: string; description: string };
+export type ProfilePage = { title: string };
 
 /**
  * A suggested question. `catalog` marks a whole-knowledge-base overview
@@ -51,7 +51,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const isPage = (value: unknown): value is ProfilePage =>
-  isRecord(value) && isString(value.title) && isString(value.description);
+  isRecord(value) && isString(value.title);
 
 const isSuggestion = (value: unknown): value is ProfileSuggestion =>
   isRecord(value) && isString(value.text) && typeof value.catalog === "boolean";

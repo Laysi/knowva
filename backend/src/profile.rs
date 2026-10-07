@@ -94,7 +94,6 @@ pub struct Pages {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PageCopy {
     title: String,
-    description: String,
 }
 
 /// A suggested question. `catalog` declares that the question is a whole-knowledge-base
@@ -312,12 +311,7 @@ fn validate_copy(file: &ProfileFile) -> anyhow::Result<()> {
         ("brand.name", &file.brand.name),
         ("brand.tagline", &file.brand.tagline),
         ("pages.chat.title", &file.pages.chat.title),
-        ("pages.chat.description", &file.pages.chat.description),
         ("pages.documents.title", &file.pages.documents.title),
-        (
-            "pages.documents.description",
-            &file.pages.documents.description,
-        ),
         ("composerPlaceholder", &file.composer_placeholder),
     ] {
         if value.trim().is_empty() {
@@ -402,8 +396,8 @@ pub(crate) mod test_support {
             "theme": theme,
             "brand": { "name": "測試品牌", "tagline": "測試標語" },
             "pages": {
-                "chat": { "title": "問答頁", "description": "問答說明" },
-                "documents": { "title": "文件頁", "description": "文件說明" }
+                "chat": { "title": "問答頁" },
+                "documents": { "title": "文件頁" }
             },
             "suggestions": [
                 { "text": "知識庫有哪些主題？", "catalog": true },

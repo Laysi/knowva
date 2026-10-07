@@ -67,8 +67,8 @@ const CONTRACT_PROFILE: Profile = {
   theme: "contract",
   brand: { name: "契約品牌名稱", tagline: "契約品牌標語" },
   pages: {
-    chat: { title: "契約問答頁標題", description: "契約問答頁說明" },
-    documents: { title: "契約文件頁標題", description: "契約文件頁說明" },
+    chat: { title: "契約問答頁標題" },
+    documents: { title: "契約文件頁標題" },
   },
   suggestions: [
     { text: "契約總覽建議問題？", catalog: true },

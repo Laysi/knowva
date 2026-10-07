@@ -160,7 +160,7 @@ profiles/<id>/
 |---|---|
 | `theme` | 前端主題名稱，後端提供 `../frontend/dist/<theme>`；同一個主題可以給多個 profile 共用。只允許小寫英數與 `-` |
 | `brand.name`、`brand.tagline` | 品牌名稱與標語 |
-| `pages.chat`、`pages.documents` | 問答頁與文件頁的 `title`、`description` |
+| `pages.chat`、`pages.documents` | 問答頁與文件頁的 `title` |
 | `suggestions` | 建議問題 `{ "text", "catalog" }`；`catalog: true` 表示這題會走總覽（全庫文件清單）路徑，測試會逐一驗證標記與實際判斷一致 |
 | `composerPlaceholder` | 輸入框提示 |
 | `catalogKeywords.scope`、`catalogKeywords.intent` | 總覽關鍵字：問題同時含一個 scope 詞與一個 intent 詞時，改以全庫文件清單回答；比對不分大小寫。只留在後端，不會送到瀏覽器 |
@@ -257,6 +257,7 @@ proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸�
 - 隔離完全靠 token 保密。每個查詢都限定目前 cookie 的擁有者，存取不屬於自己或不存在的對話一律回 404，不透露那串對話是否存在。資料表以 `owner_kind`（`anonymous` 或 `user`，目前只寫入 `anonymous`）與 `owner_id` 表示擁有者，之後加入登入時可以用一個 `UPDATE` 把匿名對話轉給帳號。
 - 標題由後端在保存第一則使用者訊息時產生：去掉頭尾空白、連續空白併成一個空格，再取前 30 個 Unicode 字元，不呼叫模型。
 - 每則回答連同 `sources` data part 一起保存，串流中斷或出錯的回答也照樣保存（狀態為 `incomplete`）；重新整理後追問，送出的 `previousSources` 和沒重新整理時相同。重新整理後會回到最近更新的那串對話。
+- 側欄的「近期對話」依最後更新時間排列，每串標示多久前更新；在較舊的對話裡發問後，那串會移到最上面。
 - 保存失敗時問答照常，畫面顯示一行「這串對話無法保存」的提示。連線失敗、408、429 與 5xx 會在這串對話的下一則訊息前重送；其他 4xx 讓這串對話在這個頁面裡停止保存。對話清單載入失敗時，清單位置顯示 core 的安全化訊息與「重新載入」按鈕。
 - 不做重新命名、封存、搜尋、匯出、自動過期與速率限制。
 
@@ -286,11 +287,8 @@ proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸�
   "theme": "default",
   "brand": { "name": "Knowva 知星", "tagline": "點亮你的知識星系" },
   "pages": {
-    "chat": { "title": "知識問答", "description": "查詢已建立索引的公司文件。" },
-    "documents": {
-      "title": "文件管理",
-      "description": "上傳後，知星會讀完文件、整理摘要，並建立索引供查詢。"
-    }
+    "chat": { "title": "知識問答" },
+    "documents": { "title": "文件管理" }
   },
   "suggestions": [
     { "text": "知識庫裡有哪些主題？", "catalog": true },
