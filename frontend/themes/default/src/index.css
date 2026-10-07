@@ -1,7 +1,7 @@
 /* ============================================================
    Knowva — design tokens
-   "Nova on light": white workspace, deep-space navigation rail,
-   a violet-to-amber nova as the single accent gradient.
+   Petrol teal on cool neutrals: a light navigation rail, a white
+   workspace, and one flat accent colour with no gradients.
    ============================================================ */
 :root {
   /* ---- Typography ---- */
@@ -10,73 +10,42 @@
   --font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Courier New",
     monospace;
 
-  /* ---- Nova accent ---- */
-  --color-accent: #6d4aff;
-  --color-accent-hover: #5a37f0;
-  --color-accent-active: #4a2ad6;
-  --color-accent-weak: #efebff;
-  --color-accent-weak-border: #ddd6ff;
-  --color-accent-ring: rgba(109, 74, 255, 0.24);
-  --color-flare: #ff9f1c;
-  /* The specular highlight lives inside the gradient, so every nova surface
-     (brand mark, avatar, send button, active bar) is polished, not flat. */
-  --gradient-nova: radial-gradient(
-      88% 88% at 14% 2%,
-      rgba(255, 255, 255, 0.34),
-      rgba(255, 255, 255, 0) 48%
-    ),
-    linear-gradient(135deg, #6d4aff 0%, #a855f7 52%, #ff9f1c 100%);
-  --gradient-nova-soft: radial-gradient(
-      88% 88% at 16% 2%,
-      rgba(255, 255, 255, 0.6),
-      rgba(255, 255, 255, 0) 52%
-    ),
-    linear-gradient(
-      135deg,
-      rgba(109, 74, 255, 0.24) 0%,
-      rgba(255, 159, 28, 0.24) 100%
-    );
-  /* A lit top edge and a shaded bottom one — the rest of the gloss. */
-  --gloss-edge: inset 0 1px 0 rgba(255, 255, 255, 0.42),
-    inset 0 -1px 0 rgba(12, 6, 40, 0.2);
-
-  /* ---- Deep space (navigation rail) ---- */
-  --color-space: #101436;
-  --color-space-deep: #0a0d26;
-  --color-space-line: rgba(255, 255, 255, 0.09);
-  --color-space-text: #eceefb;
-  --color-space-text-muted: #9aa0c8;
-  --color-space-hover: rgba(255, 255, 255, 0.07);
-  --color-space-active: rgba(255, 255, 255, 0.12);
+  /* ---- Accent ---- */
+  --color-accent: #0e6b7c;
+  --color-accent-hover: #0b5768;
+  --color-accent-active: #094b5a;
+  --color-accent-weak: #e9f2f4;
+  --color-accent-weak-border: #cbe0e4;
+  --color-accent-ring: rgba(14, 107, 124, 0.28);
 
   /* ---- Surfaces ---- */
-  --color-canvas: #f7f8fc;
+  --color-canvas: #f3f6f8;
   --color-surface: #ffffff;
-  --color-surface-sunken: #f2f4fa;
-  --color-surface-hover: #eef0f8;
-  --color-surface-zebra: #fafbfe;
+  --color-surface-sunken: #f1f5f7;
+  --color-surface-hover: #eef2f5;
+  --color-surface-zebra: #f8fafb;
 
-  --color-border: #e6e9f2;
-  --color-border-strong: #d5dae8;
+  --color-border: #e4e9ee;
+  --color-border-strong: #d3dbe2;
 
-  --color-text: #10142a;
-  --color-text-secondary: #4c5474;
+  --color-text: #17242e;
+  --color-text-secondary: #52616f;
   /* muted carries real body copy, so it clears AA (4.7:1 on the canvas);
-     faint is for icons and placeholders only, at 3.1:1. */
-  --color-text-muted: #686f8a;
-  --color-text-faint: #848ca9;
+     faint is for icons and borders only, at 3.2:1. */
+  --color-text-muted: #627080;
+  --color-text-faint: #7f8c99;
 
   /* ---- Status ---- */
-  --color-success: #17915e;
-  --color-success-bg: #e6f6ee;
-  --color-success-text: #0f6b45;
-  --color-warning: #b4690e;
-  --color-warning-bg: #fdf1de;
-  --color-warning-text: #8a4f04;
-  --color-danger: #d0384a;
-  --color-danger-bg: #fdecef;
-  --color-danger-border: #f7d2d9;
-  --color-danger-text: #a32236;
+  --color-success: #2f8a56;
+  --color-success-bg: #e7f4ec;
+  --color-success-text: #206b40;
+  --color-warning: #b26a08;
+  --color-warning-bg: #fbf0dc;
+  --color-warning-text: #895205;
+  --color-danger: #c53b30;
+  --color-danger-bg: #fbe9e6;
+  --color-danger-border: #f2cfca;
+  --color-danger-text: #9a2b22;
 
   /* ---- Semantic roles (theme contract) ----
      @knowva/core checks text and each status colour on the background, and
@@ -108,11 +77,10 @@
   --radius-full: 999px;
 
   /* ---- Elevation ---- */
-  --shadow-xs: 0 1px 2px rgba(16, 20, 42, 0.05);
-  --shadow-sm: 0 1px 2px rgba(16, 20, 42, 0.06), 0 2px 8px rgba(16, 20, 42, 0.05);
-  --shadow-md: 0 6px 18px rgba(16, 20, 42, 0.09);
-  --shadow-lg: 0 18px 44px rgba(16, 20, 42, 0.16);
-  --shadow-nova: 0 6px 20px rgba(109, 74, 255, 0.28);
+  --shadow-xs: 0 1px 2px rgba(17, 36, 46, 0.05);
+  --shadow-sm: 0 1px 2px rgba(17, 36, 46, 0.06), 0 2px 8px rgba(17, 36, 46, 0.05);
+  --shadow-md: 0 6px 18px rgba(17, 36, 46, 0.08);
+  --shadow-lg: 0 18px 44px rgba(17, 36, 46, 0.14);
 
   color-scheme: light;
   font-family: var(--font-sans);
@@ -201,7 +169,7 @@ textarea {
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background: #bcc3d6;
+  background: #b8c3cc;
   background-clip: padding-box;
   border: 3px solid transparent;
 }
