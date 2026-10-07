@@ -27,6 +27,8 @@
     "jsdom": "^29.1.1",
     "oxlint": "^1.71.0",
     "react-dom": "^19.2.7",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "typescript": "~6.0.2",
     "vite": "^8.1.1",
     "vitest": "^4.1.10"

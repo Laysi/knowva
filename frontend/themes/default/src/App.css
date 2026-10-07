@@ -794,6 +794,179 @@
   border-radius: var(--radius-sm);
 }
 
+.source-entry {
+  padding: 0;
+  font-size: inherit;
+  line-height: inherit;
+  text-align: left;
+  color: inherit;
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  text-decoration: underline;
+  text-decoration-color: var(--color-border-strong);
+  text-underline-offset: 3px;
+}
+
+.source-entry:hover {
+  color: var(--color-accent-active);
+  text-decoration-color: currentColor;
+}
+
+/* An answer's inline [S1]. */
+.source-marker {
+  margin: 0 1px;
+  padding: 0 4px;
+  font-size: 0.82em;
+  font-weight: 600;
+  line-height: inherit;
+  color: var(--color-accent-active);
+  background: var(--color-accent-weak);
+  border: none;
+  border-radius: 5px;
+}
+
+.source-marker:hover {
+  background: var(--color-accent-weak-border);
+}
+
+/* What a source cited, in a modal dialog. */
+.source-preview {
+  width: min(880px, calc(100vw - 32px));
+  max-width: none;
+  max-height: calc(100dvh - 32px);
+  padding: 0;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+}
+
+.source-preview[open] {
+  display: flex;
+}
+
+.source-preview::backdrop {
+  background: rgba(8, 10, 30, 0.48);
+}
+
+.source-preview-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.source-preview-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-3) var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.source-preview-head h2 {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+.source-preview-close {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  font-size: 20px;
+  color: var(--color-text-secondary);
+  background: none;
+  border: none;
+  border-radius: var(--radius-md);
+}
+
+.source-preview-close:hover {
+  color: var(--color-text);
+  background: var(--color-surface-hover);
+}
+
+.source-preview-body {
+  flex: 1;
+  min-height: 0;
+  padding: var(--space-4) var(--space-5);
+  overflow-y: auto;
+  background: var(--color-surface-sunken);
+}
+
+.source-preview-body img {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #fff;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.source-preview-text {
+  padding: var(--space-4) var(--space-5);
+  font-size: 15px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.source-preview-status {
+  padding: var(--space-8) 0;
+  font-size: 14px;
+  text-align: center;
+  color: var(--color-text-muted);
+}
+
+.source-preview-error {
+  padding: var(--space-3) var(--space-4);
+  font-size: 14px;
+  color: var(--color-danger-text);
+  background: var(--color-danger-bg);
+  border: 1px solid var(--color-danger-border);
+  border-radius: var(--radius-md);
+}
+
+.source-preview-foot {
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--space-3) var(--space-5);
+  border-top: 1px solid var(--color-border);
+}
+
+.source-preview-download {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-accent-active);
+  text-decoration: none;
+  background: var(--color-accent-weak);
+  border: 1px solid var(--color-accent-weak-border);
+  border-radius: var(--radius-md);
+}
+
+.source-preview-download:hover {
+  background: var(--color-accent-weak-border);
+}
+
+.source-preview-download:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
 /* Streaming caret */
 .aui-md[data-status="running"] > :last-child::after {
   content: "";
@@ -1580,6 +1753,18 @@
   .topbar-new:hover {
     color: var(--color-text);
     background: var(--color-surface-hover);
+  }
+  .source-preview-head {
+    padding-left: var(--space-4);
+  }
+  .source-preview-body {
+    padding: var(--space-3);
+  }
+  .source-preview-text {
+    padding: var(--space-3) var(--space-4);
+  }
+  .source-preview-foot {
+    padding: var(--space-3) var(--space-4);
   }
 }
 

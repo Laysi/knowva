@@ -12,6 +12,11 @@ export type ChatSource = {
   filename: string;
   pageNumber: number | null;
   kind: "page" | "text";
+  /**
+   * Set on a catalog answer's sources: the answer saw the document's card
+   * (filename, summary, tags), and `unitId` is only its first unit.
+   */
+  catalog?: boolean;
 };
 
 /**
@@ -106,6 +111,7 @@ const isChatSource = (value: unknown): value is ChatSource => {
         value.unitIndex >= 0)) &&
     typeof value.filename === "string" &&
     value.filename.length > 0 &&
+    (value.catalog === undefined || typeof value.catalog === "boolean") &&
     ((value.kind === "page" &&
       typeof value.pageNumber === "number" &&
       Number.isSafeInteger(value.pageNumber) &&

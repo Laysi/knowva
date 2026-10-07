@@ -4,7 +4,7 @@ import type {
   ChatModelRunResult,
   ThreadAssistantMessagePart,
 } from "@assistant-ui/react";
-import { BackendAdapter } from "./BackendAdapter";
+import { BackendAdapter, sourceData } from "./BackendAdapter";
 
 const runOptions = (
   messages: readonly unknown[] = [],
@@ -267,5 +267,25 @@ describe("BackendAdapter", () => {
       "系統暫時無法產生回覆，請稍後再試。",
     );
     expect((thrown as Error).message).not.toContain(rawSecret);
+  });
+});
+
+describe("sourceData", () => {
+  const source = {
+    sourceId: "S1",
+    documentId: "document",
+    unitId: 41,
+    unitIndex: 0,
+    filename: "manual.pdf",
+    pageNumber: null,
+    kind: "text",
+  };
+
+  it("accepts the catalog marker only as a boolean", () => {
+    expect(sourceData([{ ...source, catalog: true }])).toEqual([
+      { ...source, catalog: true },
+    ]);
+    expect(sourceData([source])).toEqual([source]);
+    expect(sourceData([{ ...source, catalog: "true" }])).toBeNull();
   });
 });

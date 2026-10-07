@@ -27,6 +27,15 @@ export type {
   ConversationHistory,
   KnowvaRuntime,
 } from "./useKnowvaRuntime";
+export {
+  documentFileUrl,
+  remarkSourceMarkers,
+  SOURCE_MARKER_ELEMENT,
+  sourcePreviewErrorMessage,
+  useMessageSources,
+  useSourcePreview,
+} from "./sourcePreview";
+export type { SourcePreview } from "./sourcePreview";
 export { isProfile, profileRequestErrorMessage, useProfile } from "./useProfile";
 export type {
   Profile,

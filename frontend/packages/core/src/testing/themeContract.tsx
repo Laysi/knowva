@@ -20,6 +20,7 @@ import {
   conversationRequestErrorMessage,
 } from "../conversationApi";
 import { MAX_UPLOAD_BYTES, validateUploadFile } from "../DocumentModel";
+import { documentFileUrl, sourcePreviewErrorMessage } from "../sourcePreview";
 import { profileRequestErrorMessage } from "../useProfile";
 import type { Profile } from "../useProfile";
 import { themeContrasts, WCAG_AA_TEXT_CONTRAST } from "./themeColors";
@@ -37,6 +38,8 @@ export type ThemeContractHarness = {
    * presses the button named 新對話, opens a conversation with the button named
    * by its title, deletes one with the button whose name holds 刪除 and the
    * title, and clears them all with 清除全部對話 followed by 確定清除 in the page.
+   * It opens a cited source with the button whose name holds its filename, or
+   * by clicking the answer's `[S1]`, and looks for what it cited in the page.
    */
   renderChat: () => ReactElement;
   /**
@@ -95,6 +98,18 @@ const TEXT_SOURCE: ChatSource = {
   filename: "維運交接筆記.md",
   pageNumber: null,
   kind: "text",
+};
+
+/** A catalog answer's source: the card of a document whose first unit is a page. */
+const CATALOG_SOURCE: ChatSource = {
+  sourceId: "S1",
+  documentId: "manual",
+  unitId: 101,
+  unitIndex: 0,
+  filename: "設備保養手冊.pdf",
+  pageNumber: null,
+  kind: "text",
+  catalog: true,
 };
 
 const encoder = new TextEncoder();
@@ -297,11 +312,31 @@ const sentRequests = (fetchMock: ReturnType<typeof stubFetch>) =>
 const pageText = () => document.body.textContent ?? "";
 
 /**
- * jsdom has no layout. Fill in the few layout APIs chat surfaces call, for the
- * duration of one test, without replacing anything jsdom does provide.
+ * jsdom has no layout and no modal dialogs, and object URLs only where Node's
+ * `URL` stands in for its own. Fill in the few APIs chat surfaces call, for
+ * the duration of one test, without replacing anything that is provided. A
+ * modal dialog only opens and closes.
  */
-const installLayoutStubs = () => {
+const installBrowserStubs = () => {
   const restore: (() => void)[] = [];
+  const fillIn = (target: object, name: string, value: unknown) => {
+    if (typeof (target as Record<string, unknown>)[name] === "function") return;
+    Object.defineProperty(target, name, { configurable: true, writable: true, value });
+    restore.push(() => {
+      delete (target as Record<string, unknown>)[name];
+    });
+  };
+  fillIn(HTMLDialogElement.prototype, "showModal", function (this: HTMLDialogElement) {
+    this.open = true;
+  });
+  fillIn(HTMLDialogElement.prototype, "close", function (this: HTMLDialogElement) {
+    if (!this.open) return;
+    this.open = false;
+    this.dispatchEvent(new Event("close"));
+  });
+  let objectUrls = 0;
+  fillIn(URL, "createObjectURL", () => `blob:knowva-contract/${(objectUrls += 1)}`);
+  fillIn(URL, "revokeObjectURL", () => undefined);
   if (!("ResizeObserver" in globalThis)) {
     vi.stubGlobal(
       "ResizeObserver",
@@ -313,15 +348,7 @@ const installLayoutStubs = () => {
     );
   }
   for (const method of ["scrollTo", "scrollIntoView"] as const) {
-    if (typeof Element.prototype[method] === "function") continue;
-    Object.defineProperty(Element.prototype, method, {
-      configurable: true,
-      writable: true,
-      value: () => undefined,
-    });
-    restore.push(() => {
-      delete (Element.prototype as Partial<Element>)[method];
-    });
+    fillIn(Element.prototype, method, () => undefined);
   }
   return () => restore.forEach((undo) => undo());
 };
@@ -379,6 +406,27 @@ const expectShown = async (
   });
 };
 
+/** Cites both contract sources inline, the way the answer prompt asks. */
+const CITED_ANSWER = "保養週期請依照手冊執行 [S1]。交接細節見筆記 [S2]。";
+const CITED_PASSAGE = "交接時請確認備品庫存與上次保養紀錄。";
+const PAGE_IMAGE_ROUTE = `GET /api/documents/${PAGE_SOURCE.documentId}/units/${PAGE_SOURCE.unitId}/image`;
+const TEXT_ROUTE = `GET /api/documents/${TEXT_SOURCE.documentId}/units/${TEXT_SOURCE.unitId}/text`;
+
+const pageImageResponse = () =>
+  new Response(new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])]), {
+    headers: { "Content-Type": "image/png" },
+  });
+
+/** The control that opens a cited source: the one whose name holds its filename. */
+const sourceButton = (filename: string) =>
+  screen.getByRole("button", { name: (name) => name.includes(filename) });
+
+/** The page image of an opened page source, from the object URL core made for it. */
+const citedImage = () => document.querySelector('img[src^="blob:"]');
+
+const originalFileLink = (source: ChatSource) =>
+  document.querySelector(`a[href="${documentFileUrl(source.documentId)}"]`);
+
 const answerEvents = (text: string, sources: readonly ChatSource[]) => [
   { type: "text-delta", text },
   { type: "sources", sources },
@@ -424,7 +472,7 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
   describe(`theme contract: ${harness.name}`, () => {
     let alert: MockInstance<typeof window.alert>;
     let confirm: MockInstance<typeof window.confirm>;
-    let removeLayoutStubs: () => void = () => undefined;
+    let removeBrowserStubs: () => void = () => undefined;
 
     beforeEach(() => {
       if (typeof document === "undefined") {
@@ -432,14 +480,14 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
           "the theme contract needs a DOM: add `// @vitest-environment jsdom` to the test file",
         );
       }
-      removeLayoutStubs = installLayoutStubs();
+      removeBrowserStubs = installBrowserStubs();
       alert = vi.spyOn(window, "alert").mockImplementation(() => undefined);
       confirm = vi.spyOn(window, "confirm").mockImplementation(() => true);
     });
 
     afterEach(() => {
       cleanup();
-      removeLayoutStubs();
+      removeBrowserStubs();
       vi.restoreAllMocks();
       vi.unstubAllGlobals();
     });
@@ -463,6 +511,101 @@ export function describeThemeContract(harness: ThemeContractHarness): void {
       expect(page, "page source entry").toBeDefined();
       expect(text, "text source entry").toBeDefined();
       expect(page!.textContent).toMatch(/(?<!\d)37(?!\d)/);
+    });
+
+    it("opens a page source's cited page from its entry and offers the original file", async () => {
+      const { fetchMock } = stubChat(
+        [answerEvents(CITED_ANSWER, [PAGE_SOURCE, TEXT_SOURCE])],
+        undefined,
+        { [PAGE_IMAGE_ROUTE]: pageImageResponse },
+      );
+      render(harness.renderChat());
+
+      await ask("馬達多久保養一次？");
+      await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
+      fireEvent.click(sourceButton(PAGE_SOURCE.filename));
+
+      await waitFor(() => expect(citedImage()).not.toBeNull());
+      expect(sentRequests(fetchMock)).toContain(PAGE_IMAGE_ROUTE);
+      expect(sentRequests(fetchMock)).not.toContain(TEXT_ROUTE);
+      expect(originalFileLink(PAGE_SOURCE)).not.toBeNull();
+    });
+
+    it("opens a text source's cited passage from its entry", async () => {
+      stubChat([answerEvents(CITED_ANSWER, [PAGE_SOURCE, TEXT_SOURCE])], undefined, {
+        [TEXT_ROUTE]: () =>
+          new Response(CITED_PASSAGE, {
+            headers: { "Content-Type": "text/plain; charset=utf-8" },
+          }),
+      });
+      render(harness.renderChat());
+
+      await ask("交接要注意什麼？");
+      await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
+      fireEvent.click(sourceButton(TEXT_SOURCE.filename));
+
+      await waitFor(() => expect(pageText()).toContain(CITED_PASSAGE));
+      expect(originalFileLink(TEXT_SOURCE)).not.toBeNull();
+    });
+
+    it("opens the source an answer's [S1] cites", async () => {
+      const { fetchMock } = stubChat(
+        [answerEvents(CITED_ANSWER, [PAGE_SOURCE, TEXT_SOURCE])],
+        undefined,
+        { [PAGE_IMAGE_ROUTE]: pageImageResponse },
+      );
+      render(harness.renderChat());
+
+      await ask("馬達多久保養一次？");
+      await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
+      fireEvent.click(screen.getByText(`[${PAGE_SOURCE.sourceId}]`));
+
+      await waitFor(() => expect(citedImage()).not.toBeNull());
+      expect(sentRequests(fetchMock)).toContain(PAGE_IMAGE_ROUTE);
+      expect(sentRequests(fetchMock)).not.toContain(TEXT_ROUTE);
+    });
+
+    it("opens a catalog answer's source as the document card the answer saw", async () => {
+      const card = "文件名稱：設備保養手冊.pdf\n摘要：馬達與輸送帶的保養週期";
+      const { fetchMock } = stubChat(
+        [answerEvents("知識庫收錄設備保養手冊 [S1]。", [CATALOG_SOURCE])],
+        undefined,
+        {
+          [`GET /api/documents/${CATALOG_SOURCE.documentId}/units/${CATALOG_SOURCE.unitId}/catalog`]: () =>
+            new Response(card, {
+              headers: { "Content-Type": "text/plain; charset=utf-8" },
+            }),
+        },
+      );
+      render(harness.renderChat());
+
+      await ask("知識庫裡有哪些主題？");
+      await waitFor(() => expect(pageText()).toContain(CATALOG_SOURCE.filename));
+      fireEvent.click(sourceButton(CATALOG_SOURCE.filename));
+
+      await waitFor(() => expect(pageText()).toContain("馬達與輸送帶的保養週期"));
+      // Its unitId is only the document's first unit, never what was cited.
+      expect(
+        sentRequests(fetchMock).filter((request) => /\/units\/\d+\/(text|image)$/.test(request)),
+      ).toEqual([]);
+      expect(originalFileLink(CATALOG_SOURCE)).not.toBeNull();
+    });
+
+    it("shows core's safe message when a cited source is gone", async () => {
+      stubChat([answerEvents(CITED_ANSWER, [PAGE_SOURCE, TEXT_SOURCE])], undefined, {
+        [PAGE_IMAGE_ROUTE]: () => new Response(RAW_SECRET, { status: 404 }),
+      });
+      render(harness.renderChat());
+
+      await ask("馬達多久保養一次？");
+      await waitFor(() => expect(pageText()).toContain(TEXT_SOURCE.filename));
+      fireEvent.click(sourceButton(PAGE_SOURCE.filename));
+
+      await waitFor(() =>
+        expect(pageText()).toContain(sourcePreviewErrorMessage(404)),
+      );
+      expect(pageText()).not.toContain(RAW_SECRET);
+      expect(citedImage()).toBeNull();
     });
 
     it("shows core's safe message for an SSE error event", async () => {

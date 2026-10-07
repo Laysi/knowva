@@ -78,6 +78,14 @@ export const UploadIcon = ({ className }: IconProps) => (
   </svg>
 );
 
+export const DownloadIcon = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <path d="M21 15v3.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V15" />
+    <path d="M7.5 10.5 12 15l4.5-4.5" />
+    <path d="M12 15V4" />
+  </svg>
+);
+
 export const CompassIcon = ({ className }: IconProps) => (
   <svg {...base} className={className}>
     <circle cx="12" cy="12" r="8.6" />

@@ -15,15 +15,60 @@ import {
   ListIcon,
   UserIcon,
   ArrowRightIcon,
+  CloseIcon,
+  DownloadIcon,
 } from "./Icons";
-import type { ReactNode } from "react";
+import { createContext, useContext, useEffect, useId, useRef, useState } from "react";
+import type { ComponentProps, ReactNode } from "react";
+import {
+  documentFileUrl,
+  remarkSourceMarkers,
+  SOURCE_MARKER_ELEMENT,
+  useMessageSources,
+  useSourcePreview,
+} from "@knowva/core";
 import type { ChatSource, ProfileSuggestion } from "@knowva/core";
 
+/** Opens a source in its message's preview; null outside an assistant message. */
+const OpenSourceContext = createContext<((source: ChatSource) => void) | null>(
+  null,
+);
+
+type SourceMarkerProps = ComponentProps<"button"> & {
+  "data-source-id"?: unknown;
+};
+
+/** An answer's `[S1]`: a button when the message has that source, text otherwise. */
+const SourceMarker = ({ children, "data-source-id": sourceId }: SourceMarkerProps) => {
+  const open = useContext(OpenSourceContext);
+  const source = useMessageSources().find((entry) => entry.sourceId === sourceId);
+  if (!open || !source) return <>{children}</>;
+  return (
+    <button
+      type="button"
+      className="source-marker"
+      title={sourceLabel(source)}
+      onClick={() => open(source)}
+    >
+      {children}
+    </button>
+  );
+};
+
+const REMARK_PLUGINS = [remarkGfm, remarkSourceMarkers];
+const MARKDOWN_COMPONENTS = { [SOURCE_MARKER_ELEMENT]: SourceMarker };
+
 const MarkdownText = () => (
-  <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} className="aui-md" />
+  <MarkdownTextPrimitive
+    remarkPlugins={REMARK_PLUGINS}
+    components={MARKDOWN_COMPONENTS}
+    className="aui-md"
+  />
 );
 
 const sourceLabel = (source: ChatSource): string => {
+  // A catalog answer cited the whole document's card, not one passage.
+  if (source.catalog === true) return source.filename;
   if (source.kind === "page") {
     return source.pageNumber !== null && Number.isFinite(source.pageNumber)
       ? `${source.filename} · 第 ${source.pageNumber} 頁`
@@ -40,6 +85,7 @@ const sourceLabel = (source: ChatSource): string => {
 type SourceListProps = Pick<DataMessagePartProps<ChatSource[]>, "data">;
 
 export const SourceList = ({ data }: SourceListProps) => {
+  const open = useContext(OpenSourceContext);
   if (!Array.isArray(data) || data.length === 0) return null;
 
   return (
@@ -47,10 +93,102 @@ export const SourceList = ({ data }: SourceListProps) => {
       <h3>資料來源</h3>
       <ol>
         {data.map((source) => (
-          <li key={source.sourceId}>{sourceLabel(source)}</li>
+          <li key={source.sourceId}>
+            <button
+              type="button"
+              className="source-entry"
+              onClick={() => open?.(source)}
+            >
+              {sourceLabel(source)}
+            </button>
+          </li>
         ))}
       </ol>
     </section>
+  );
+};
+
+type SourcePreviewDialogProps = {
+  /** The source to show; null keeps the dialog closed. */
+  source: ChatSource | null;
+  onClose: () => void;
+};
+
+/**
+ * What one source cited, in a modal dialog: the page image or the passage,
+ * and the original file to download. The dialog follows `source`. Escape (its
+ * `cancel` event), the close button and a click on the backdrop each call
+ * `onClose` straight away: the `close` event comes later, and a hidden tab
+ * may not get it at all, so it only covers any other way the dialog closes.
+ */
+export const SourcePreviewDialog = ({
+  source,
+  onClose,
+}: SourcePreviewDialogProps) => {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const titleId = useId();
+  const preview = useSourcePreview(source);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (source && !dialog.open) dialog.showModal();
+    if (!source && dialog.open) dialog.close();
+  }, [source]);
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="source-preview"
+      aria-labelledby={titleId}
+      onCancel={onClose}
+      onClose={onClose}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      {source && (
+        <div className="source-preview-panel">
+          <header className="source-preview-head">
+            <h2 id={titleId}>{sourceLabel(source)}</h2>
+            <button
+              type="button"
+              className="source-preview-close"
+              aria-label="關閉"
+              onClick={onClose}
+            >
+              <CloseIcon />
+            </button>
+          </header>
+          <div className="source-preview-body">
+            {preview.status === "loading" && (
+              <p className="source-preview-status">載入中…</p>
+            )}
+            {preview.status === "image" && (
+              <img src={preview.url} alt={sourceLabel(source)} />
+            )}
+            {preview.status === "text" && (
+              <p className="source-preview-text">{preview.text}</p>
+            )}
+            {preview.status === "error" && (
+              <p className="source-preview-error" role="alert">
+                {preview.message}
+              </p>
+            )}
+          </div>
+          <footer className="source-preview-foot">
+            <a
+              className="source-preview-download"
+              href={documentFileUrl(source.documentId)}
+              download
+            >
+              <DownloadIcon />
+              下載原檔
+            </a>
+          </footer>
+        </div>
+      )}
+    </dialog>
   );
 };
 
@@ -98,33 +236,43 @@ const UserMessage = () => (
   </MessagePrimitive.Root>
 );
 
-const AssistantMessage = () => (
-  <MessagePrimitive.Root className="msg msg-assistant">
-    <span className="msg-avatar">
-      <BrandMark />
-    </span>
-    <div className="msg-body">
-      <MessagePrimitive.Parts
-        components={{
-          Text: MarkdownText,
-          data: { by_name: { sources: SourceList } },
-        }}
-      />
-      <MessagePrimitive.Error>
-        <ErrorPrimitive.Root className="msg-error">
-          <ErrorPrimitive.Message />
-        </ErrorPrimitive.Root>
-      </MessagePrimitive.Error>
-      <MessagePrimitive.If hasContent={false}>
-        <div className="typing" aria-label="思考中">
-          <span />
-          <span />
-          <span />
-        </div>
-      </MessagePrimitive.If>
-    </div>
-  </MessagePrimitive.Root>
-);
+const AssistantMessage = () => {
+  const [openedSource, setOpenedSource] = useState<ChatSource | null>(null);
+
+  return (
+    <MessagePrimitive.Root className="msg msg-assistant">
+      <span className="msg-avatar">
+        <BrandMark />
+      </span>
+      <div className="msg-body">
+        <OpenSourceContext.Provider value={setOpenedSource}>
+          <MessagePrimitive.Parts
+            components={{
+              Text: MarkdownText,
+              data: { by_name: { sources: SourceList } },
+            }}
+          />
+        </OpenSourceContext.Provider>
+        <SourcePreviewDialog
+          source={openedSource}
+          onClose={() => setOpenedSource(null)}
+        />
+        <MessagePrimitive.Error>
+          <ErrorPrimitive.Root className="msg-error">
+            <ErrorPrimitive.Message />
+          </ErrorPrimitive.Root>
+        </MessagePrimitive.Error>
+        <MessagePrimitive.If hasContent={false}>
+          <div className="typing" aria-label="思考中">
+            <span />
+            <span />
+            <span />
+          </div>
+        </MessagePrimitive.If>
+      </div>
+    </MessagePrimitive.Root>
+  );
+};
 
 const Composer = ({ placeholder }: { placeholder: string }) => (
   <ComposerPrimitive.Root className="composer">
