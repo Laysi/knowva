@@ -121,16 +121,14 @@ export const PlusIcon = ({ className }: IconProps) => (
   </svg>
 );
 
-export const HistoryIcon = ({ className }: IconProps) => (
+export const MenuIcon = ({ className }: IconProps) => (
   <svg {...base} className={className}>
-    <path d="M3.8 12a8.2 8.2 0 1 0 2.4-5.8" />
-    <path d="M3.5 4.5v4h4" />
-    <path d="M12 8v4.3l2.8 1.7" />
+    <path d="M4 7h16M4 12h16M4 17h16" />
   </svg>
 );
 
-export const ChevronDownIcon = ({ className }: IconProps) => (
+export const CloseIcon = ({ className }: IconProps) => (
   <svg {...base} className={className}>
-    <path d="m6 9.5 6 6 6-6" />
+    <path d="m6 6 12 12M18 6 6 18" />
   </svg>
 );

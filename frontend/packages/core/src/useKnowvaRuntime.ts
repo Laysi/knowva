@@ -35,6 +35,12 @@ export type ConversationHistory = {
    * (`CONVERSATION_LOAD_FAILED_MESSAGE`). Answers keep working.
    */
   notice: string | null;
+  /**
+   * When each conversation last changed on the server, by server id (a list
+   * item's `remoteId`), kept current as messages are saved. A conversation the
+   * server never created has none.
+   */
+  updatedAt: ReadonlyMap<string, Date>;
   /** Loads the list again. */
   reload: () => void;
   /**
@@ -145,6 +151,7 @@ export function useKnowvaRuntime(): KnowvaRuntime {
   const notice = useSyncExternalStore(subscribe, () =>
     sync.notice(openConversationId(runtime)),
   );
+  const updatedAt = useSyncExternalStore(subscribe, () => sync.updatedTimes);
 
   const reload = useCallback(() => {
     runtime.threads.reload().catch(() => undefined);
@@ -186,8 +193,8 @@ export function useKnowvaRuntime(): KnowvaRuntime {
   return useMemo(
     () => ({
       runtime,
-      history: { status, error, notice, reload, remove, clearAll },
+      history: { status, error, notice, updatedAt, reload, remove, clearAll },
     }),
-    [runtime, status, error, notice, reload, remove, clearAll],
+    [runtime, status, error, notice, updatedAt, reload, remove, clearAll],
   );
 }

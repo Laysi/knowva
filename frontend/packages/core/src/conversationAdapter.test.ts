@@ -288,6 +288,50 @@ describe("ConversationSync list adapter", () => {
     expect(sync.listError).toBeNull();
   });
 
+  it("knows when each conversation last changed, from the list and then from each save", async () => {
+    const older = "00000000-0000-4000-8000-000000000002";
+    const at = (id: string, title: string, updatedAt: string) => ({
+      ...summary(id, title),
+      updatedAt,
+    });
+    stubFetch({
+      "GET /api/conversations": () =>
+        Response.json([
+          at(ID, "問題", "2026-10-06T01:00:00.000Z"),
+          at(older, "較舊的問題", "2026-10-05T01:00:00.000Z"),
+        ]),
+      [`POST /api/conversations/${older}/messages`]: () =>
+        Response.json({
+          conversation: at(older, "較舊的問題", "2026-10-06T02:00:00.000Z"),
+        }),
+      [`DELETE /api/conversations/${ID}`]: () => new Response(null, { status: 204 }),
+    });
+    const sync = new ConversationSync();
+    const adapter = sync.listAdapter();
+    const listener = vi.fn();
+    sync.subscribe(listener);
+
+    await adapter.list();
+    const listed = sync.updatedTimes;
+    expect(listed.get(ID)?.toISOString()).toBe("2026-10-06T01:00:00.000Z");
+    expect(listed.get(older)?.toISOString()).toBe("2026-10-05T01:00:00.000Z");
+
+    listener.mockClear();
+    expect(await sync.save(older, userItem("q1", "較舊的問題"))).toBe(true);
+    expect(sync.updatedTimes.get(older)?.toISOString()).toBe("2026-10-06T02:00:00.000Z");
+    expect(listener).toHaveBeenCalled();
+    // A new map each time, so a snapshot taken earlier never changes under it.
+    expect(sync.updatedTimes).not.toBe(listed);
+    expect(listed.get(older)?.toISOString()).toBe("2026-10-05T01:00:00.000Z");
+
+    // A list answer older than a save does not move a time back.
+    await adapter.list();
+    expect(sync.updatedTimes.get(older)?.toISOString()).toBe("2026-10-06T02:00:00.000Z");
+
+    await adapter.delete(ID);
+    expect(sync.updatedTimes.has(ID)).toBe(false);
+  });
+
   it("reads a list response of the wrong shape as a failure", async () => {
     stubFetch({ "GET /api/conversations": () => Response.json({ conversations: [] }) });
     const sync = new ConversationSync();

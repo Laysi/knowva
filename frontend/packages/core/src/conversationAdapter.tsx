@@ -75,6 +75,8 @@ export class ConversationSync {
   private status: ConversationListStatus = "loading";
   private error: string | null = null;
   private readonly titles = new Map<string, string>();
+  /** Replaced, never changed in place, so a snapshot of it stays stable. */
+  private times: ReadonlyMap<string, Date> = new Map();
   /** Deleted, evicted or cleared: nothing is sent for it again. */
   private readonly gone = new Set<string>();
   /** Saving stopped for good in this page, with the line to show. */
@@ -94,6 +96,14 @@ export class ConversationSync {
   /** Safe text for the last failed list load, otherwise null. */
   get listError(): string | null {
     return this.error;
+  }
+
+  /**
+   * When each conversation last changed on the server, by server id: as the
+   * list said, then as each save answered. A new map on every change.
+   */
+  get updatedTimes(): ReadonlyMap<string, Date> {
+    return this.times;
   }
 
   /** The line to show for the conversation with this server id, or null. */
@@ -122,7 +132,13 @@ export class ConversationSync {
     this.queues.delete(remoteId);
     const wasStopped = this.stopped.delete(remoteId);
     const wasRetrying = this.retrying.delete(remoteId);
-    if (wasStopped || wasRetrying) this.emit();
+    const hadTime = this.times.has(remoteId);
+    if (hadTime) {
+      const times = new Map(this.times);
+      times.delete(remoteId);
+      this.times = times;
+    }
+    if (wasStopped || wasRetrying || hadTime) this.emit();
   }
 
   /** Resolves once every save asked for so far in this conversation has finished. */
@@ -165,6 +181,7 @@ export class ConversationSync {
       try {
         const conversation = await saveMessage(remoteId, next.item);
         if (conversation.title) this.titles.set(remoteId, conversation.title);
+        this.touch([conversation]);
       } catch (error) {
         if (isTransientFailure(error)) {
           // Kept, in order, for the next message of this conversation.
@@ -192,6 +209,22 @@ export class ConversationSync {
     if (this.status === status && this.error === error) return;
     this.status = status;
     this.error = error;
+    this.emit();
+  }
+
+  /** Keeps the later of the known and the given time of each conversation. */
+  private touch(conversations: readonly ConversationSummary[]): void {
+    let times: Map<string, Date> | null = null;
+    for (const { id, updatedAt } of conversations) {
+      if (this.gone.has(id)) continue;
+      const time = new Date(updatedAt);
+      const known = (times ?? this.times).get(id);
+      if (known !== undefined && known.getTime() >= time.getTime()) continue;
+      times ??= new Map(this.times);
+      times.set(id, time);
+    }
+    if (times === null) return;
+    this.times = times;
     this.emit();
   }
 
@@ -228,6 +261,7 @@ export class ConversationSync {
           for (const { id, title } of conversations) {
             if (title) this.titles.set(id, title);
           }
+          this.touch(conversations);
           this.setList("ready", null);
           return {
             threads: conversations
@@ -246,11 +280,14 @@ export class ConversationSync {
         if (this.gone.has(remoteId) || isLocalConversationId(remoteId)) {
           throw new ConversationRequestError(404);
         }
-        return metadata(await fetchConversation(remoteId));
+        const conversation = await fetchConversation(remoteId);
+        this.touch([conversation]);
+        return metadata(conversation);
       },
       initialize: async () => {
         try {
           const { conversation, removedIds } = await createConversation();
+          this.touch([conversation]);
           if (removedIds.length > 0) {
             for (const id of removedIds) this.markGone(id);
             for (const listener of this.removedListeners) listener(removedIds);
