@@ -1,3 +1,0 @@
-// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
-
-exports[`SourceList > renders every source in server order without page deduplication 1`] = `"<section class="source-list" aria-label="資料來源"><h3>資料來源</h3><ol><li>操作手冊.pdf · 第 2 頁</li><li>操作手冊.pdf · 第 5 頁</li><li>維運筆記.md · 第 1 段</li><li>維運筆記.md · 段落</li></ol></section>"`;

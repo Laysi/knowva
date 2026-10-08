@@ -8,7 +8,7 @@
 
 | 服務 | 形態 | 說明 |
 | --- | --- | --- |
-| app(前端 + 後端) | 容器 | 前端 build 產物烘進後端 image(axum 本就 serve `frontend/dist`);前處理 = pdfium 頁面轉圖(原生庫烘進 image)+ 呼叫嵌入端點,無 Python 依賴,客戶機器不需裝任何語言環境。 |
+| app(前端 + 後端) | 容器 | 前端 build 產物烘進後端 image(axum 依部署 profile 的主題 serve `frontend/dist/<theme>`);前處理 = pdfium 頁面轉圖(原生庫烘進 image)+ 呼叫嵌入端點,無 Python 依賴,客戶機器不需裝任何語言環境。 |
 | 文件轉檔(Office→PDF) | 容器 | LibreOffice headless,image 含 CJK 字型;僅 DOCX/PPTX/XLSX 上傳時使用,PDF/圖片/md/txt 不經過它。 |
 | PostgreSQL + pgvector | 容器 | 沿用現行 `docker-compose.yml`(pgvector/pgvector:pg17)— 現在的 compose 就是全套 compose 的起點;2048 維索引走 `halfvec`。 |
 | LLM 推理 | 容器(GPU) | 經 NVIDIA Container Toolkit 直通 GPU;對 app 永遠只是一個 OpenAI-compatible base URL。 |

@@ -1,0 +1,179 @@
+/* ============================================================
+   Knowva — design tokens
+   Petrol teal on cool neutrals: a light navigation rail, a white
+   workspace, and one flat accent colour with no gradients.
+   ============================================================ */
+:root {
+  /* ---- Typography ---- */
+  --font-sans: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", system-ui,
+    sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Courier New",
+    monospace;
+
+  /* ---- Accent ---- */
+  --color-accent: #0e6b7c;
+  --color-accent-hover: #0b5768;
+  --color-accent-active: #094b5a;
+  --color-accent-weak: #e9f2f4;
+  --color-accent-weak-border: #cbe0e4;
+  --color-accent-ring: rgba(14, 107, 124, 0.28);
+
+  /* ---- Surfaces ---- */
+  --color-canvas: #f3f6f8;
+  --color-surface: #ffffff;
+  --color-surface-sunken: #f1f5f7;
+  --color-surface-hover: #eef2f5;
+  --color-surface-zebra: #f8fafb;
+
+  --color-border: #e4e9ee;
+  --color-border-strong: #d3dbe2;
+
+  --color-text: #17242e;
+  --color-text-secondary: #52616f;
+  /* muted carries real body copy, so it clears AA (4.7:1 on the canvas);
+     faint is for icons and borders only, at 3.2:1. */
+  --color-text-muted: #627080;
+  --color-text-faint: #7f8c99;
+
+  /* ---- Status ---- */
+  --color-success: #2f8a56;
+  --color-success-bg: #e7f4ec;
+  --color-success-text: #206b40;
+  --color-warning: #b26a08;
+  --color-warning-bg: #fbf0dc;
+  --color-warning-text: #895205;
+  --color-danger: #c53b30;
+  --color-danger-bg: #fbe9e6;
+  --color-danger-border: #f2cfca;
+  --color-danger-text: #9a2b22;
+
+  /* ---- Semantic roles (theme contract) ----
+     @knowva/core checks text and each status colour on the background, and
+     on-brand on brand, for WCAG AA. They name colours already used above. */
+  --theme-text: var(--color-text);
+  --theme-background: var(--color-canvas);
+  --theme-brand: var(--color-accent);
+  --theme-on-brand: #fff;
+  --theme-success: var(--color-success-text);
+  --theme-warning: var(--color-warning-text);
+  --theme-error: var(--color-danger-text);
+
+  /* ---- Spacing scale (4 / 8) ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* ---- Radii ---- */
+  --radius-sm: 7px;
+  --radius-md: 11px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
+  --radius-full: 999px;
+
+  /* ---- Elevation ---- */
+  --shadow-xs: 0 1px 2px rgba(17, 36, 46, 0.05);
+  --shadow-sm: 0 1px 2px rgba(17, 36, 46, 0.06), 0 2px 8px rgba(17, 36, 46, 0.05);
+  --shadow-md: 0 6px 18px rgba(17, 36, 46, 0.08);
+  --shadow-lg: 0 18px 44px rgba(17, 36, 46, 0.14);
+
+  color-scheme: light;
+  font-family: var(--font-sans);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--color-text);
+  background: var(--color-canvas);
+}
+
+#root {
+  display: flex;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--color-text);
+}
+
+p {
+  margin: 0;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+::selection {
+  background: var(--color-accent-weak);
+  color: var(--color-accent-active);
+}
+
+:where(button, [role="button"], [tabindex="0"]):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* ---- Scrollbars ---- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: var(--radius-full);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #b8c3cc;
+  background-clip: padding-box;
+  border: 3px solid transparent;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}

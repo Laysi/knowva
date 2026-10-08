@@ -324,6 +324,17 @@ impl Storage {
         key: &str,
         max_bytes: usize,
     ) -> Result<Vec<u8>, StorageError> {
+        self.open(document_id, key, max_bytes).await?.bytes().await
+    }
+
+    /// Opens one document object without reading its body, under the same key
+    /// and size checks as [`Storage::get`].
+    pub async fn open(
+        &self,
+        document_id: Uuid,
+        key: &str,
+        max_bytes: usize,
+    ) -> Result<StoredObject, StorageError> {
         let path = validate_document_key(document_id, key)?;
         if let Some(root) = &self.local_root {
             // A symlink under FILES_DIR (including a symlinked document directory)
@@ -348,14 +359,7 @@ impl Storage {
                 limit,
             });
         }
-        let bytes = result.bytes().await?;
-        if bytes.len() as u64 > limit {
-            return Err(StorageError::TooLarge {
-                size: bytes.len() as u64,
-                limit,
-            });
-        }
-        Ok(bytes.into())
+        Ok(StoredObject { result, limit })
     }
 
     /// Lists every object key below `prefix` (whole segments, recursive).
@@ -397,6 +401,38 @@ impl Storage {
             }
         }
         Ok(())
+    }
+}
+
+/// One document object from [`Storage::open`]: within the caller's size limit,
+/// body not read yet.
+pub struct StoredObject {
+    result: object_store::GetResult,
+    limit: u64,
+}
+
+impl StoredObject {
+    pub fn size(&self) -> u64 {
+        self.result.meta.size
+    }
+
+    pub async fn bytes(self) -> Result<Vec<u8>, StorageError> {
+        let bytes = self.result.bytes().await?;
+        if bytes.len() as u64 > self.limit {
+            return Err(StorageError::TooLarge {
+                size: bytes.len() as u64,
+                limit: self.limit,
+            });
+        }
+        Ok(bytes.into())
+    }
+
+    /// The body in chunks, for a response that should not hold the whole
+    /// object in memory. The GET that opened it fixed its length at `size`.
+    pub fn into_stream(
+        self,
+    ) -> impl futures::Stream<Item = Result<axum::body::Bytes, StorageError>> + Send + 'static {
+        self.result.into_stream().map_err(StorageError::from)
     }
 }
 

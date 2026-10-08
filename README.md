@@ -20,11 +20,12 @@
 
 | 層 | 技術 |
 |---|---|
-| 前端 | React + Vite + assistant-ui（純 CSS、繁中介面） |
+| 前端 | React + Vite + assistant-ui（npm workspaces：共用的 `@knowva/core` 加上主題；純 CSS、繁中介面） |
 | 後端 | Rust（axum + tokio + sqlx），單一 binary |
 | 資料庫 | PostgreSQL 17 + pgvector |
 | 模型呼叫 | 單一模型服務 HTTP client（`cloud_models.rs`，地端與雲端端點共用）；Gemma 4 + Nemotron Embed/Rerank VL |
 | 檔案儲存 | 初始化時選定本機 `FILES_DIR` 或 S3 相容物件儲存（`object_store`）；DB 只存 `{document_id}/...` 相對 key，原檔與每次完整 artifact run 分開保存 |
+| 產業 profile | `profiles/<id>/`：部署時以 `KNOWVA_PROFILE` 選定前端主題、預設文案、總覽關鍵字與產業段 prompt（見「產業 profile」） |
 
 ## 前置需求
 
@@ -136,6 +137,38 @@ STORAGE_SECRET_ACCESS_KEY=<r2-secret-access-key>
 - Pdfium／LibreOffice 仍只能讀本機檔，每次轉檔都在系統暫存區（`TMPDIR`）下獨立的 `knowva-ingest-<run_id>` 目錄進行，不論成功或失敗都會刪除。
 - evaluation 固定使用本機 `EVAL_FILES_DIR`，不受 `STORAGE_BACKEND` 影響；它的獨立 `EVAL_DATABASE_URL` 有自己的鎖定紀錄，與 production 互不影響。
 
+### 產業 profile
+
+同一個 image 出貨所有產業：產業差異是 profile（產業段 prompt、預設文案）加上前端主題，部署時以 `KNOWVA_PROFILE` 選定。一台機器只跑一個 profile。
+
+| 環境變數 | 預設值 | 說明 |
+|---|---|---|
+| `KNOWVA_PROFILE` | `default` | profile id，也就是 `PROFILES_DIR` 下的目錄名；只允許小寫英數與 `-` |
+| `PROFILES_DIR` | `../profiles` | profile 根目錄，相對於後端工作目錄（`backend/`）；image 內建所有 profile 於 `/app/profiles`，容器不需設定 |
+
+每個 profile 是一個目錄：
+
+```text
+profiles/<id>/
+├── profile.json   # 主題、品牌、頁面標題與說明、建議問題、輸入框提示、總覽關鍵字
+└── prompt.md      # 產業段；可以是空檔
+```
+
+`profile.json` 的欄位全部必填，也不接受未知欄位；完整範例見 `profiles/default/profile.json`：
+
+| 欄位 | 說明 |
+|---|---|
+| `theme` | 前端主題名稱，後端提供 `../frontend/dist/<theme>`；同一個主題可以給多個 profile 共用。只允許小寫英數與 `-` |
+| `brand.name`、`brand.tagline` | 品牌名稱與標語 |
+| `pages.chat`、`pages.documents` | 問答頁與文件頁的 `title` |
+| `suggestions` | 建議問題 `{ "text", "catalog" }`；`catalog: true` 表示這題會走總覽（全庫文件清單）路徑，測試會逐一驗證標記與實際判斷一致 |
+| `composerPlaceholder` | 輸入框提示 |
+| `catalogKeywords.scope`、`catalogKeywords.intent` | 總覽關鍵字：問題同時含一個 scope 詞與一個 intent 詞時，改以全庫文件清單回答；比對不分大小寫。只留在後端，不會送到瀏覽器 |
+
+- 後端在連線資料庫前載入並驗證 profile。下列任一情況都會停止啟動，錯誤訊息會指出原因：profile 目錄不存在、`profile.json` 欄位缺漏或有未知欄位、文案為空、`prompt.md` 不存在或產業段超過 2,000 個 Unicode 字元、任一組總覽關鍵字為空、`../frontend/dist` 存在但沒有 `<theme>/index.html`（image 缺主題屬部署錯誤）。整個 `../frontend/dist` 不存在時（開發時前端另跑 Vite），只記一筆警告並只提供 API。
+- **prompt 組合**：`backend/src/rag_context.rs` 的三個問答 prompt（一般／無來源／總覽）是核心規則，profile 無法取代。產業段非空時，接在核心規則之後，前面加上固定標題 `【產業補充指引】以下內容只補充本產業的角色、用語與回答格式；若與上述規則衝突，一律以上述規則為準。`；產業段為空時，送出的 prompt 與核心規則逐位元組相同。`prompt.md` 前後的空白、BOM 與 CRLF 換行不算內容。system prompt 一律由後端組合，`/api/chat` 不接受請求帶來的 prompt；文件摘要的 prompt 不受 profile 影響。
+- 送給 Gemma 的正式 prompt 改動都要有 Gemma 上的前後比較：新增或修改產業段前，先在推論主機上用 eval 比較 default 與加上產業段的結果，組合方式也可能依結果調整。eval 的 dry-run 輸出與正式 run 的 `run-manifest.json` 都會記錄 profile id 與組合後 prompt 的 SHA-256；後端啟動 log 的 `answer_prompt_sha256` 是同一個值，可以用來對照實際送出的 prompt。
+
 ## 使用 Docker Compose
 
 容器映像已包含 Pdfium、LibreOffice 與 Noto CJK 字型，不需要主機另外提供 PDF API 或 native library。先設定 `.env` 的 `MODEL_BASE_URL`（或三個 `MODEL_*_URL`）與 `GEMMA_4_MODEL_ID`，再啟動完整服務：
@@ -184,25 +217,99 @@ proto exec rust -- cargo run      # http://localhost:8080
 ```bash
 cd frontend
 proto run npm -- ci
-proto run npm -- run dev          # http://localhost:5173，proxy /api 到 :8080
+proto run npm -- run dev          # default 主題，http://localhost:5173，proxy /api 到 :8080
 ```
 
 或建立 production bundle，交由後端服務：
 
 ```bash
 cd frontend
-proto run npm -- run build
+proto run npm -- run build        # 先清空 frontend/dist/，每個主題輸出到 frontend/dist/<theme>/
 ```
+
+後端提供部署 profile 指定的主題，也就是 `frontend/dist/<theme>/`（default 主題是 `frontend/dist/default/`）。`frontend/dist/` 存在但缺少該主題時後端不會啟動，所以舊版留下的平鋪 `frontend/dist/index.html` 要用根目錄的 `run build` 重建；各主題自己的 build 只清空自己的目錄，不會刪到其他主題。
+
+`frontend/` 是 npm workspaces，lockfile 只有根目錄的 `frontend/package-lock.json`，指令一律在 `frontend/` 執行：
+
+| Workspace | 內容 |
+|---|---|
+| `packages/core`（`@knowva/core`） | `BackendAdapter`、`useKnowvaRuntime`（問答 runtime 與對話紀錄）、`DocumentModel`、`useDocuments`（文件列表、輪詢、上傳、刪除）、`useProfile`（讀 `GET /api/profile`）、`useSourcePreview`／`useMessageSources`／`remarkSourceMarkers`（引用來源的預覽與內文 `[S1]` 標記）與安全化的錯誤訊息；不含 CSS 與版面。`@knowva/core/testing` 提供主題契約測試，`@knowva/core/vite` 提供擋外部網址的 build plugin |
+| `themes/default`（`@knowva/theme-default`） | 現行介面：元件、CSS、`index.html` 與 `main.tsx`；輸出到 `frontend/dist/default/` |
+
+根目錄的 `run lint`、`run test`、`run build` 依序跑過每個 workspace；`run dev` 與 `run preview` 啟動 default 主題，也可以用 `proto run npm -- run dev --workspace @knowva/theme-default` 指定。
+
+主題不寫死品牌名稱與標語、頁面標題與說明、建議問題和輸入框提示，一律由 `useProfile()` 從 `GET /api/profile` 讀取。它回傳 `status` 為 `loading`、`ready`（附 `profile`）或 `error`（附 core 的安全化 `message`）的狀態，以及重新載入用的 `reload()`。default 主題在載入期間保留版面但不顯示文案；載入失敗時在頁首顯示該訊息與「重新載入」按鈕，問答與文件功能照常可用。載入完成後的畫面與改版前相同，分頁標題也改用 profile 的品牌名稱與標語。
+
+每個主題的 vitest 都要呼叫 `describeThemeContract`，用主題自己的元件確認產品承諾：回答完成後列出每個來源的檔名、分頁來源另列頁碼；點來源清單的項目或內文的 `[S1]` 會讀出並顯示該單元的頁面圖或文字（總覽來源則是文件卡）、提供原檔下載連結，來源已不存在時顯示 core 的安全化訊息；SSE `error` 或連線失敗時顯示 core 的安全化訊息；串流途中可以停止生成；不支援的副檔名或超過 50 MiB 的檔案顯示 core 的訊息而且不送出請求；問答頁標題與建議問題來自 `/api/profile`；`/api/profile` 失敗時顯示 core 的安全化訊息，問答仍可使用；重新整理後對話與來源都還在、追問送出的 `previousSources` 和沒重新整理時相同；新對話、切換、刪除單一對話與畫面內確認的「清除全部對話」都反映在伺服器上；清單顯示後端用第一個問題前 30 個字元產生的標題，除了 `/api/chat` 之外不發模型請求；保存失敗時問答照常並顯示 core 的無法保存提示；對話清單載入失敗時顯示 core 的安全化訊息，問答照常。契約用記憶體裡的 `/api/conversations` 假後端代替伺服器，重新 render 就是重新整理。主題也要在 `:root` 宣告 `--theme-text`、`--theme-background`、`--theme-brand`、`--theme-on-brand`、`--theme-success`、`--theme-warning`、`--theme-error`，契約測試會檢查內文與三種狀態色在底色上、`on-brand` 在品牌色上的對比都達到 WCAG AA（4.5:1）。正式環境是離線 appliance，主題的 HTML、SVG 與 CSS 不能從其他主機載入字型、圖片或樣式，build 遇到這類 `src`、`href`、`url()`、`@import` 會直接失敗。
+
+### 對話紀錄
+
+問答頁的對話紀錄存在伺服器的 PostgreSQL（migration `0008_conversations.sql`），以瀏覽器 cookie 區分擁有者，每個瀏覽器最多 50 串。`/api/chat` 維持無狀態：回答完成後，前端另外呼叫 `/api/conversations` 保存每一則訊息。系統沒有登入，部署前請先了解這種做法的代價：
+
+- **換瀏覽器或清除網站資料，就找不回原本的對話。** 擁有者是後端發給瀏覽器的 `knowva_client` cookie；換電腦、換瀏覽器或清除 cookie 之後就是另一個擁有者，也沒有跨裝置同步。原本的對話仍留在伺服器，直到被數量上限或刪除清掉。
+- **共用電腦的同一個瀏覽器，會看到前一位使用者的紀錄。** 同一個瀏覽器設定檔共用同一個 cookie，誰打開問答頁都看得到之前的對話。共用的電腦請在離開前按「清除全部對話」，或讓每位使用者使用自己的瀏覽器設定檔。
+- **能存取資料庫的人，讀得到問答內容。** 問題與回答以明文存在 `conversations` 與 `conversation_messages` 兩張表；資料庫只存 cookie token 的 SHA-256，不存 token 本身。
+
+其餘行為：
+
+- 上限：每個瀏覽器最多 50 串，建立第 51 串時刪除最久沒更新的那一串；每串最多 200 則訊息；單則訊息的 JSON 最多 256 KiB。超過時 API 回 4xx 與固定的安全化訊息，這串對話不再保存，問答照常。
+- Cookie：對話 API 收到沒有 `knowva_client` cookie（或格式不對）的請求時，產生 256 位元的隨機 token，以 `HttpOnly`、`SameSite=Strict`、`Path=/api`、`Max-Age` 400 天的 cookie 回傳；請求經由 HTTPS 進來（直接 HTTPS 或 `X-Forwarded-Proto: https`）時再加 `Secure`。正式環境可能是純 HTTP 的內網，所以不一律加 `Secure`。log 與錯誤訊息不會出現 token。
+- 隔離完全靠 token 保密。每個查詢都限定目前 cookie 的擁有者，存取不屬於自己或不存在的對話一律回 404，不透露那串對話是否存在。資料表以 `owner_kind`（`anonymous` 或 `user`，目前只寫入 `anonymous`）與 `owner_id` 表示擁有者，之後加入登入時可以用一個 `UPDATE` 把匿名對話轉給帳號。
+- 標題由後端在保存第一則使用者訊息時產生：去掉頭尾空白、連續空白併成一個空格，再取前 30 個 Unicode 字元，不呼叫模型。
+- 每則回答連同 `sources` data part 一起保存，串流中斷或出錯的回答也照樣保存（狀態為 `incomplete`）；重新整理後追問，送出的 `previousSources` 和沒重新整理時相同。重新整理後會回到最近更新的那串對話。
+- 側欄的「近期對話」依最後更新時間排列，每串標示多久前更新；在較舊的對話裡發問後，那串會移到最上面。
+- 保存失敗時問答照常，畫面顯示一行「這串對話無法保存」的提示。連線失敗、408、429 與 5xx 會在這串對話的下一則訊息前重送；其他 4xx 讓這串對話在這個頁面裡停止保存。對話清單載入失敗時，清單位置顯示 core 的安全化訊息與「重新載入」按鈕。
+- 不做重新命名、封存、搜尋、匯出、自動過期與速率限制。
+
+### 引用來源
+
+回答內文的 `[S1]`、`[S2]` 與下方「資料來源」清單的每一項都可以點，點了會開啟對話框顯示模型引用的內容：頁面來源（PDF、Office、圖片）顯示那一頁的頁面圖，文字來源（Markdown、純文字）顯示那一段文字，總覽問答的來源顯示文件卡（檔名、摘要、標籤）；對話框底部可以下載原檔。內文中對不到來源的 `[Sn]` 維持純文字。
+
+- 只讀得到問答目前會用到的內容：文件處理完成（`ready`）才讀得到，處理中、失敗或刪除中的文件一律當作不存在。文件刪除或重新處理後單元會換新，舊回答的來源會顯示「找不到這個來源，文件可能已刪除或重新處理。」
+- 頁面圖就是入庫時轉出的那張圖，圖上不標示引用的位置。原檔只提供下載，不在瀏覽器裡開啟；回應帶 `Content-Security-Policy: sandbox`，上傳的內容不會在本站執行。
+- 這些回應都帶 `Cache-Control: no-store`，瀏覽器不留快取，刪除的文件不會再從快取被看到。
 
 ## API
 
 | Method | Path | 說明 |
 |---|---|---|
 | GET | `/api/health` | 健康檢查 |
+| GET | `/api/profile` | 部署 profile 的介面欄位（主題、品牌、頁面標題與說明、建議問題、輸入框提示）；不含 prompt 與總覽關鍵字 |
 | GET | `/api/documents` | 文件列表（含文件／artifact 狀態、頁數與檢索單元數） |
 | POST | `/api/documents` | multipart 上傳（單一 `file` 欄位），立即回 id，背景處理 |
 | DELETE | `/api/documents/{id}` | 刪除 `{id}/` 前綴下所有物件（原檔、轉出 PDF、頁圖、manifest）後才刪 DB row；清除失敗時保留 row，可重送 DELETE |
+| GET | `/api/documents/{id}/file` | 下載原檔，串流回傳，`Content-Disposition: attachment`（中文檔名以 RFC 8187 編碼）；只限 `ready` 文件 |
+| GET | `/api/documents/{id}/units/{unitId}/catalog` | 總覽問答引用的文件卡（`text/plain`，檔名、摘要、標籤），與模型拿到的相同；`unitId` 必須仍是該文件第一個可檢索的單元，文件重新處理後舊引用回 404 |
+| GET | `/api/documents/{id}/units/{unitId}/image` | 來源單元的頁面圖；只限 `ready` 文件中可檢索的單元 |
+| GET | `/api/documents/{id}/units/{unitId}/text` | 來源單元的文字（`text/plain`），與模型拿到的相同；條件同上 |
 | POST | `/api/chat` | SSE 串流問答（`text-delta` / `sources` / `done` / `error`） |
+| GET | `/api/conversations` | 這個瀏覽器的對話清單，依 `updatedAt` 新到舊 |
+| POST | `/api/conversations` | 新增對話（201），id 由後端產生；回傳 `conversation` 與為了維持 50 串上限而刪除的 `removedIds` |
+| DELETE | `/api/conversations` | 清除這個瀏覽器的全部對話（204） |
+| GET | `/api/conversations/{id}` | 單串對話的 id、標題與時間 |
+| DELETE | `/api/conversations/{id}` | 刪除一串（204） |
+| GET | `/api/conversations/{id}/messages` | 依保存順序讀出 `{ parentId, message }` |
+| POST | `/api/conversations/{id}/messages` | 保存一則 `{ parentId, message }`；同一個 `message.id` 重送時覆寫（冪等），並更新對話的 `updatedAt`；回傳 `{ conversation }` |
+
+`GET /api/profile` 的形狀與 `profile.json` 相同，但多了 profile `id`，拿掉 `catalogKeywords`；產業段 prompt 與總覽關鍵字只留在後端。default profile 的回應如下：
+
+```json
+{
+  "id": "default",
+  "theme": "default",
+  "brand": { "name": "Knowva 知星", "tagline": "點亮你的知識星系" },
+  "pages": {
+    "chat": { "title": "知識問答" },
+    "documents": { "title": "文件管理" }
+  },
+  "suggestions": [
+    { "text": "知識庫裡有哪些主題？", "catalog": true },
+    { "text": "整理知識庫的重點", "catalog": false },
+    { "text": "新人該先看哪幾份文件？", "catalog": false }
+  ],
+  "composerPlaceholder": "問問你的文件…"
+}
+```
 
 `GET /api/documents` 的 canonical response 使用 camelCase；下列範例同時省略了過渡期保留的 `artifact_status`、`page_count`、`unit_count`、`chunk_count`、`created_at` 與安全字串 `error` aliases：
 
@@ -229,7 +336,20 @@ proto run npm -- run build
 
 `/api/chat` 的純文字串流契約維持不變；有檢索來源時，`sources` 一定在 `done` 前送出。模型端 HTTP 錯誤包含 status、最多 500 字的安全 response snippet 與可重試狀態；timeout 也會以統一錯誤回傳。
 
-分頁 source 的 `pageNumber` 是 1-based；文字 source 的 `pageNumber` 固定為 JSON `null`，並以 0-based `unitIndex` 標識文字單元（UI 顯示時加一）。同文件的不同頁不會去重，完整 SSE 範例如下：
+對話 API 只作用在目前 `knowva_client` cookie 的擁有者身上，回應一律帶 `Cache-Control: no-store`；失敗時回傳固定的繁中純文字。`message` 是 assistant-ui 的完整訊息（JSON 物件，`role` 為 `user` 或 `assistant`），`parentId` 必須是這串對話裡已保存的訊息。保存第一個問題後的回應如下：
+
+```json
+{
+  "conversation": {
+    "id": "6f1c2a8e-3b7d-4c55-9a43-0d2e8f61b9a7",
+    "title": "馬達多久保養一次？",
+    "createdAt": "2026-10-06T08:00:00Z",
+    "updatedAt": "2026-10-06T08:00:05Z"
+  }
+}
+```
+
+分頁 source 的 `pageNumber` 是 1-based；文字 source 的 `pageNumber` 固定為 JSON `null`，並以 0-based `unitIndex` 標識文字單元（UI 顯示時加一）。總覽問答（「知識庫裡有哪些主題？」這類問題）的 source 另帶 `"catalog": true`：模型拿到的是整份文件的文件卡（檔名、摘要、標籤），`unitId` 只是該文件的第一個單元，引用內容要用 `GET /api/documents/{id}/units/{unitId}/catalog` 讀；其他 source 不帶這個欄位。同文件的不同頁不會去重，完整 SSE 範例如下：
 
 ```text
 data: {"type":"text-delta","text":"答案 [S1]"}
@@ -303,7 +423,7 @@ DB 欄位（`documents.storage_path`、`document_artifact_sets.*_path`／`artifa
 cd backend && proto exec rust -- cargo run -- eval --dry-run
 ```
 
-dry-run 只讀取並驗證 fixture，不連資料庫、不載入 native converter，也不呼叫任何模型端點。它會檢查 dataset schema/version、未知欄位、唯一 document/query/unit id、安全相對路徑、檔案類型與副檔名、SHA-256、非空 license/source、預期 page/unit inventory，以及 query scope、expected source、required facts、answerable/not-found 等契約。所有內附文件都是 deterministic synthetic CC0 fixture，不含客戶或正式環境內容；涵蓋繁中原生 PDF、純影像掃描 PDF、PPTX、表格／圖表 PDF、PNG、Markdown 與純文字，也涵蓋同名文件隔離、相鄰頁干擾、多頁來源、無頁碼文字與 visual-only facts。完整來源與 coverage 見 [backend/eval/fixtures/README.md](backend/eval/fixtures/README.md)。
+dry-run 只讀取並驗證 fixture 與 profile，不連資料庫、不載入 native converter，也不呼叫任何模型端點。profile 依 `KNOWVA_PROFILE`／`PROFILES_DIR` 選定，和正式 run 一樣會讀 `.env`；輸出的 JSON 含 `profileId` 與 `systemPromptSha256`（回答時送出的組合後 system prompt 的 SHA-256），比較產業段前後時可以先確認兩次用的是不同 prompt。fixture 方面，它會檢查 dataset schema/version、未知欄位、唯一 document/query/unit id、安全相對路徑、檔案類型與副檔名、SHA-256、非空 license/source、預期 page/unit inventory，以及 query scope、expected source、required facts、answerable/not-found 等契約。所有內附文件都是 deterministic synthetic CC0 fixture，不含客戶或正式環境內容；涵蓋繁中原生 PDF、純影像掃描 PDF、PPTX、表格／圖表 PDF、PNG、Markdown 與純文字，也涵蓋同名文件隔離、相鄰頁干擾、多頁來源、無頁碼文字與 visual-only facts。完整來源與 coverage 見 [backend/eval/fixtures/README.md](backend/eval/fixtures/README.md)。
 
 可重複使用 `--document <document_key>` 與 `--query <query_id>` 選 subset；指定 document 時，只會選取其 `document_scope` 全部落在所選 documents 的 queries。dry-run 的 JSON 會列出實際選到的 documents/queries，未知或空 subset 會 fail closed。例如：
 
@@ -316,7 +436,7 @@ proto exec rust -- cargo run -- eval --dry-run \
 
 ### 正式 A/B run（`--cloud`）
 
-正式 run 是明確 opt-in，會 ingest fixtures 並實際呼叫設定好的 embedding、rerank 與 generation endpoint。端點是雲端服務時會產生費用，是地端服務時會佔用推論主機；CI 與一般測試絕不自動執行。A 是 dense-only control，B 共用 A 的同一批 dense candidates，再執行 BM25、RRF 與固定 VL reranker。兩組固定使用相同 embedding 與 Gemma 4 generation model id、相同 prompt version、相同 query、相同 context top_n 與 deterministic retry policy，只有 retrieval path 不同。provider 不支援 seed 時會在 run manifest 明確記為 false。為確保 telemetry 可歸因，目前正式 run 強制 `--concurrency 1`。
+正式 run 是明確 opt-in，會 ingest fixtures 並實際呼叫設定好的 embedding、rerank 與 generation endpoint。端點是雲端服務時會產生費用，是地端服務時會佔用推論主機；CI 與一般測試絕不自動執行。A 是 dense-only control，B 共用 A 的同一批 dense candidates，再執行 BM25、RRF 與固定 VL reranker。兩組固定使用相同 embedding 與 Gemma 4 generation model id、相同 prompt version、相同 system prompt（選定 profile 的一般問答 prompt，與 `/api/chat` 用同一個組合函式產生）、相同 query、相同 context top_n 與 deterministic retry policy，只有 retrieval path 不同。provider 不支援 seed 時會在 run manifest 明確記為 false。為確保 telemetry 可歸因，目前正式 run 強制 `--concurrency 1`。
 
 執行前必須完成下列事項：
 
@@ -363,13 +483,13 @@ proto exec rust -- cargo run -- eval --cloud \
   --concurrency 1
 ```
 
-正式 run 也接受上述 `--document` / `--query` subset flags。成功寫檔後，stdout 會回傳 `passed` 與路徑；每次輸出位於 `<output>/<run_id>/report.json`、`report.csv`、`report.md`、`run-manifest.json`。`passed: true` 只有在至少一組有效 A/B pair，且 correct-page、citation precision/recall、answer facts recall、B 相對 A improvement 全部達到門檻檔的數值時成立；command 本身完成不代表門檻通過。`report.*` 會列出各 query 的 improvement/same/regression/failure、分數與 failure reasons，`run-manifest.json` 則保存 locked model ids、prompt/top_n、dataset/threshold hash、git revision、subsets、retry/latency/request/fallback telemetry 與安全化失敗案例。preflight、native conversion、模型服務 contract 或 DB isolation 錯誤會以非零狀態停止；已開始寫入後不會局部清掉 DB/files，以免破壞診斷一致性。
+正式 run 也接受上述 `--document` / `--query` subset flags。成功寫檔後，stdout 會回傳 `passed` 與路徑；每次輸出位於 `<output>/<run_id>/report.json`、`report.csv`、`report.md`、`run-manifest.json`。`passed: true` 只有在至少一組有效 A/B pair，且 correct-page、citation precision/recall、answer facts recall、B 相對 A improvement 全部達到門檻檔的數值時成立；command 本身完成不代表門檻通過。`report.*` 會列出各 query 的 improvement/same/regression/failure、分數與 failure reasons，`run-manifest.json`（schema `1.1`）則保存 locked model ids、prompt version、profile id（`profile_id`）與組合後 system prompt 的 SHA-256（`system_prompt_sha256`）、top_n、dataset/threshold hash、git revision、subsets、retry/latency/request/fallback telemetry 與安全化失敗案例。preflight、native conversion、模型服務 contract 或 DB isolation 錯誤會以非零狀態停止；已開始寫入後不會局部清掉 DB/files，以免破壞診斷一致性。
 
 Threshold JSON 只應保存在本機安全位置：不得提交本機 threshold 檔、API token、`.env` secret 或任何 customer/production 文件。fixture 只能使用 repository 內已審核、標明來源與 license 的 synthetic files。
 
 ## CI 與快取
 
-`ci.yml` 的三個檢查 job 前面先跑一個 `changes` job，用改動路徑決定哪幾個要跑：`backend/**` 觸發 backend 與 native-conversion，`frontend/**` 觸發 frontend，`Dockerfile` 與 `.dockerignore` 觸發 native-conversion，`.prototools` 與 workflow 本身觸發全部。只改文件的 PR 因此只花一個短 job。
+`ci.yml` 的三個檢查 job 前面先跑一個 `changes` job，用改動路徑決定哪幾個要跑：`backend/**` 觸發 backend 與 native-conversion，`frontend/**` 觸發 frontend，`profiles/**` 觸發 backend 與 frontend，`Dockerfile` 與 `.dockerignore` 觸發 native-conversion，`.prototools` 與 workflow 本身觸發全部。只改文件的 PR 因此只花一個短 job。
 
 只有 pull request 會過濾。那是 paths-filter 能直接從 API 回答的事件，不需要 checkout 也不需要 history；要過濾 push 就得在每一次 run 完整 fetch 整個 repo，只為了省下「每次合併一次」而且 PR 已經檢查過的那一趟。所以 push 到 main 與手動 dispatch 一律全跑。
 

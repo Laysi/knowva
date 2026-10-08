@@ -1,16 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { UploadIcon, DocsIcon, TrashIcon } from "./Icons";
 import {
   documentFailureMessage,
-  documentRequestErrorMessage,
   documentStatusLabel,
   documentSummary,
   documentVisualStatus,
-  shouldPollDocuments,
   UPLOAD_ACCEPT,
-  validateUploadFile,
-} from "./DocumentModel";
-import type { DocumentRow } from "./DocumentModel";
+  useDocuments,
+} from "@knowva/core";
+import type { DocumentRow } from "@knowva/core";
 
 function fileExt(name: string): string {
   const dot = name.lastIndexOf(".");
@@ -135,90 +133,31 @@ const DocumentListError = ({
 );
 
 export const Documents = () => {
-  const [docs, setDocs] = useState<DocumentRow[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [listError, setListError] = useState<string | null>(null);
-  const [uploading, setUploading] = useState(false);
+  const {
+    documents: docs,
+    loaded,
+    listError,
+    uploading,
+    refresh,
+    upload,
+    remove,
+  } = useDocuments();
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const fetchDocs = useCallback(async () => {
-    try {
-      const res = await fetch("/api/documents");
-      if (!res.ok) {
-        setListError(documentRequestErrorMessage("list", res.status));
-        return undefined;
-      }
-      const data: unknown = await res.json();
-      if (!Array.isArray(data)) {
-        setListError(documentRequestErrorMessage("list", 502));
-        return undefined;
-      }
-      const documents = data as DocumentRow[];
-      setDocs(documents);
-      setListError(null);
-      return documents;
-    } catch {
-      setListError(documentRequestErrorMessage("list"));
-      return undefined;
-    }
-  }, []);
-
-  useEffect(() => {
-    void fetchDocs().finally(() => setLoaded(true));
-  }, [fetchDocs]);
-
-  const polling = shouldPollDocuments(docs);
-  useEffect(() => {
-    if (!polling) return undefined;
-    const pollId = window.setInterval(() => {
-      void fetchDocs();
-    }, 3000);
-    return () => window.clearInterval(pollId);
-  }, [fetchDocs, polling]);
-
   const uploadFile = async (file: File) => {
-    const validationError = validateUploadFile(file);
-    if (validationError) {
-      window.alert(validationError);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-      return;
+    const result = await upload(file);
+    // A failed request keeps the selection; anything else clears the picker.
+    if (result.status !== "failed" && fileInputRef.current) {
+      fileInputRef.current.value = "";
     }
-
-    setUploading(true);
-    try {
-      const formData = new FormData();
-      formData.append("file", file);
-      const res = await fetch("/api/documents", {
-        method: "POST",
-        body: formData,
-      });
-      if (!res.ok) {
-        window.alert(documentRequestErrorMessage("upload", res.status));
-        return;
-      }
-      if (fileInputRef.current) fileInputRef.current.value = "";
-      await fetchDocs();
-    } catch {
-      window.alert(documentRequestErrorMessage("upload"));
-    } finally {
-      setUploading(false);
-    }
+    if (result.status !== "uploaded") window.alert(result.message);
   };
 
   const handleDelete = async (doc: DocumentRow) => {
     if (!window.confirm(`確定刪除「${doc.filename}」？`)) return;
-    try {
-      const res = await fetch(`/api/documents/${doc.id}`, { method: "DELETE" });
-      if (!res.ok) {
-        window.alert(documentRequestErrorMessage("delete", res.status));
-        if (res.status === 404) await fetchDocs();
-        return;
-      }
-      await fetchDocs();
-    } catch {
-      window.alert(documentRequestErrorMessage("delete"));
-    }
+    const result = await remove(doc);
+    if (!result.ok) window.alert(result.message);
   };
 
   const openPicker = () => {
@@ -302,7 +241,7 @@ export const Documents = () => {
           listError ? (
             <DocumentListError
               message={listError}
-              onRetry={() => void fetchDocs()}
+              onRetry={() => void refresh()}
             />
           ) : (
             <div className="docs-empty">
@@ -310,9 +249,6 @@ export const Documents = () => {
                 <DocsIcon />
               </span>
               <h3>這裡還沒有文件</h3>
-              <p>
-                上傳手冊、規範、簡報或報表，知星會讀完內容並建立索引，之後就能直接問。
-              </p>
             </div>
           )
         ) : (
@@ -320,7 +256,7 @@ export const Documents = () => {
             {listError && (
               <DocumentListError
                 message={listError}
-                onRetry={() => void fetchDocs()}
+                onRetry={() => void refresh()}
               />
             )}
             <DocumentList documents={docs} onDelete={handleDelete} />

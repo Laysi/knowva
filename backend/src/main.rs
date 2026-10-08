@@ -1,10 +1,13 @@
 pub mod cloud_models;
+mod conversations;
+mod document_files;
 mod document_summary;
 mod embedding;
 pub mod evaluation;
 mod ingest;
 mod page_artifacts;
 mod page_vision;
+mod profile;
 mod rag_context;
 mod search;
 mod storage;
@@ -21,6 +24,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use cloud_models::{ChatMessage, CloudModelClient, CloudModelConfig, SseEvent};
 use futures::StreamExt;
+use profile::{Profile, PromptKind};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -35,6 +39,8 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 pub(crate) const DEFAULT_DATABASE_URL: &str = "postgres://knowva:knowva@localhost:5432/knowva";
 pub(crate) const DEFAULT_FILES_DIR: &str = "./data/files";
+/// Holds one build per theme, `<theme>/index.html` and `<theme>/assets/`.
+const FRONTEND_DIST_DIR: &str = "../frontend/dist";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -43,6 +49,7 @@ pub struct AppState {
     storage: storage::Storage,
     artifact_config: page_artifacts::ArtifactConfig,
     document_locks: ingest::DocumentLocks,
+    profile: Arc<Profile>,
 }
 
 #[tokio::main]
@@ -65,6 +72,17 @@ async fn main() -> anyhow::Result<()> {
     let model_config = CloudModelConfig::from_env()?;
     let artifact_config = page_artifacts::ArtifactConfig::from_env()?;
     let storage_config = storage::StorageConfig::from_env()?;
+    // The profile and its theme build are checked here, before the database, so a missing
+    // or malformed profile never accepts traffic.
+    let profile = Arc::new(Profile::from_env()?);
+    let frontend_dir = profile.theme_dist_dir(Path::new(FRONTEND_DIST_DIR))?;
+    tracing::info!(
+        profile = profile.id(),
+        theme = profile.theme(),
+        industry_section_chars = profile.industry_section_chars(),
+        answer_prompt_sha256 = %profile.system_prompt_sha256(PromptKind::Answer),
+        "industry profile loaded"
+    );
     tracing::info!(
         chat_model = model_config.chat_model(),
         embed_model = model_config.embed_model(),
@@ -103,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
         storage,
         artifact_config,
         document_locks: ingest::DocumentLocks::default(),
+        profile,
     });
 
     // No CORS layer: the frontend is served from this process, so the browser
@@ -112,32 +131,15 @@ async fn main() -> anyhow::Result<()> {
     // authentication in front of it.
     let app = api_router(state);
 
-    // Compression wraps the static files only. /api/chat is an SSE stream, and
-    // a compressor in front of it can hold token chunks back.
-    let dist_dir = "../frontend/dist";
-    let app = if Path::new(dist_dir).exists() {
-        // Vite writes content-hashed filenames under assets/, so those never
-        // change meaning and can be cached indefinitely. index.html names them
-        // and must be revalidated, or a deploy would not be picked up.
-        let assets = Router::new()
-            .fallback_service(ServeDir::new(format!("{dist_dir}/assets")))
-            .layer(SetResponseHeaderLayer::overriding(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=31536000, immutable"),
-            ))
-            .layer(CompressionLayer::new());
-        let index_html = format!("{dist_dir}/index.html");
-        let shell = Router::new()
-            .fallback_service(ServeDir::new(dist_dir).not_found_service(ServeFile::new(index_html)))
-            .layer(SetResponseHeaderLayer::overriding(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("no-cache"),
-            ))
-            .layer(CompressionLayer::new());
-        app.nest_service("/assets", assets).fallback_service(shell)
-    } else {
-        tracing::warn!("{dist_dir} not found; serving the API without a frontend");
-        app
+    let app = match frontend_dir {
+        Some(theme_dir) => {
+            tracing::info!(frontend = %theme_dir.display(), "serving the theme build");
+            with_frontend(app, &theme_dir)
+        }
+        None => {
+            tracing::warn!("{FRONTEND_DIST_DIR} not found; serving the API without a frontend");
+            app
+        }
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -151,18 +153,56 @@ async fn main() -> anyhow::Result<()> {
 fn api_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/profile", get(profile_ui))
         .route(
             "/api/documents",
             get(list_documents).post(ingest::upload_document),
         )
         .route("/api/documents/{id}", delete(ingest::delete_document))
         .route("/api/chat", post(chat))
+        .merge(document_files::router())
+        .merge(conversations::router())
         .layer(DefaultBodyLimit::max(ingest::MULTIPART_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 
+/// Serves one theme's build behind the API: `assets/` and, for every other path, the
+/// single-page shell.
+fn with_frontend(app: Router, theme_dir: &Path) -> Router {
+    // Compression wraps the static files only. /api/chat is an SSE stream, and
+    // a compressor in front of it can hold token chunks back.
+    //
+    // Vite writes content-hashed filenames under assets/, so those never
+    // change meaning and can be cached indefinitely. index.html names them
+    // and must be revalidated, or a deploy would not be picked up.
+    let assets = Router::new()
+        .fallback_service(ServeDir::new(theme_dir.join("assets")))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        ))
+        .layer(CompressionLayer::new());
+    let shell = Router::new()
+        .fallback_service(
+            ServeDir::new(theme_dir)
+                .not_found_service(ServeFile::new(theme_dir.join("index.html"))),
+        )
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ))
+        .layer(CompressionLayer::new());
+    app.nest_service("/assets", assets).fallback_service(shell)
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// Interface defaults of the deployed profile. Prompt text and catalog keywords stay on the
+/// server: `ProfileUi` has no field for either.
+async fn profile_ui(State(state): State<Arc<AppState>>) -> Json<profile::ProfileUi> {
+    Json(state.profile.ui().clone())
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -363,7 +403,9 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
         .find(|message| message.role == "user")
         .map(|message| message.content.clone());
 
-    let catalog_query = last_user_text.as_deref().is_some_and(is_catalog_query);
+    let catalog_query = last_user_text
+        .as_deref()
+        .is_some_and(|text| is_catalog_query(text, state.profile.catalog_keywords()));
     let candidates = match last_user_text {
         Some(text) if !text.trim().is_empty() => {
             let retrieval = if catalog_query {
@@ -436,18 +478,19 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
             return;
         }
     };
-    let system_prompt = if catalog_query {
-        rag_context::RAG_CATALOG_SYSTEM_PROMPT
+    let prompt_kind = if catalog_query {
+        PromptKind::Catalog
     } else if context.sources.is_empty() {
-        rag_context::RAG_NO_SOURCES_SYSTEM_PROMPT
+        PromptKind::NoSources
     } else {
-        rag_context::RAG_SYSTEM_PROMPT
+        PromptKind::Answer
     };
+    let system_prompt = state.profile.system_prompt(prompt_kind).to_owned();
     let models = state.models.clone();
     let context = match if catalog_query {
-        models.fit_catalog_context_to_request(system_prompt, context, &req.messages)
+        models.fit_catalog_context_to_request(&system_prompt, context, &req.messages)
     } else {
-        models.fit_rag_context_to_request(system_prompt, context, &req.messages)
+        models.fit_rag_context_to_request(&system_prompt, context, &req.messages)
     } {
         Ok(context) => context,
         Err(error) => {
@@ -476,7 +519,7 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
     let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
     let stream_task = tokio::spawn(async move {
         models
-            .stream_chat_with_context(system_prompt.to_string(), content, req.messages, inner_tx)
+            .stream_chat_with_context(system_prompt, content, req.messages, inner_tx)
             .await;
     });
     let abort_handle = stream_task.abort_handle();
@@ -487,11 +530,18 @@ async fn run_chat(state: Arc<AppState>, req: ChatRequest, tx: tokio::sync::mpsc:
     }
 }
 
-fn is_catalog_query(query: &str) -> bool {
+/// A whole-knowledge-base question names a scope term and an intent term from the profile's
+/// catalog keywords, which the profile stores lowercased.
+fn is_catalog_query(query: &str, keywords: &profile::CatalogKeywords) -> bool {
     let query = query.to_lowercase();
-    let scope = ["知識庫", "資料庫", "專案", "全庫", "所有文件", "整個"];
-    let intent = ["主題", "文件", "內容", "涵蓋", "有哪些", "什麼資料"];
-    scope.iter().any(|term| query.contains(term)) && intent.iter().any(|term| query.contains(term))
+    keywords
+        .scope()
+        .iter()
+        .any(|term| query.contains(term.as_str()))
+        && keywords
+            .intent()
+            .iter()
+            .any(|term| query.contains(term.as_str()))
 }
 
 async fn forward_rag_events(
@@ -566,6 +616,7 @@ async fn forward_rag_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::test_support::{TempDir, valid_profile_json, write_profile};
 
     fn pending_upstream() -> tokio::task::JoinHandle<()> {
         tokio::spawn(std::future::pending())
@@ -651,6 +702,7 @@ mod tests {
             filename: "source.pdf".to_string(),
             page_number: Some(1),
             kind: "page".to_string(),
+            catalog: false,
         }];
         let upstream = pending_upstream();
         let abort_handle = upstream.abort_handle();
@@ -793,9 +845,228 @@ mod tests {
 
     #[test]
     fn catalog_query_detection_is_limited_to_whole_kb_intent() {
-        assert!(is_catalog_query("知識庫目前涵蓋哪些主題？"));
-        assert!(is_catalog_query("專案有哪些文件？"));
-        assert!(!is_catalog_query("維護報告涵蓋哪些主題？"));
-        assert!(!is_catalog_query("感測器告警怎麼處理？"));
+        let profile = Profile::for_test();
+        let keywords = profile.catalog_keywords();
+        assert!(is_catalog_query("知識庫目前涵蓋哪些主題？", keywords));
+        assert!(is_catalog_query("專案有哪些文件？", keywords));
+        assert!(!is_catalog_query("維護報告涵蓋哪些主題？", keywords));
+        assert!(!is_catalog_query("感測器告警怎麼處理？", keywords));
+    }
+
+    #[test]
+    fn every_repository_profile_marks_exactly_its_catalog_suggestions() {
+        let profiles_dir = profile::repository_profiles_dir();
+        let mut visited = Vec::new();
+        for entry in std::fs::read_dir(&profiles_dir).expect("read the repository profiles") {
+            let entry = entry.expect("read a profiles entry");
+            if !entry.file_type().expect("profiles entry type").is_dir() {
+                continue;
+            }
+            let id = entry.file_name().into_string().expect("UTF-8 profile id");
+            let profile = Profile::load(&profiles_dir, &id)
+                .unwrap_or_else(|error| panic!("profile {id:?} must load: {error:#}"));
+            for suggestion in profile.suggestions() {
+                // A suggestion marked catalog must reach the overview path; an unmarked one
+                // must not, or the marking would misdescribe what the question does.
+                assert_eq!(
+                    is_catalog_query(&suggestion.text, profile.catalog_keywords()),
+                    suggestion.catalog,
+                    "profile {id:?}: suggestion {:?} is marked catalog={}",
+                    suggestion.text,
+                    suggestion.catalog
+                );
+            }
+            visited.push(id);
+        }
+        assert!(
+            visited.iter().any(|id| id == profile::DEFAULT_PROFILE_ID),
+            "profiles/default must exist: {visited:?}"
+        );
+    }
+
+    fn offline_state(profile: Arc<Profile>) -> Arc<AppState> {
+        Arc::new(AppState {
+            // Nothing these tests request reaches the database; this pool never connects.
+            pool: PgPoolOptions::new()
+                .connect_lazy("postgres://unused@127.0.0.1:9/unused")
+                .expect("lazy pool"),
+            models: CloudModelClient::for_test(),
+            storage: storage::Storage::memory(),
+            artifact_config: page_artifacts::ArtifactConfig::for_test(),
+            document_locks: ingest::DocumentLocks::default(),
+            profile,
+        })
+    }
+
+    async fn get(app: &Router, uri: &str) -> (axum::http::StatusCode, Option<String>, String) {
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(uri)
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route the request");
+        let status = response.status();
+        let cache_control = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .map(|value| value.to_str().expect("ASCII header").to_owned());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read the body");
+        (
+            status,
+            cache_control,
+            String::from_utf8(body.to_vec()).expect("UTF-8 body"),
+        )
+    }
+
+    #[tokio::test]
+    async fn profile_route_serves_the_default_interface_fields() {
+        let app = api_router(offline_state(Profile::for_test()));
+        let (status, _, body) = get(&app, "/api/profile").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "id": "default",
+                "theme": "default",
+                "brand": { "name": "Knowva 知星", "tagline": "點亮你的知識星系" },
+                "pages": {
+                    "chat": { "title": "知識問答" },
+                    "documents": { "title": "文件管理" }
+                },
+                "suggestions": [
+                    { "text": "知識庫裡有哪些主題？", "catalog": true },
+                    { "text": "整理知識庫的重點", "catalog": false },
+                    { "text": "新人該先看哪幾份文件？", "catalog": false }
+                ],
+                "composerPlaceholder": "問問你的文件…"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_route_never_returns_prompt_text_or_catalog_keywords() {
+        let root = TempDir::new("route");
+        let industry = "產業段標記：你是精密機械廠的維修顧問。";
+        let mut json = valid_profile_json("default");
+        json["catalogKeywords"] = serde_json::json!({
+            "scope": ["範圍標記詞甲", "範圍標記詞乙"],
+            "intent": ["意圖標記詞丙"]
+        });
+        write_profile(&root.0, "machining", &json, industry);
+        let profile = Arc::new(Profile::load(&root.0, "machining").expect("load profile"));
+        assert!(
+            profile
+                .system_prompt(PromptKind::Answer)
+                .ends_with(industry)
+        );
+
+        let (status, _, body) = get(&api_router(offline_state(profile)), "/api/profile").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        for secret in [
+            industry,
+            "產業段標記",
+            rag_context::INDUSTRY_SECTION_HEADING,
+            rag_context::RAG_SYSTEM_PROMPT,
+            "範圍標記詞甲",
+            "範圍標記詞乙",
+            "意圖標記詞丙",
+            "catalogKeywords",
+            "prompt",
+        ] {
+            assert!(!body.contains(secret), "response leaks {secret:?}: {body}");
+        }
+        let json: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        let keys = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "brand",
+                "composerPlaceholder",
+                "id",
+                "pages",
+                "suggestions",
+                "theme"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn frontend_follows_the_theme_of_the_selected_profile() {
+        let root = TempDir::new("themes");
+        let profiles_dir = root.0.join("profiles");
+        let dist = root.0.join("dist");
+        for theme in ["alpha", "beta"] {
+            write_profile(
+                &profiles_dir,
+                &format!("{theme}-industry"),
+                &valid_profile_json(theme),
+                "",
+            );
+            std::fs::create_dir_all(dist.join(theme).join("assets")).expect("create theme");
+            std::fs::write(
+                dist.join(theme).join("index.html"),
+                format!("<!doctype html><title>{theme}</title>"),
+            )
+            .expect("write index.html");
+            std::fs::write(
+                dist.join(theme).join("assets/index-c0ffee.js"),
+                format!("console.log({theme:?});"),
+            )
+            .expect("write asset");
+        }
+
+        for theme in ["alpha", "beta"] {
+            let profile = Profile::from_lookup(|name| match name {
+                "KNOWVA_PROFILE" => Some(format!("{theme}-industry")),
+                "PROFILES_DIR" => Some(profiles_dir.display().to_string()),
+                _ => None,
+            })
+            .expect("load profile");
+            let theme_dir = profile
+                .theme_dist_dir(&dist)
+                .expect("the theme is built")
+                .expect("dist exists");
+            let app = with_frontend(api_router(offline_state(Arc::new(profile))), &theme_dir);
+            let index = format!("<!doctype html><title>{theme}</title>");
+
+            for path in ["/", "/index.html"] {
+                let (status, cache_control, body) = get(&app, path).await;
+                assert_eq!(status, axum::http::StatusCode::OK, "{theme} {path}");
+                assert_eq!(body, index, "{theme} {path}");
+                assert_eq!(cache_control.as_deref(), Some("no-cache"), "{theme} {path}");
+            }
+            // Any other path still gets this theme's shell (with ServeDir's not-found status,
+            // as before themes existed).
+            let (_, cache_control, body) = get(&app, "/documents").await;
+            assert_eq!(body, index, "{theme} shell fallback");
+            assert_eq!(cache_control.as_deref(), Some("no-cache"));
+
+            let (status, cache_control, body) = get(&app, "/assets/index-c0ffee.js").await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{theme} asset");
+            assert_eq!(body, format!("console.log({theme:?});"));
+            assert_eq!(
+                cache_control.as_deref(),
+                Some("public, max-age=31536000, immutable")
+            );
+            let (status, _, _) = get(&app, "/assets/missing.js").await;
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+            let (_, _, body) = get(&app, "/api/profile").await;
+            let json: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+            assert_eq!(json["theme"], theme);
+        }
     }
 }

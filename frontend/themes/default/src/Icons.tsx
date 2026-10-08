@@ -78,6 +78,14 @@ export const UploadIcon = ({ className }: IconProps) => (
   </svg>
 );
 
+export const DownloadIcon = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <path d="M21 15v3.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V15" />
+    <path d="M7.5 10.5 12 15l4.5-4.5" />
+    <path d="M12 15V4" />
+  </svg>
+);
+
 export const CompassIcon = ({ className }: IconProps) => (
   <svg {...base} className={className}>
     <circle cx="12" cy="12" r="8.6" />
@@ -112,5 +120,23 @@ export const ArrowRightIcon = ({ className }: IconProps) => (
   <svg {...base} className={className}>
     <path d="M5 12h13" />
     <path d="M12.5 5.5 19 12l-6.5 6.5" />
+  </svg>
+);
+
+export const PlusIcon = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <path d="M12 5v14M5 12h14" />
+  </svg>
+);
+
+export const MenuIcon = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <path d="M4 7h16M4 12h16M4 17h16" />
+  </svg>
+);
+
+export const CloseIcon = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <path d="m6 6 12 12M18 6 6 18" />
   </svg>
 );

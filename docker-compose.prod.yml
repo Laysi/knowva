@@ -64,6 +64,8 @@ services:
       MODEL_REQUEST_TIMEOUT_SECS: ${MODEL_REQUEST_TIMEOUT_SECS:-120}
       PDF_RENDER_DPI: ${PDF_RENDER_DPI:-180}
       DOCUMENT_CONVERSION_TIMEOUT_SECS: ${DOCUMENT_CONVERSION_TIMEOUT_SECS:-120}
+      # Industry profile baked into the image; an unknown one stops the container.
+      KNOWVA_PROFILE: ${KNOWVA_PROFILE:-default}
     volumes:
       - app_files:/app/backend/data/files
 

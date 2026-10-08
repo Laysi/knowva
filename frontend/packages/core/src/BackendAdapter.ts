@@ -12,7 +12,24 @@ export type ChatSource = {
   filename: string;
   pageNumber: number | null;
   kind: "page" | "text";
+  /**
+   * Set on a catalog answer's sources: the answer saw the document's card
+   * (filename, summary, tags), and `unitId` is only its first unit.
+   */
+  catalog?: boolean;
 };
+
+/**
+ * Every chat failure a theme can show. Raw server, SSE and provider text never
+ * reaches the thread; it is always replaced by one of these.
+ */
+export const CHAT_ERROR_MESSAGES = {
+  /** The backend sent an SSE `error` event. */
+  generation: "系統暫時無法產生回覆，請稍後再試。",
+  malformed: "回覆格式異常，請重新送出問題。",
+  interrupted: "回覆傳輸中斷，請重新送出問題。",
+  emptyBody: "問答服務未傳回內容，請稍後再試。",
+} as const;
 
 class SafeChatError extends Error {}
 
@@ -94,6 +111,7 @@ const isChatSource = (value: unknown): value is ChatSource => {
         value.unitIndex >= 0)) &&
     typeof value.filename === "string" &&
     value.filename.length > 0 &&
+    (value.catalog === undefined || typeof value.catalog === "boolean") &&
     ((value.kind === "page" &&
       typeof value.pageNumber === "number" &&
       Number.isSafeInteger(value.pageNumber) &&
@@ -102,7 +120,8 @@ const isChatSource = (value: unknown): value is ChatSource => {
   );
 };
 
-const sourceData = (value: unknown): ChatSource[] | null => {
+/** The sources of one answer, or null unless every entry is well formed and unique. */
+export const sourceData = (value: unknown): ChatSource[] | null => {
   if (!Array.isArray(value) || !value.every(isChatSource)) return null;
   const sourceIds = new Set(value.map((source) => source.sourceId));
   return sourceIds.size === value.length ? value : null;
@@ -144,7 +163,7 @@ const appendTextDelta = (
 
   const current = content[activeTextIndex];
   if (current?.type !== "text") {
-    throw new SafeChatError("回覆格式異常，請重新送出問題。");
+    throw new SafeChatError(CHAT_ERROR_MESSAGES.malformed);
   }
   const updated = { ...current, text: current.text + delta };
   return {
@@ -184,7 +203,7 @@ export const BackendAdapter: ChatModelAdapter = {
       throw new SafeChatError(chatRequestErrorMessage(response.status));
     }
     if (!response.body) {
-      throw new SafeChatError("問答服務未傳回內容，請稍後再試。");
+      throw new SafeChatError(CHAT_ERROR_MESSAGES.emptyBody);
     }
 
     let content: ThreadAssistantMessagePart[] = [];
@@ -196,12 +215,12 @@ export const BackendAdapter: ChatModelAdapter = {
       for await (const value of readSsePayloads(response.body)) {
         if (!isRecord(value) || typeof value.type !== "string") continue;
         if (completed) {
-          throw new SafeChatError("回覆格式異常，請重新送出問題。");
+          throw new SafeChatError(CHAT_ERROR_MESSAGES.malformed);
         }
 
         if (value.type === "text-delta") {
           if (sources !== null || typeof value.text !== "string") {
-            throw new SafeChatError("回覆格式異常，請重新送出問題。");
+            throw new SafeChatError(CHAT_ERROR_MESSAGES.malformed);
           }
           const next = appendTextDelta(content, activeTextIndex, value.text);
           content = next.content;
@@ -212,18 +231,18 @@ export const BackendAdapter: ChatModelAdapter = {
 
         if (value.type === "sources") {
           if (sources !== null) {
-            throw new SafeChatError("回覆格式異常，請重新送出問題。");
+            throw new SafeChatError(CHAT_ERROR_MESSAGES.malformed);
           }
           sources = sourceData(value.sources);
           if (sources === null) {
-            throw new SafeChatError("回覆格式異常，請重新送出問題。");
+            throw new SafeChatError(CHAT_ERROR_MESSAGES.malformed);
           }
           continue;
         }
 
         if (value.type === "done") {
           if (sources === null) {
-            throw new SafeChatError("回覆格式異常，請重新送出問題。");
+            throw new SafeChatError(CHAT_ERROR_MESSAGES.malformed);
           }
           content = [
             ...content,
@@ -236,16 +255,16 @@ export const BackendAdapter: ChatModelAdapter = {
         }
 
         if (value.type === "error") {
-          throw new SafeChatError("系統暫時無法產生回覆，請稍後再試。");
+          throw new SafeChatError(CHAT_ERROR_MESSAGES.generation);
         }
       }
       if (!completed) {
-        throw new SafeChatError("回覆傳輸中斷，請重新送出問題。");
+        throw new SafeChatError(CHAT_ERROR_MESSAGES.interrupted);
       }
     } catch (error) {
       if (isAbortError(error, abortSignal)) throw error;
       if (error instanceof SafeChatError) throw error;
-      throw new SafeChatError("回覆傳輸中斷，請重新送出問題。");
+      throw new SafeChatError(CHAT_ERROR_MESSAGES.interrupted);
     }
   },
 };

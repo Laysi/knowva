@@ -109,6 +109,7 @@ fn test_state(pool: &PgPool, models: CloudModelClient, storage: Storage) -> Arc<
         storage,
         artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
         document_locks: crate::ingest::DocumentLocks::default(),
+        profile: crate::profile::Profile::for_test(),
     })
 }
 
@@ -2240,6 +2241,289 @@ async fn delete_keeps_a_retry_handle_when_storage_cleanup_fails(
     Ok(())
 }
 
+/// A ready document with its original, as ingestion leaves it published.
+async fn ready_document_with_original(
+    pool: &PgPool,
+    storage: &Storage,
+    filename: &str,
+    original: &[u8],
+) -> anyhow::Result<Uuid> {
+    let (document_id, _) = store_original(pool, storage, filename, original.to_vec()).await?;
+    sqlx::query(
+        "UPDATE documents SET status = 'ready', artifact_status = 'ready', \
+         mime_type = 'application/pdf' WHERE id = $1",
+    )
+    .bind(document_id)
+    .execute(pool)
+    .await?;
+    Ok(document_id)
+}
+
+async fn insert_page_unit_at(
+    pool: &PgPool,
+    document_id: Uuid,
+    page_number: i32,
+    content: Option<&str>,
+    image_path: &str,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "INSERT INTO document_units \
+         (document_id, kind, unit_index, page_number, content, image_path, needs_vision, \
+          embedding) \
+         VALUES ($1, 'page', $2, $3, $4, $5, $6, $7) RETURNING id",
+    )
+    .bind(document_id)
+    .bind(page_number - 1)
+    .bind(page_number)
+    .bind(content)
+    .bind(image_path)
+    .bind(content.is_none())
+    .bind(vector_with(&[(0, 1.0)]))
+    .fetch_one(pool)
+    .await
+}
+
+async fn get_document_file(
+    app: &Router,
+    uri: &str,
+) -> anyhow::Result<(StatusCode, axum::http::HeaderMap, Vec<u8>)> {
+    let response = app
+        .clone()
+        .oneshot(Request::get(uri).body(Body::empty())?)
+        .await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    Ok((status, headers, body.to_vec()))
+}
+
+fn assert_private(headers: &axum::http::HeaderMap) {
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+}
+
+#[sqlx::test]
+async fn cited_files_are_served_exactly_from_local_storage(pool: PgPool) -> anyhow::Result<()> {
+    let files_dir = std::env::temp_dir().join(format!("knowva-cited-local-{}", Uuid::new_v4()));
+    cited_files_are_served_exactly(pool, Storage::local(&files_dir)?).await?;
+    std::fs::remove_dir_all(files_dir)?;
+    Ok(())
+}
+
+#[sqlx::test]
+async fn cited_files_are_served_exactly_from_in_memory_storage(pool: PgPool) -> anyhow::Result<()> {
+    cited_files_are_served_exactly(pool, Storage::memory()).await
+}
+
+/// The page image, the texts and the original come back byte for byte, with
+/// the headers that keep them private and inert.
+async fn cited_files_are_served_exactly(pool: PgPool, storage: Storage) -> anyhow::Result<()> {
+    let original = b"%PDF-1.7 cited original".to_vec();
+    let document_id =
+        ready_document_with_original(&pool, &storage, "設備保養手冊.pdf", &original).await?;
+    let image_key = format!("{document_id}/artifacts-run/pages/0001.png");
+    let page_image = png_bytes(3, 2, [20, 40, 60, 255]);
+    storage.put(&image_key, page_image.clone()).await?;
+    let page_unit =
+        insert_page_unit_at(&pool, document_id, 1, Some("第一頁的文字層"), &image_key).await?;
+    let text_unit = insert_text_unit(
+        &pool,
+        document_id,
+        0,
+        "保養週期為六個月。",
+        &vector_with(&[(1, 1.0)]),
+    )
+    .await?;
+    let app = api_router(test_state(&pool, CloudModelClient::for_test(), storage));
+
+    let (status, headers, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{page_unit}/image"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, page_image);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(
+        headers["content-length"],
+        page_image.len().to_string().as_str()
+    );
+    assert_private(&headers);
+
+    let (status, headers, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{text_unit}/text"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8(body)?, "保養週期為六個月。");
+    assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+    assert_private(&headers);
+
+    let (status, _, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{page_unit}/text"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8(body)?, "第一頁的文字層");
+
+    let (status, headers, body) =
+        get_document_file(&app, &format!("/api/documents/{document_id}/file")).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, original);
+    assert_eq!(headers["content-type"], "application/pdf");
+    assert_eq!(
+        headers["content-length"],
+        original.len().to_string().as_str()
+    );
+    assert_eq!(
+        headers["content-disposition"],
+        "attachment; filename=\"______.pdf\"; \
+         filename*=UTF-8''%E8%A8%AD%E5%82%99%E4%BF%9D%E9%A4%8A%E6%89%8B%E5%86%8A.pdf"
+    );
+    assert_eq!(headers["content-security-policy"], "sandbox");
+    assert_private(&headers);
+
+    sqlx::query(
+        "UPDATE documents SET summary = '設備保養重點', tags = ARRAY['保養', '馬達'] \
+         WHERE id = $1",
+    )
+    .bind(document_id)
+    .execute(&pool)
+    .await?;
+    let catalog = search::catalog_candidates(&pool).await?;
+    let cited_unit = catalog[0].unit_id;
+    assert_eq!(cited_unit, page_unit.min(text_unit));
+    let (status, headers, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{cited_unit}/catalog"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        String::from_utf8(body)?,
+        "文件名稱：設備保養手冊.pdf\n摘要：設備保養重點\n標籤：保養、馬達"
+    );
+    assert_eq!(
+        catalog[0].content.as_deref(),
+        Some("文件名稱：設備保養手冊.pdf\n摘要：設備保養重點\n標籤：保養、馬達"),
+        "the card is the text the catalog answer saw"
+    );
+    assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+    assert_private(&headers);
+
+    // Only the document's first unit names its card: a citation from before the
+    // document was processed again names a unit that is gone.
+    let (status, _, _) = get_document_file(
+        &app,
+        &format!(
+            "/api/documents/{document_id}/units/{}/catalog",
+            page_unit.max(text_unit)
+        ),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    sqlx::query("DELETE FROM document_units WHERE id = $1")
+        .bind(cited_unit)
+        .execute(&pool)
+        .await?;
+    let (status, _, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{cited_unit}/catalog"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(String::from_utf8(body)?, "找不到這個來源。");
+    Ok(())
+}
+
+#[sqlx::test]
+async fn document_files_answer_one_not_found_for_anything_retrieval_would_not_use(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let storage = Storage::memory();
+    let document_id =
+        ready_document_with_original(&pool, &storage, "manual.pdf", b"%PDF manual").await?;
+    let image_key = format!("{document_id}/artifacts-run/pages/0001.png");
+    storage
+        .put(&image_key, png_bytes(1, 1, [0, 0, 0, 255]))
+        .await?;
+    let scanned_page = insert_page_unit_at(&pool, document_id, 1, None, &image_key).await?;
+    let text_unit =
+        insert_text_unit(&pool, document_id, 0, "段落", &vector_with(&[(1, 1.0)])).await?;
+
+    let other_id =
+        ready_document_with_original(&pool, &storage, "other.pdf", b"%PDF other secret").await?;
+    let other_key = format!("{other_id}/artifacts-run/pages/0001.png");
+    storage
+        .put(&other_key, png_bytes(1, 1, [9, 9, 9, 255]))
+        .await?;
+    let other_page = insert_page_unit_at(&pool, other_id, 1, Some("其他文件"), &other_key).await?;
+    // A row whose key names another document's original must never read it.
+    let escaping_page = insert_page_unit_at(
+        &pool,
+        document_id,
+        2,
+        Some("跨文件"),
+        &format!("{other_id}/original.pdf"),
+    )
+    .await?;
+    let app = api_router(test_state(&pool, CloudModelClient::for_test(), storage));
+
+    let not_found = [
+        format!("/api/documents/{document_id}/units/{scanned_page}/text"),
+        format!("/api/documents/{document_id}/units/{text_unit}/image"),
+        format!("/api/documents/{document_id}/units/{other_page}/image"),
+        format!("/api/documents/{document_id}/units/{other_page}/text"),
+        format!("/api/documents/{document_id}/units/999999999/image"),
+        format!("/api/documents/{document_id}/units/not-a-unit/text"),
+        format!("/api/documents/{}/units/{text_unit}/text", Uuid::new_v4()),
+        format!("/api/documents/not-a-uuid/units/{text_unit}/text"),
+        format!("/api/documents/{}/file", Uuid::new_v4()),
+        "/api/documents/not-a-uuid/file".to_string(),
+        format!(
+            "/api/documents/{}/units/{text_unit}/catalog",
+            Uuid::new_v4()
+        ),
+        format!("/api/documents/{document_id}/units/not-a-unit/catalog"),
+        "/api/documents/not-a-uuid/units/1/catalog".to_string(),
+    ];
+    for uri in &not_found {
+        let (status, headers, body) = get_document_file(&app, uri).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(String::from_utf8(body)?, "找不到這個來源。", "{uri}");
+        assert_private(&headers);
+    }
+
+    let (status, _, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{escaping_page}/image"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(String::from_utf8(body)?, "來源暫時無法讀取，請稍後再試。");
+
+    for status in ["processing", "failed"] {
+        sqlx::query("UPDATE documents SET status = $2 WHERE id = $1")
+            .bind(document_id)
+            .bind(status)
+            .execute(&pool)
+            .await?;
+        for uri in [
+            format!("/api/documents/{document_id}/units/{scanned_page}/image"),
+            format!("/api/documents/{document_id}/units/{text_unit}/text"),
+            format!("/api/documents/{document_id}/file"),
+            format!("/api/documents/{document_id}/units/{scanned_page}/catalog"),
+        ] {
+            let (response_status, _, body) = get_document_file(&app, &uri).await?;
+            assert_eq!(response_status, StatusCode::NOT_FOUND, "{status} {uri}");
+            assert_eq!(String::from_utf8(body)?, "找不到這個來源。");
+        }
+    }
+    Ok(())
+}
+
 #[sqlx::test]
 async fn markdown_and_text_fixtures_keep_heading_aware_staging(pool: PgPool) -> anyhow::Result<()> {
     let root = std::env::temp_dir().join(format!("knowva-text-fixtures-{}", Uuid::new_v4()));
@@ -2414,11 +2698,18 @@ async fn upload_answer_delete_flow(pool: &PgPool, storage: Storage) -> anyhow::R
                 .is_some_and(|image| image.starts_with("data:image/png;base64,"))
         );
         let chats = mock.summary_requests.lock().expect("chat request lock");
-        let answer = chats
+        let answer_request = chats
             .iter()
             .find(|request| request["stream"] == true)
-            .expect("streamed answer request")
-            .to_string();
+            .expect("streamed answer request");
+        // The default profile has no industry section, so /api/chat sends the core rules
+        // exactly as written.
+        assert_eq!(answer_request["messages"][0]["role"], "system");
+        assert_eq!(
+            answer_request["messages"][0]["content"],
+            crate::rag_context::RAG_SYSTEM_PROMPT
+        );
+        let answer = answer_request.to_string();
         assert!(answer.contains("data:image/jpeg;base64,"));
         assert!(
             !answer.contains(&image_path),
@@ -2575,5 +2866,659 @@ async fn unlocked_database_with_documents_requires_reinitialization(
         .fetch_one(&pool)
         .await?;
     assert_eq!(rows, 0);
+    Ok(())
+}
+
+// Conversation history (issue #52).
+
+struct ConversationReply {
+    status: StatusCode,
+    set_cookie: Option<String>,
+    body: Value,
+}
+
+impl ConversationReply {
+    /// The `knowva_client` token this reply issued.
+    fn issued_token(&self) -> String {
+        self.set_cookie
+            .as_deref()
+            .and_then(|cookie| cookie.strip_prefix("knowva_client="))
+            .and_then(|rest| rest.split(';').next())
+            .expect("the reply issues a client cookie")
+            .to_owned()
+    }
+}
+
+/// One conversation API call as the browser holding `token` would make it.
+async fn conversation_call(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> anyhow::Result<ConversationReply> {
+    let mut request = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        request = request.header("cookie", format!("knowva_client={token}"));
+    }
+    let request = match body {
+        Some(body) => request
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body)?))?,
+        None => request.body(Body::empty())?,
+    };
+    let response = app.clone().oneshot(request).await?;
+    let status = response.status();
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()?;
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+    };
+    Ok(ConversationReply {
+        status,
+        set_cookie,
+        body,
+    })
+}
+
+async fn create_conversation_for(app: &Router, token: &str) -> anyhow::Result<String> {
+    let reply = conversation_call(app, "POST", "/api/conversations", Some(token), None).await?;
+    assert_eq!(reply.status, StatusCode::CREATED, "{:?}", reply.body);
+    Ok(reply.body["conversation"]["id"]
+        .as_str()
+        .expect("conversation id")
+        .to_owned())
+}
+
+fn user_message(id: &str, text: &str) -> Value {
+    serde_json::json!({
+        "id": id,
+        "role": "user",
+        "createdAt": "2026-10-06T08:00:00.000Z",
+        "content": [{ "type": "text", "text": text }],
+        "attachments": [],
+        "metadata": { "custom": {} }
+    })
+}
+
+fn assistant_message(id: &str, text: &str, sources: Value) -> Value {
+    serde_json::json!({
+        "id": id,
+        "role": "assistant",
+        "createdAt": "2026-10-06T08:00:05.000Z",
+        "content": [
+            { "type": "text", "text": text },
+            { "type": "data", "name": "sources", "data": sources }
+        ],
+        "status": { "type": "complete", "reason": "unknown" },
+        "metadata": {
+            "unstable_state": null,
+            "unstable_annotations": [],
+            "unstable_data": [],
+            "steps": [],
+            "custom": {}
+        }
+    })
+}
+
+async fn save_conversation_message(
+    app: &Router,
+    token: &str,
+    conversation_id: &str,
+    parent_id: Option<&str>,
+    message: Value,
+) -> anyhow::Result<ConversationReply> {
+    conversation_call(
+        app,
+        "POST",
+        &format!("/api/conversations/{conversation_id}/messages"),
+        Some(token),
+        Some(serde_json::json!({ "parentId": parent_id, "message": message })),
+    )
+    .await
+}
+
+fn conversation_ids(reply: &ConversationReply) -> Vec<String> {
+    reply
+        .body
+        .as_array()
+        .expect("conversation list")
+        .iter()
+        .map(|conversation| conversation["id"].as_str().expect("id").to_owned())
+        .collect()
+}
+
+#[sqlx::test]
+async fn conversations_keep_every_message_part_in_save_order(pool: PgPool) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let token = crate::conversations::test_support::new_token();
+    let id = create_conversation_for(&app, &token).await?;
+    let sources = serde_json::json!([
+        { "sourceId": "S1", "documentId": "00000000-0000-0000-0000-000000000001",
+          "unitId": 137, "unitIndex": 36, "filename": "設備保養手冊.pdf",
+          "pageNumber": 37, "kind": "page" },
+        { "sourceId": "S2", "documentId": "00000000-0000-0000-0000-000000000002",
+          "unitId": 202, "filename": "維運交接筆記.md", "pageNumber": null, "kind": "text" }
+    ]);
+    let question = user_message("q1", "馬達多久保養一次？");
+    let answer = assistant_message("a1", "每三個月保養一次。", sources);
+    let mut failed = assistant_message("a2", "請先", serde_json::json!([]));
+    failed["content"] = serde_json::json!([{ "type": "text", "text": "請先" }]);
+    failed["status"] = serde_json::json!({
+        "type": "incomplete", "reason": "error", "error": "回覆傳輸中斷，請重新送出問題。"
+    });
+    let follow_up = user_message("q2", "交接要注意什麼？");
+    for (parent_id, message) in [
+        (None, &question),
+        (Some("q1"), &answer),
+        (Some("a1"), &follow_up),
+        (Some("q2"), &failed),
+    ] {
+        let reply =
+            save_conversation_message(&app, &token, &id, parent_id, message.clone()).await?;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    }
+
+    let reply = conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{id}/messages"),
+        Some(&token),
+        None,
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        reply.body,
+        serde_json::json!([
+            { "parentId": null, "message": question },
+            { "parentId": "q1", "message": answer },
+            { "parentId": "a1", "message": follow_up },
+            { "parentId": "q2", "message": failed }
+        ])
+    );
+    assert_eq!(reply.set_cookie, None, "a valid cookie is never replaced");
+    Ok(())
+}
+
+#[sqlx::test]
+async fn conversations_of_another_browser_answer_404(pool: PgPool) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let alice = crate::conversations::test_support::new_token();
+    let bob = crate::conversations::test_support::new_token();
+    let alices = create_conversation_for(&app, &alice).await?;
+    let saved =
+        save_conversation_message(&app, &alice, &alices, None, user_message("q1", "甲的問題"))
+            .await?;
+    assert_eq!(saved.status, StatusCode::OK);
+    let bobs = create_conversation_for(&app, &bob).await?;
+
+    let listed = conversation_call(&app, "GET", "/api/conversations", Some(&bob), None).await?;
+    assert_eq!(conversation_ids(&listed), std::slice::from_ref(&bobs));
+    for (method, uri, body) in [
+        ("GET", format!("/api/conversations/{alices}"), None),
+        ("GET", format!("/api/conversations/{alices}/messages"), None),
+        (
+            "POST",
+            format!("/api/conversations/{alices}/messages"),
+            Some(
+                serde_json::json!({ "parentId": "q1", "message": user_message("q2", "乙的問題") }),
+            ),
+        ),
+        ("DELETE", format!("/api/conversations/{alices}"), None),
+    ] {
+        let reply = conversation_call(&app, method, &uri, Some(&bob), body).await?;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method} {uri}");
+        assert_eq!(reply.body, Value::String("找不到這串對話。".to_owned()));
+    }
+    let missing = conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{}", Uuid::new_v4()),
+        Some(&alice),
+        None,
+    )
+    .await?;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.body, Value::String("找不到這串對話。".to_owned()));
+    let malformed = conversation_call(
+        &app,
+        "GET",
+        "/api/conversations/not-a-uuid",
+        Some(&alice),
+        None,
+    )
+    .await?;
+    assert_eq!(malformed.status, StatusCode::NOT_FOUND);
+
+    let cleared = conversation_call(&app, "DELETE", "/api/conversations", Some(&bob), None).await?;
+    assert_eq!(cleared.status, StatusCode::NO_CONTENT);
+    let alices_list =
+        conversation_call(&app, "GET", "/api/conversations", Some(&alice), None).await?;
+    assert_eq!(
+        conversation_ids(&alices_list),
+        std::slice::from_ref(&alices)
+    );
+    let messages: i64 = sqlx::query_scalar("SELECT count(*) FROM conversation_messages")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        messages, 1,
+        "clearing one browser keeps the other's messages"
+    );
+
+    let deleted = conversation_call(
+        &app,
+        "DELETE",
+        &format!("/api/conversations/{alices}"),
+        Some(&alice),
+        None,
+    )
+    .await?;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM conversations")
+        .fetch_one(&pool)
+        .await?;
+    let remaining_messages: i64 = sqlx::query_scalar("SELECT count(*) FROM conversation_messages")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!((remaining, remaining_messages), (0, 0));
+    Ok(())
+}
+
+/// Collects everything the fmt subscriber writes while it is the default.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[sqlx::test]
+async fn the_client_token_never_reaches_the_log(pool: PgPool) -> anyhow::Result<()> {
+    let log = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+
+    let created = conversation_call(&app, "POST", "/api/conversations", None, None).await?;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let token = created.issued_token();
+    let id = created.body["conversation"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    for message in [
+        user_message("q1", "權杖不能外流嗎？"),
+        // Invalid, oversized and misplaced saves go through the error paths too.
+        serde_json::json!({ "id": "bad", "role": "system", "content": [] }),
+    ] {
+        save_conversation_message(&app, &token, &id, None, message).await?;
+    }
+    save_conversation_message(&app, &token, &id, Some("missing"), user_message("q9", "x")).await?;
+    conversation_call(&app, "GET", "/api/conversations", Some(&token), None).await?;
+    conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{}", Uuid::new_v4()),
+        Some(&token),
+        None,
+    )
+    .await?;
+    // A dropped connection mid-request still must not log the token.
+    pool.close().await;
+    let unavailable =
+        conversation_call(&app, "GET", "/api/conversations", Some(&token), None).await?;
+    assert_eq!(unavailable.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        unavailable.body,
+        Value::String("對話紀錄暫時無法使用，請稍後再試。".to_owned())
+    );
+
+    let log = String::from_utf8(log.0.lock().expect("log lock").clone())?;
+    assert!(log.contains("issued an anonymous client cookie"), "{log}");
+    assert!(log.contains("conversation query failed"), "{log}");
+    assert!(!log.contains(&token), "the log holds the client token");
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn conversations_store_only_the_token_hash_as_an_anonymous_owner(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let created = conversation_call(&app, "POST", "/api/conversations", None, None).await?;
+    let token = created.issued_token();
+    let id = created.body["conversation"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    save_conversation_message(&app, &token, &id, None, user_message("q1", "第一個問題")).await?;
+    create_conversation_for(&app, &crate::conversations::test_support::new_token()).await?;
+
+    let owners: Vec<(String, String)> =
+        sqlx::query_as("SELECT owner_kind, owner_id FROM conversations ORDER BY created_at")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(owners.len(), 2);
+    assert_eq!(
+        owners[0].1,
+        crate::conversations::test_support::hash(&token)
+    );
+    assert!(owners.iter().all(|(kind, _)| kind == "anonymous"));
+    let rows_with_token: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM conversations c WHERE c::text LIKE '%' || $1 || '%') \
+              + (SELECT count(*) FROM conversation_messages m WHERE m::text LIKE '%' || $1 || '%')",
+    )
+    .bind(&token)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(rows_with_token, 0);
+
+    // The schema refuses an unknown owner kind and an anonymous owner that is not a hash.
+    for (kind, owner_id) in [
+        ("robot", crate::conversations::test_support::hash(&token)),
+        ("anonymous", token.clone()),
+    ] {
+        let insert =
+            sqlx::query("INSERT INTO conversations (owner_kind, owner_id) VALUES ($1, $2)")
+                .bind(kind)
+                .bind(&owner_id)
+                .execute(&pool)
+                .await;
+        assert!(insert.is_err(), "{kind} {owner_id} must be rejected");
+    }
+    sqlx::query("INSERT INTO conversations (owner_kind, owner_id) VALUES ('user', 'account-42')")
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+#[sqlx::test]
+async fn the_51st_conversation_deletes_the_least_recently_updated(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let token = crate::conversations::test_support::new_token();
+    let other = crate::conversations::test_support::new_token();
+    let others = create_conversation_for(&app, &other).await?;
+    let mut ids = Vec::new();
+    for _ in 0..crate::conversations::MAX_CONVERSATIONS {
+        ids.push(create_conversation_for(&app, &token).await?);
+    }
+    // The second one gets a message so its messages must go with it; the first one is
+    // updated last, so the second is now the stalest.
+    save_conversation_message(&app, &token, &ids[1], None, user_message("q1", "舊的問題")).await?;
+    save_conversation_message(
+        &app,
+        &token,
+        &ids[0],
+        None,
+        user_message("q1", "最近的問題"),
+    )
+    .await?;
+    let stalest = ids[2].clone();
+
+    let created = conversation_call(&app, "POST", "/api/conversations", Some(&token), None).await?;
+    assert_eq!(created.status, StatusCode::CREATED);
+    assert_eq!(created.body["removedIds"], serde_json::json!([stalest]));
+    let newest = created.body["conversation"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let listed = conversation_call(&app, "GET", "/api/conversations", Some(&token), None).await?;
+    let listed = conversation_ids(&listed);
+    assert_eq!(listed.len(), 50);
+    assert_eq!(listed[0], newest);
+    assert_eq!(listed[1], ids[0]);
+    assert!(!listed.contains(&stalest));
+    assert!(listed.contains(&ids[1]));
+    let others_list =
+        conversation_call(&app, "GET", "/api/conversations", Some(&other), None).await?;
+    assert_eq!(conversation_ids(&others_list), [others]);
+
+    // Once more: now the third-created one goes, taking its messages with it.
+    save_conversation_message(&app, &token, &ids[3], None, user_message("q1", "x")).await?;
+    let created = conversation_call(&app, "POST", "/api/conversations", Some(&token), None).await?;
+    assert_eq!(created.body["removedIds"], serde_json::json!([ids[4]]));
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM conversations WHERE owner_id = $1")
+        .bind(crate::conversations::test_support::hash(&token))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(total, 50);
+    Ok(())
+}
+
+#[sqlx::test]
+async fn conversation_messages_are_capped_checked_and_idempotent(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let token = crate::conversations::test_support::new_token();
+    let id = create_conversation_for(&app, &token).await?;
+
+    let limit = crate::conversations::MAX_MESSAGES_PER_CONVERSATION as usize;
+    let mut parent: Option<String> = None;
+    for index in 0..limit {
+        let message_id = format!("m{index}");
+        let message = if index % 2 == 0 {
+            user_message(&message_id, &format!("問題 {index}"))
+        } else {
+            assistant_message(&message_id, &format!("回答 {index}"), serde_json::json!([]))
+        };
+        let reply =
+            save_conversation_message(&app, &token, &id, parent.as_deref(), message).await?;
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "message {index}: {:?}",
+            reply.body
+        );
+        parent = Some(message_id);
+    }
+
+    let over = save_conversation_message(
+        &app,
+        &token,
+        &id,
+        parent.as_deref(),
+        user_message("m-over", "第 201 則"),
+    )
+    .await?;
+    assert_eq!(over.status, StatusCode::CONFLICT);
+    assert_eq!(
+        over.body,
+        Value::String("這串對話已達 200 則訊息，無法再保存。".to_owned())
+    );
+
+    // Resending a saved id replaces it in place, even at the limit.
+    let resent = save_conversation_message(
+        &app,
+        &token,
+        &id,
+        None,
+        user_message("m0", "改寫過的第一個問題"),
+    )
+    .await?;
+    assert_eq!(resent.status, StatusCode::OK);
+    let stored: Vec<(String, i32, Value)> = sqlx::query_as(
+        "SELECT message_id, position, message FROM conversation_messages \
+         WHERE conversation_id = $1::uuid ORDER BY position",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(stored.len(), limit);
+    assert_eq!(stored[0].0, "m0");
+    assert_eq!(stored[0].1, 0);
+    assert_eq!(stored[0].2["content"][0]["text"], "改寫過的第一個問題");
+    assert!(
+        stored
+            .iter()
+            .enumerate()
+            .all(|(index, row)| row.1 == index as i32)
+    );
+
+    let fresh = create_conversation_for(&app, &token).await?;
+    let missing_parent = save_conversation_message(
+        &app,
+        &token,
+        &fresh,
+        Some("nowhere"),
+        user_message("q1", "x"),
+    )
+    .await?;
+    assert_eq!(missing_parent.status, StatusCode::CONFLICT);
+    let invalid = save_conversation_message(
+        &app,
+        &token,
+        &fresh,
+        None,
+        serde_json::json!({ "id": "q1", "role": "tool", "content": [] }),
+    )
+    .await?;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid.body,
+        Value::String("訊息格式不正確，無法保存。".to_owned())
+    );
+    let not_json = conversation_call(
+        &app,
+        "POST",
+        &format!("/api/conversations/{fresh}/messages"),
+        Some(&token),
+        Some(Value::String("not an object".to_owned())),
+    )
+    .await?;
+    assert_eq!(not_json.status, StatusCode::BAD_REQUEST);
+
+    let max = crate::conversations::MAX_MESSAGE_BYTES;
+    let mut at_limit = user_message("q1", "");
+    let overhead = serde_json::to_vec(&at_limit)?.len();
+    at_limit["content"][0]["text"] = Value::String("a".repeat(max - overhead));
+    assert_eq!(serde_json::to_vec(&at_limit)?.len(), max);
+    let accepted = save_conversation_message(&app, &token, &fresh, None, at_limit).await?;
+    assert_eq!(accepted.status, StatusCode::OK);
+    for extra in [1, 64 * 1024] {
+        let mut too_large = user_message("q2", "");
+        too_large["content"][0]["text"] = Value::String("a".repeat(max - overhead + extra));
+        let rejected =
+            save_conversation_message(&app, &token, &fresh, Some("q1"), too_large).await?;
+        assert_eq!(
+            rejected.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "+{extra} bytes"
+        );
+        assert_eq!(
+            rejected.body,
+            Value::String("單則訊息超過 256 KiB，無法保存。".to_owned())
+        );
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM conversation_messages WHERE conversation_id = $1::uuid",
+    )
+    .bind(&fresh)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[sqlx::test]
+async fn the_first_question_titles_a_conversation_without_any_model_request(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (models, mock, server) = spawn_embedding_mock(false).await;
+    let app = api_router(test_state(&pool, models, Storage::memory()));
+    let token = crate::conversations::test_support::new_token();
+    let id = create_conversation_for(&app, &token).await?;
+
+    let question = "  𠀋𡈽三號廠區\n\n冷卻水塔今年第三季有哪些異常紀錄、各自如何處理、負責人是誰？";
+    let saved =
+        save_conversation_message(&app, &token, &id, None, user_message("q1", question)).await?;
+    let title = "𠀋𡈽三號廠區 冷卻水塔今年第三季有哪些異常紀錄、各自如何處理";
+    assert_eq!(title.chars().count(), 30);
+    assert_eq!(saved.body["conversation"]["title"], title);
+
+    for (parent, message) in [
+        ("q1", assistant_message("a1", "回答", serde_json::json!([]))),
+        ("a1", user_message("q2", "第二個問題不會改標題")),
+    ] {
+        let reply = save_conversation_message(&app, &token, &id, Some(parent), message).await?;
+        assert_eq!(reply.body["conversation"]["title"], title);
+    }
+    let fetched = conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{id}"),
+        Some(&token),
+        None,
+    )
+    .await?;
+    assert_eq!(fetched.body["title"], title);
+
+    for requests in [
+        &mock.requests,
+        &mock.summary_requests,
+        &mock.rerank_requests,
+    ] {
+        assert!(
+            requests.lock().expect("mock requests").is_empty(),
+            "titling must not reach a model endpoint"
+        );
+    }
+    server.abort();
     Ok(())
 }
