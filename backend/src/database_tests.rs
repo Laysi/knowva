@@ -109,6 +109,7 @@ fn test_state(pool: &PgPool, models: CloudModelClient, storage: Storage) -> Arc<
         storage,
         artifact_config: crate::page_artifacts::ArtifactConfig::for_test(),
         document_locks: crate::ingest::DocumentLocks::default(),
+        profile: crate::profile::Profile::for_test(),
     })
 }
 
@@ -297,16 +298,7 @@ async fn fresh_database_migrates_to_halfvec(pool: PgPool) -> anyhow::Result<()> 
     assert!(index_definition.contains("halfvec_cosine_ops"));
     assert!(index_definition.contains("WHERE retrieval_ready"));
 
-    let bm25_index_definition: String = sqlx::query_scalar(
-        "SELECT indexdef FROM pg_indexes \
-         WHERE schemaname = current_schema() \
-           AND indexname = 'document_units_bm25_tokens_gin'",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert!(bm25_index_definition.contains("USING gin"));
-    assert!(bm25_index_definition.contains("bm25_tokens"));
-    assert!(bm25_index_definition.contains("retrieval_ready"));
+    assert_no_bm25_objects(&pool).await?;
 
     let chunks_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('public.chunks')::text")
@@ -596,6 +588,127 @@ async fn page_vision_migration_keeps_existing_pages_on_the_image_path(
     Ok(())
 }
 
+async fn assert_no_bm25_objects(pool: &PgPool) -> anyhow::Result<()> {
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT attname::text FROM pg_attribute \
+         WHERE attrelid = 'document_units'::regclass \
+           AND attname LIKE 'bm25%' AND NOT attisdropped",
+    )
+    .fetch_all(pool)
+    .await?;
+    assert!(columns.is_empty(), "BM25 columns remain: {columns:?}");
+    let relations: Vec<String> = sqlx::query_scalar(
+        "SELECT relname::text FROM pg_class \
+         WHERE relnamespace = current_schema()::regnamespace \
+           AND (relname LIKE 'knowva_bm25%' OR relname LIKE '%bm25%')",
+    )
+    .fetch_all(pool)
+    .await?;
+    assert!(
+        relations.is_empty(),
+        "BM25 tables or indexes remain: {relations:?}"
+    );
+    let routines: Vec<String> = sqlx::query_scalar(
+        "SELECT proname::text FROM pg_proc \
+         WHERE pronamespace = current_schema()::regnamespace \
+           AND proname LIKE 'knowva_bm25%'",
+    )
+    .fetch_all(pool)
+    .await?;
+    assert!(routines.is_empty(), "BM25 functions remain: {routines:?}");
+    let triggers: Vec<String> = sqlx::query_scalar(
+        "SELECT tgname::text FROM pg_trigger \
+         WHERE tgrelid = 'document_units'::regclass AND NOT tgisinternal \
+         ORDER BY tgname",
+    )
+    .fetch_all(pool)
+    .await?;
+    assert_eq!(triggers, vec!["document_units_set_retrieval_ready"]);
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+async fn dense_retrieval_migration_drops_bm25_and_keeps_ready_only_retrieval(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    for migration in [
+        include_str!("../migrations/0001_init.sql"),
+        include_str!("../migrations/0002_page_units_halfvec.sql"),
+        include_str!("../migrations/0003_ingest_artifacts.sql"),
+        include_str!("../migrations/0004_hybrid_retrieval.sql"),
+        include_str!("../migrations/0005_allow_binary_artifacts.sql"),
+        include_str!("../migrations/0006_storage_settings.sql"),
+        include_str!("../migrations/0007_page_vision.sql"),
+        include_str!("../migrations/0008_conversations.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(&pool).await?;
+    }
+    let embedding = vector_with(&[(0, 1.0)]);
+    let ready_document = insert_document(&pool, "ready").await?;
+    let ready_unit = insert_text_unit(
+        &pool,
+        ready_document,
+        0,
+        "ready text NX-2048-V2",
+        &embedding,
+    )
+    .await?;
+    let processing_document = insert_document(&pool, "processing").await?;
+    insert_text_unit(&pool, processing_document, 0, "staged text", &embedding).await?;
+
+    sqlx::raw_sql(include_str!("../migrations/0009_dense_retrieval.sql"))
+        .execute(&pool)
+        .await?;
+
+    assert_no_bm25_objects(&pool).await?;
+    let dense = crate::search::dense_candidates_from_pool(&pool, &embedding, 20).await?;
+    assert_eq!(
+        dense
+            .iter()
+            .map(|candidate| candidate.metadata.unit_id)
+            .collect::<Vec<_>>(),
+        vec![ready_unit],
+        "existing rows keep their readiness and stay searchable"
+    );
+    assert_eq!(
+        dense[0].metadata.content.as_deref(),
+        Some("ready text NX-2048-V2")
+    );
+
+    // Both readiness triggers still follow the canonical document status.
+    sqlx::query("UPDATE documents SET status = 'ready' WHERE id = $1")
+        .bind(processing_document)
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE documents SET status = 'failed' WHERE id = $1")
+        .bind(ready_document)
+        .execute(&pool)
+        .await?;
+    insert_text_unit(&pool, processing_document, 1, "new text", &embedding).await?;
+    let readiness: Vec<(Uuid, bool)> =
+        sqlx::query_as("SELECT document_id, retrieval_ready FROM document_units ORDER BY id")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(
+        readiness,
+        vec![
+            (ready_document, false),
+            (processing_document, true),
+            (processing_document, true),
+        ]
+    );
+
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(processing_document)
+        .execute(&pool)
+        .await?;
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM document_units")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(remaining, 1);
+    Ok(())
+}
+
 #[sqlx::test]
 async fn unit_constraints_dimensions_and_cascade_are_enforced(pool: PgPool) -> anyhow::Result<()> {
     let document_id = insert_document(&pool, "processing").await?;
@@ -807,248 +920,7 @@ async fn halfvec_cosine_query_orders_results_and_uses_hnsw(pool: PgPool) -> anyh
 }
 
 #[sqlx::test]
-async fn bm25_tokenizer_normalizes_traditional_chinese_english_numbers_and_product_codes(
-    pool: PgPool,
-) -> anyhow::Result<()> {
-    let tokens: Vec<String> = sqlx::query_scalar(
-        "SELECT knowva_bm25_tokenize('知識，管理！PostgreSQL／ＢＭ２５ 版本１２３ ＮＸ－２０４８－Ｖ２')",
-    )
-    .fetch_one(&pool)
-    .await?;
-
-    for expected in [
-        "知識",
-        "管理",
-        "postgresql",
-        "bm25",
-        "版本",
-        "123",
-        "nx-2048-v2",
-        "nx2048v2",
-        "nx",
-        "2048",
-        "v2",
-    ] {
-        assert!(
-            tokens.iter().any(|token| token == expected),
-            "missing {expected:?} from {tokens:?}"
-        );
-    }
-
-    let full_width: Vec<String> =
-        sqlx::query_scalar("SELECT knowva_bm25_tokenize('ＮＸ－２０４８－Ｖ２')")
-            .fetch_one(&pool)
-            .await?;
-    let half_width: Vec<String> = sqlx::query_scalar("SELECT knowva_bm25_tokenize('nx-2048-v2')")
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!(full_width, half_width);
-
-    let punctuation_variant: Vec<String> =
-        sqlx::query_scalar("SELECT knowva_bm25_tokenize('知識。管理 PostgreSQL, BM25; 123')")
-            .fetch_one(&pool)
-            .await?;
-    for basic_term in ["知識", "管理", "postgresql", "bm25", "123"] {
-        assert!(
-            punctuation_variant.iter().any(|token| token == basic_term),
-            "punctuation removed basic term {basic_term:?}: {punctuation_variant:?}"
-        );
-    }
-    Ok(())
-}
-
-#[sqlx::test]
-async fn bm25_ready_corpus_stats_follow_status_content_updates_and_cascade_delete(
-    pool: PgPool,
-) -> anyhow::Result<()> {
-    let first_document = insert_document(&pool, "processing").await?;
-    let embedding = vector_with(&[(0, 1.0)]);
-    let first_unit = insert_text_unit(
-        &pool,
-        first_document,
-        0,
-        "alpha alpha product-100",
-        &embedding,
-    )
-    .await?;
-
-    let initial_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(initial_stats, (0, 0));
-
-    sqlx::query("UPDATE documents SET status = 'ready' WHERE id = $1")
-        .bind(first_document)
-        .execute(&pool)
-        .await?;
-    let first_length: i32 =
-        sqlx::query_scalar("SELECT bm25_length FROM document_units WHERE id = $1")
-            .bind(first_unit)
-            .fetch_one(&pool)
-            .await?;
-    let ready_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(ready_stats, (1, i64::from(first_length)));
-    let alpha_df: i64 = sqlx::query_scalar(
-        "SELECT document_frequency FROM knowva_bm25_term_stats WHERE term = 'alpha'",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(alpha_df, 1, "repeated terms count once toward DF");
-
-    sqlx::query("UPDATE document_units SET content = 'beta beta' WHERE id = $1")
-        .bind(first_unit)
-        .execute(&pool)
-        .await?;
-    let changed_length: i32 =
-        sqlx::query_scalar("SELECT bm25_length FROM document_units WHERE id = $1")
-            .bind(first_unit)
-            .fetch_one(&pool)
-            .await?;
-    let changed_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(changed_stats, (1, i64::from(changed_length)));
-    let alpha_df: Option<i64> = sqlx::query_scalar(
-        "SELECT document_frequency FROM knowva_bm25_term_stats WHERE term = 'alpha'",
-    )
-    .fetch_optional(&pool)
-    .await?;
-    assert!(alpha_df.is_none());
-    let beta_df: i64 = sqlx::query_scalar(
-        "SELECT document_frequency FROM knowva_bm25_term_stats WHERE term = 'beta'",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(beta_df, 1);
-
-    let second_document = insert_document(&pool, "ready").await?;
-    insert_text_unit(&pool, second_document, 0, "beta gamma", &embedding).await?;
-    let two_document_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(two_document_stats.0, 2);
-    let beta_df: i64 = sqlx::query_scalar(
-        "SELECT document_frequency FROM knowva_bm25_term_stats WHERE term = 'beta'",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(beta_df, 2);
-
-    sqlx::query("UPDATE documents SET status = 'failed' WHERE id = $1")
-        .bind(first_document)
-        .execute(&pool)
-        .await?;
-    let failed_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(failed_stats.0, 1);
-    let beta_df: i64 = sqlx::query_scalar(
-        "SELECT document_frequency FROM knowva_bm25_term_stats WHERE term = 'beta'",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(beta_df, 1);
-
-    sqlx::query("UPDATE documents SET status = 'ready' WHERE id = $1")
-        .bind(first_document)
-        .execute(&pool)
-        .await?;
-    let restored_count: i64 =
-        sqlx::query_scalar("SELECT document_count FROM knowva_bm25_corpus_stats WHERE singleton")
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(restored_count, 2);
-
-    let processing_document = insert_document(&pool, "processing").await?;
-    sqlx::query("UPDATE document_units SET document_id = $1 WHERE id = $2")
-        .bind(processing_document)
-        .bind(first_unit)
-        .execute(&pool)
-        .await?;
-    let moved_ready: bool =
-        sqlx::query_scalar("SELECT retrieval_ready FROM document_units WHERE id = $1")
-            .bind(first_unit)
-            .fetch_one(&pool)
-            .await?;
-    assert!(!moved_ready);
-    let moved_count: i64 =
-        sqlx::query_scalar("SELECT document_count FROM knowva_bm25_corpus_stats WHERE singleton")
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(moved_count, 1);
-
-    sqlx::query("UPDATE document_units SET retrieval_ready = true WHERE id = $1")
-        .bind(first_unit)
-        .execute(&pool)
-        .await?;
-    let canonical_ready: bool =
-        sqlx::query_scalar("SELECT retrieval_ready FROM document_units WHERE id = $1")
-            .bind(first_unit)
-            .fetch_one(&pool)
-            .await?;
-    assert!(
-        !canonical_ready,
-        "direct flag updates must follow canonical document status"
-    );
-    let canonical_count: i64 =
-        sqlx::query_scalar("SELECT document_count FROM knowva_bm25_corpus_stats WHERE singleton")
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(canonical_count, 1);
-
-    sqlx::query("UPDATE document_units SET document_id = $1 WHERE id = $2")
-        .bind(first_document)
-        .bind(first_unit)
-        .execute(&pool)
-        .await?;
-    let moved_back_count: i64 =
-        sqlx::query_scalar("SELECT document_count FROM knowva_bm25_corpus_stats WHERE singleton")
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(moved_back_count, 2);
-
-    sqlx::query("DELETE FROM documents WHERE id = $1")
-        .bind(second_document)
-        .execute(&pool)
-        .await?;
-    let after_first_delete: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(after_first_delete, (1, i64::from(changed_length)));
-
-    sqlx::query("DELETE FROM documents WHERE id = $1")
-        .bind(first_document)
-        .execute(&pool)
-        .await?;
-    let final_stats: (i64, i64) = sqlx::query_as(
-        "SELECT document_count, total_length FROM knowva_bm25_corpus_stats WHERE singleton",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(final_stats, (0, 0));
-    let term_count: i64 = sqlx::query_scalar("SELECT count(*) FROM knowva_bm25_term_stats")
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!(term_count, 0);
-    Ok(())
-}
-
-#[sqlx::test]
-async fn dense_and_bm25_return_complete_ready_only_metadata_and_keep_scan_pages(
+async fn dense_returns_complete_ready_only_metadata_and_keeps_scan_pages(
     pool: PgPool,
 ) -> anyhow::Result<()> {
     let query_vector = vector_with(&[(0, 1.0)]);
@@ -1121,87 +993,30 @@ async fn dense_and_bm25_return_complete_ready_only_metadata_and_keep_scan_pages(
     assert!(dense[0].metadata.image_path.is_some());
     assert!(dense[0].metadata.content.is_none());
     assert_eq!(dense.len(), 4, "only four ready units are dense candidates");
-
-    let product =
-        crate::search::bm25_candidates_from_pool(&pool, "ｎｘ－２０４８－ｖ２", 50).await?;
-    assert_eq!(product.len(), 1);
-    assert_eq!(product[0].metadata.unit_id, product_unit);
-    assert_eq!(product[0].rank, 1);
-    assert!(product[0].score > 0.0);
-    assert_eq!(product[0].metadata.filename, "products.md");
-    assert_eq!(product[0].metadata.kind, "text");
-    assert_eq!(product[0].metadata.page_number, None);
-    assert_eq!(product[0].metadata.image_path, None);
-    assert!(
-        product[0]
-            .metadata
-            .content
-            .as_deref()
-            .is_some_and(|content| content.contains("NX-2048-V2"))
-    );
-
-    let duplicate = crate::search::bm25_candidates_from_pool(&pool, "重複，內容", 50).await?;
+    let product = dense
+        .iter()
+        .find(|candidate| candidate.metadata.unit_id == product_unit)
+        .expect("ready text unit is a dense candidate");
+    assert_eq!(product.metadata.filename, "products.md");
+    assert_eq!(product.metadata.kind, "text");
+    assert_eq!(product.metadata.page_number, None);
+    assert_eq!(product.metadata.image_path, None);
+    let duplicate_pages = dense
+        .iter()
+        .filter(|candidate| [duplicate_one, duplicate_two].contains(&candidate.metadata.unit_id))
+        .map(|candidate| candidate.metadata.page_number)
+        .collect::<Vec<_>>();
     assert_eq!(
-        duplicate
-            .iter()
-            .map(|candidate| candidate.metadata.unit_id)
-            .collect::<Vec<_>>(),
-        vec![
-            duplicate_one.min(duplicate_two),
-            duplicate_one.max(duplicate_two)
-        ]
+        duplicate_pages.len(),
+        2,
+        "same-text pages keep their own units"
     );
-    assert!(
-        duplicate
-            .iter()
-            .all(|candidate| candidate.metadata.image_path.is_some())
-    );
-    assert!(
-        duplicate
-            .iter()
-            .all(|candidate| candidate.metadata.page_number.is_some())
-    );
-    assert!(
-        product
-            .iter()
-            .chain(&duplicate)
-            .all(|candidate| candidate.metadata.unit_id != scan_unit),
-        "image-only scan page must not be fabricated into lexical results"
-    );
+    assert!(duplicate_pages.iter().all(Option::is_some));
     Ok(())
 }
 
 #[sqlx::test]
-async fn lexical_scores_match_okapi_bm25_formula_and_do_not_pad_top_k(
-    pool: PgPool,
-) -> anyhow::Result<()> {
-    let embedding = vector_with(&[(0, 1.0)]);
-    let first_document = insert_document(&pool, "ready").await?;
-    let first_id = insert_text_unit(&pool, first_document, 0, "alpha alpha", &embedding).await?;
-    let second_document = insert_document(&pool, "ready").await?;
-    let second_id =
-        insert_text_unit(&pool, second_document, 0, "alpha beta beta", &embedding).await?;
-    let third_document = insert_document(&pool, "ready").await?;
-    insert_text_unit(&pool, third_document, 0, "gamma", &embedding).await?;
-
-    let results = crate::search::bm25_candidates_from_pool(&pool, "alpha", 50).await?;
-    assert_eq!(results.len(), 2, "top_k is not padded with placeholders");
-    assert_eq!(results[0].metadata.unit_id, first_id);
-    assert_eq!(results[1].metadata.unit_id, second_id);
-
-    let idf = (1.0_f64 + ((3.0_f64 - 2.0 + 0.5) / (2.0 + 0.5))).ln();
-    let expected_first = idf * ((2.0 * (1.2 + 1.0)) / (2.0 + 1.2 * (1.0 - 0.75 + 0.75)));
-    let expected_second =
-        idf * ((1.0 * (1.2 + 1.0)) / (1.0 + 1.2 * (1.0 - 0.75 + 0.75 * (3.0 / 2.0))));
-    assert!((results[0].score - expected_first).abs() < 1e-12);
-    assert!((results[1].score - expected_second).abs() < 1e-12);
-    Ok(())
-}
-
-#[sqlx::test]
-async fn production_candidate_predicates_use_hnsw_and_gin_indexes(
-    pool: PgPool,
-) -> anyhow::Result<()> {
+async fn production_dense_query_uses_the_hnsw_index(pool: PgPool) -> anyhow::Result<()> {
     let document_id = insert_document(&pool, "ready").await?;
     let query_vector = vector_with(&[(0, 1.0)]);
     insert_text_unit(
@@ -1241,39 +1056,6 @@ async fn production_candidate_predicates_use_hnsw_and_gin_indexes(
             .iter()
             .any(|line| line.contains("document_units_embedding_hnsw")),
         "production dense query must use HNSW: {dense_plan:?}"
-    );
-
-    let lexical_plan: Vec<String> = sqlx::query_scalar(
-        "EXPLAIN (COSTS OFF) \
-         WITH query_terms AS MATERIALIZED ( \
-           SELECT DISTINCT token AS term \
-           FROM unnest(knowva_bm25_tokenize($1)) AS token \
-           WHERE token <> '' \
-         ), query_token_array AS ( \
-           SELECT COALESCE(array_agg(term ORDER BY term), ARRAY[]::text[]) AS terms \
-           FROM query_terms \
-         ), lexical AS MATERIALIZED ( \
-           SELECT u.id, u.document_id \
-           FROM document_units AS u \
-           CROSS JOIN query_token_array AS query \
-           WHERE u.retrieval_ready \
-             AND u.content IS NOT NULL \
-             AND btrim(u.content) <> '' \
-             AND u.bm25_tokens && query.terms \
-         ) \
-         SELECT lexical.id \
-         FROM lexical \
-         JOIN documents AS d ON d.id = lexical.document_id \
-         WHERE d.status = 'ready'",
-    )
-    .bind("ＮＸ－２０４８－Ｖ２")
-    .fetch_all(&mut *connection)
-    .await?;
-    assert!(
-        lexical_plan
-            .iter()
-            .any(|line| line.contains("document_units_bm25_tokens_gin")),
-        "production lexical candidate predicate must use GIN: {lexical_plan:?}"
     );
     Ok(())
 }
@@ -2240,6 +2022,289 @@ async fn delete_keeps_a_retry_handle_when_storage_cleanup_fails(
     Ok(())
 }
 
+/// A ready document with its original, as ingestion leaves it published.
+async fn ready_document_with_original(
+    pool: &PgPool,
+    storage: &Storage,
+    filename: &str,
+    original: &[u8],
+) -> anyhow::Result<Uuid> {
+    let (document_id, _) = store_original(pool, storage, filename, original.to_vec()).await?;
+    sqlx::query(
+        "UPDATE documents SET status = 'ready', artifact_status = 'ready', \
+         mime_type = 'application/pdf' WHERE id = $1",
+    )
+    .bind(document_id)
+    .execute(pool)
+    .await?;
+    Ok(document_id)
+}
+
+async fn insert_page_unit_at(
+    pool: &PgPool,
+    document_id: Uuid,
+    page_number: i32,
+    content: Option<&str>,
+    image_path: &str,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "INSERT INTO document_units \
+         (document_id, kind, unit_index, page_number, content, image_path, needs_vision, \
+          embedding) \
+         VALUES ($1, 'page', $2, $3, $4, $5, $6, $7) RETURNING id",
+    )
+    .bind(document_id)
+    .bind(page_number - 1)
+    .bind(page_number)
+    .bind(content)
+    .bind(image_path)
+    .bind(content.is_none())
+    .bind(vector_with(&[(0, 1.0)]))
+    .fetch_one(pool)
+    .await
+}
+
+async fn get_document_file(
+    app: &Router,
+    uri: &str,
+) -> anyhow::Result<(StatusCode, axum::http::HeaderMap, Vec<u8>)> {
+    let response = app
+        .clone()
+        .oneshot(Request::get(uri).body(Body::empty())?)
+        .await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    Ok((status, headers, body.to_vec()))
+}
+
+fn assert_private(headers: &axum::http::HeaderMap) {
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+}
+
+#[sqlx::test]
+async fn cited_files_are_served_exactly_from_local_storage(pool: PgPool) -> anyhow::Result<()> {
+    let files_dir = std::env::temp_dir().join(format!("knowva-cited-local-{}", Uuid::new_v4()));
+    cited_files_are_served_exactly(pool, Storage::local(&files_dir)?).await?;
+    std::fs::remove_dir_all(files_dir)?;
+    Ok(())
+}
+
+#[sqlx::test]
+async fn cited_files_are_served_exactly_from_in_memory_storage(pool: PgPool) -> anyhow::Result<()> {
+    cited_files_are_served_exactly(pool, Storage::memory()).await
+}
+
+/// The page image, the texts and the original come back byte for byte, with
+/// the headers that keep them private and inert.
+async fn cited_files_are_served_exactly(pool: PgPool, storage: Storage) -> anyhow::Result<()> {
+    let original = b"%PDF-1.7 cited original".to_vec();
+    let document_id =
+        ready_document_with_original(&pool, &storage, "設備保養手冊.pdf", &original).await?;
+    let image_key = format!("{document_id}/artifacts-run/pages/0001.png");
+    let page_image = png_bytes(3, 2, [20, 40, 60, 255]);
+    storage.put(&image_key, page_image.clone()).await?;
+    let page_unit =
+        insert_page_unit_at(&pool, document_id, 1, Some("第一頁的文字層"), &image_key).await?;
+    let text_unit = insert_text_unit(
+        &pool,
+        document_id,
+        0,
+        "保養週期為六個月。",
+        &vector_with(&[(1, 1.0)]),
+    )
+    .await?;
+    let app = api_router(test_state(&pool, CloudModelClient::for_test(), storage));
+
+    let (status, headers, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{page_unit}/image"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, page_image);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(
+        headers["content-length"],
+        page_image.len().to_string().as_str()
+    );
+    assert_private(&headers);
+
+    let (status, headers, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{text_unit}/text"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8(body)?, "保養週期為六個月。");
+    assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+    assert_private(&headers);
+
+    let (status, _, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{page_unit}/text"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8(body)?, "第一頁的文字層");
+
+    let (status, headers, body) =
+        get_document_file(&app, &format!("/api/documents/{document_id}/file")).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, original);
+    assert_eq!(headers["content-type"], "application/pdf");
+    assert_eq!(
+        headers["content-length"],
+        original.len().to_string().as_str()
+    );
+    assert_eq!(
+        headers["content-disposition"],
+        "attachment; filename=\"______.pdf\"; \
+         filename*=UTF-8''%E8%A8%AD%E5%82%99%E4%BF%9D%E9%A4%8A%E6%89%8B%E5%86%8A.pdf"
+    );
+    assert_eq!(headers["content-security-policy"], "sandbox");
+    assert_private(&headers);
+
+    sqlx::query(
+        "UPDATE documents SET summary = '設備保養重點', tags = ARRAY['保養', '馬達'] \
+         WHERE id = $1",
+    )
+    .bind(document_id)
+    .execute(&pool)
+    .await?;
+    let catalog = search::catalog_candidates(&pool).await?;
+    let cited_unit = catalog[0].unit_id;
+    assert_eq!(cited_unit, page_unit.min(text_unit));
+    let (status, headers, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{cited_unit}/catalog"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        String::from_utf8(body)?,
+        "文件名稱：設備保養手冊.pdf\n摘要：設備保養重點\n標籤：保養、馬達"
+    );
+    assert_eq!(
+        catalog[0].content.as_deref(),
+        Some("文件名稱：設備保養手冊.pdf\n摘要：設備保養重點\n標籤：保養、馬達"),
+        "the card is the text the catalog answer saw"
+    );
+    assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+    assert_private(&headers);
+
+    // Only the document's first unit names its card: a citation from before the
+    // document was processed again names a unit that is gone.
+    let (status, _, _) = get_document_file(
+        &app,
+        &format!(
+            "/api/documents/{document_id}/units/{}/catalog",
+            page_unit.max(text_unit)
+        ),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    sqlx::query("DELETE FROM document_units WHERE id = $1")
+        .bind(cited_unit)
+        .execute(&pool)
+        .await?;
+    let (status, _, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{cited_unit}/catalog"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(String::from_utf8(body)?, "找不到這個來源。");
+    Ok(())
+}
+
+#[sqlx::test]
+async fn document_files_answer_one_not_found_for_anything_retrieval_would_not_use(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let storage = Storage::memory();
+    let document_id =
+        ready_document_with_original(&pool, &storage, "manual.pdf", b"%PDF manual").await?;
+    let image_key = format!("{document_id}/artifacts-run/pages/0001.png");
+    storage
+        .put(&image_key, png_bytes(1, 1, [0, 0, 0, 255]))
+        .await?;
+    let scanned_page = insert_page_unit_at(&pool, document_id, 1, None, &image_key).await?;
+    let text_unit =
+        insert_text_unit(&pool, document_id, 0, "段落", &vector_with(&[(1, 1.0)])).await?;
+
+    let other_id =
+        ready_document_with_original(&pool, &storage, "other.pdf", b"%PDF other secret").await?;
+    let other_key = format!("{other_id}/artifacts-run/pages/0001.png");
+    storage
+        .put(&other_key, png_bytes(1, 1, [9, 9, 9, 255]))
+        .await?;
+    let other_page = insert_page_unit_at(&pool, other_id, 1, Some("其他文件"), &other_key).await?;
+    // A row whose key names another document's original must never read it.
+    let escaping_page = insert_page_unit_at(
+        &pool,
+        document_id,
+        2,
+        Some("跨文件"),
+        &format!("{other_id}/original.pdf"),
+    )
+    .await?;
+    let app = api_router(test_state(&pool, CloudModelClient::for_test(), storage));
+
+    let not_found = [
+        format!("/api/documents/{document_id}/units/{scanned_page}/text"),
+        format!("/api/documents/{document_id}/units/{text_unit}/image"),
+        format!("/api/documents/{document_id}/units/{other_page}/image"),
+        format!("/api/documents/{document_id}/units/{other_page}/text"),
+        format!("/api/documents/{document_id}/units/999999999/image"),
+        format!("/api/documents/{document_id}/units/not-a-unit/text"),
+        format!("/api/documents/{}/units/{text_unit}/text", Uuid::new_v4()),
+        format!("/api/documents/not-a-uuid/units/{text_unit}/text"),
+        format!("/api/documents/{}/file", Uuid::new_v4()),
+        "/api/documents/not-a-uuid/file".to_string(),
+        format!(
+            "/api/documents/{}/units/{text_unit}/catalog",
+            Uuid::new_v4()
+        ),
+        format!("/api/documents/{document_id}/units/not-a-unit/catalog"),
+        "/api/documents/not-a-uuid/units/1/catalog".to_string(),
+    ];
+    for uri in &not_found {
+        let (status, headers, body) = get_document_file(&app, uri).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(String::from_utf8(body)?, "找不到這個來源。", "{uri}");
+        assert_private(&headers);
+    }
+
+    let (status, _, body) = get_document_file(
+        &app,
+        &format!("/api/documents/{document_id}/units/{escaping_page}/image"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(String::from_utf8(body)?, "來源暫時無法讀取，請稍後再試。");
+
+    for status in ["processing", "failed"] {
+        sqlx::query("UPDATE documents SET status = $2 WHERE id = $1")
+            .bind(document_id)
+            .bind(status)
+            .execute(&pool)
+            .await?;
+        for uri in [
+            format!("/api/documents/{document_id}/units/{scanned_page}/image"),
+            format!("/api/documents/{document_id}/units/{text_unit}/text"),
+            format!("/api/documents/{document_id}/file"),
+            format!("/api/documents/{document_id}/units/{scanned_page}/catalog"),
+        ] {
+            let (response_status, _, body) = get_document_file(&app, &uri).await?;
+            assert_eq!(response_status, StatusCode::NOT_FOUND, "{status} {uri}");
+            assert_eq!(String::from_utf8(body)?, "找不到這個來源。");
+        }
+    }
+    Ok(())
+}
+
 #[sqlx::test]
 async fn markdown_and_text_fixtures_keep_heading_aware_staging(pool: PgPool) -> anyhow::Result<()> {
     let root = std::env::temp_dir().join(format!("knowva-text-fixtures-{}", Uuid::new_v4()));
@@ -2414,11 +2479,18 @@ async fn upload_answer_delete_flow(pool: &PgPool, storage: Storage) -> anyhow::R
                 .is_some_and(|image| image.starts_with("data:image/png;base64,"))
         );
         let chats = mock.summary_requests.lock().expect("chat request lock");
-        let answer = chats
+        let answer_request = chats
             .iter()
             .find(|request| request["stream"] == true)
-            .expect("streamed answer request")
-            .to_string();
+            .expect("streamed answer request");
+        // The default profile has no industry section, so /api/chat sends the core rules
+        // exactly as written.
+        assert_eq!(answer_request["messages"][0]["role"], "system");
+        assert_eq!(
+            answer_request["messages"][0]["content"],
+            crate::rag_context::RAG_SYSTEM_PROMPT
+        );
+        let answer = answer_request.to_string();
         assert!(answer.contains("data:image/jpeg;base64,"));
         assert!(
             !answer.contains(&image_path),
@@ -2575,5 +2647,659 @@ async fn unlocked_database_with_documents_requires_reinitialization(
         .fetch_one(&pool)
         .await?;
     assert_eq!(rows, 0);
+    Ok(())
+}
+
+// Conversation history (issue #52).
+
+struct ConversationReply {
+    status: StatusCode,
+    set_cookie: Option<String>,
+    body: Value,
+}
+
+impl ConversationReply {
+    /// The `knowva_client` token this reply issued.
+    fn issued_token(&self) -> String {
+        self.set_cookie
+            .as_deref()
+            .and_then(|cookie| cookie.strip_prefix("knowva_client="))
+            .and_then(|rest| rest.split(';').next())
+            .expect("the reply issues a client cookie")
+            .to_owned()
+    }
+}
+
+/// One conversation API call as the browser holding `token` would make it.
+async fn conversation_call(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> anyhow::Result<ConversationReply> {
+    let mut request = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        request = request.header("cookie", format!("knowva_client={token}"));
+    }
+    let request = match body {
+        Some(body) => request
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body)?))?,
+        None => request.body(Body::empty())?,
+    };
+    let response = app.clone().oneshot(request).await?;
+    let status = response.status();
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()?;
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+    };
+    Ok(ConversationReply {
+        status,
+        set_cookie,
+        body,
+    })
+}
+
+async fn create_conversation_for(app: &Router, token: &str) -> anyhow::Result<String> {
+    let reply = conversation_call(app, "POST", "/api/conversations", Some(token), None).await?;
+    assert_eq!(reply.status, StatusCode::CREATED, "{:?}", reply.body);
+    Ok(reply.body["conversation"]["id"]
+        .as_str()
+        .expect("conversation id")
+        .to_owned())
+}
+
+fn user_message(id: &str, text: &str) -> Value {
+    serde_json::json!({
+        "id": id,
+        "role": "user",
+        "createdAt": "2026-10-06T08:00:00.000Z",
+        "content": [{ "type": "text", "text": text }],
+        "attachments": [],
+        "metadata": { "custom": {} }
+    })
+}
+
+fn assistant_message(id: &str, text: &str, sources: Value) -> Value {
+    serde_json::json!({
+        "id": id,
+        "role": "assistant",
+        "createdAt": "2026-10-06T08:00:05.000Z",
+        "content": [
+            { "type": "text", "text": text },
+            { "type": "data", "name": "sources", "data": sources }
+        ],
+        "status": { "type": "complete", "reason": "unknown" },
+        "metadata": {
+            "unstable_state": null,
+            "unstable_annotations": [],
+            "unstable_data": [],
+            "steps": [],
+            "custom": {}
+        }
+    })
+}
+
+async fn save_conversation_message(
+    app: &Router,
+    token: &str,
+    conversation_id: &str,
+    parent_id: Option<&str>,
+    message: Value,
+) -> anyhow::Result<ConversationReply> {
+    conversation_call(
+        app,
+        "POST",
+        &format!("/api/conversations/{conversation_id}/messages"),
+        Some(token),
+        Some(serde_json::json!({ "parentId": parent_id, "message": message })),
+    )
+    .await
+}
+
+fn conversation_ids(reply: &ConversationReply) -> Vec<String> {
+    reply
+        .body
+        .as_array()
+        .expect("conversation list")
+        .iter()
+        .map(|conversation| conversation["id"].as_str().expect("id").to_owned())
+        .collect()
+}
+
+#[sqlx::test]
+async fn conversations_keep_every_message_part_in_save_order(pool: PgPool) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let token = crate::conversations::test_support::new_token();
+    let id = create_conversation_for(&app, &token).await?;
+    let sources = serde_json::json!([
+        { "sourceId": "S1", "documentId": "00000000-0000-0000-0000-000000000001",
+          "unitId": 137, "unitIndex": 36, "filename": "設備保養手冊.pdf",
+          "pageNumber": 37, "kind": "page" },
+        { "sourceId": "S2", "documentId": "00000000-0000-0000-0000-000000000002",
+          "unitId": 202, "filename": "維運交接筆記.md", "pageNumber": null, "kind": "text" }
+    ]);
+    let question = user_message("q1", "馬達多久保養一次？");
+    let answer = assistant_message("a1", "每三個月保養一次。", sources);
+    let mut failed = assistant_message("a2", "請先", serde_json::json!([]));
+    failed["content"] = serde_json::json!([{ "type": "text", "text": "請先" }]);
+    failed["status"] = serde_json::json!({
+        "type": "incomplete", "reason": "error", "error": "回覆傳輸中斷，請重新送出問題。"
+    });
+    let follow_up = user_message("q2", "交接要注意什麼？");
+    for (parent_id, message) in [
+        (None, &question),
+        (Some("q1"), &answer),
+        (Some("a1"), &follow_up),
+        (Some("q2"), &failed),
+    ] {
+        let reply =
+            save_conversation_message(&app, &token, &id, parent_id, message.clone()).await?;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    }
+
+    let reply = conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{id}/messages"),
+        Some(&token),
+        None,
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        reply.body,
+        serde_json::json!([
+            { "parentId": null, "message": question },
+            { "parentId": "q1", "message": answer },
+            { "parentId": "a1", "message": follow_up },
+            { "parentId": "q2", "message": failed }
+        ])
+    );
+    assert_eq!(reply.set_cookie, None, "a valid cookie is never replaced");
+    Ok(())
+}
+
+#[sqlx::test]
+async fn conversations_of_another_browser_answer_404(pool: PgPool) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let alice = crate::conversations::test_support::new_token();
+    let bob = crate::conversations::test_support::new_token();
+    let alices = create_conversation_for(&app, &alice).await?;
+    let saved =
+        save_conversation_message(&app, &alice, &alices, None, user_message("q1", "甲的問題"))
+            .await?;
+    assert_eq!(saved.status, StatusCode::OK);
+    let bobs = create_conversation_for(&app, &bob).await?;
+
+    let listed = conversation_call(&app, "GET", "/api/conversations", Some(&bob), None).await?;
+    assert_eq!(conversation_ids(&listed), std::slice::from_ref(&bobs));
+    for (method, uri, body) in [
+        ("GET", format!("/api/conversations/{alices}"), None),
+        ("GET", format!("/api/conversations/{alices}/messages"), None),
+        (
+            "POST",
+            format!("/api/conversations/{alices}/messages"),
+            Some(
+                serde_json::json!({ "parentId": "q1", "message": user_message("q2", "乙的問題") }),
+            ),
+        ),
+        ("DELETE", format!("/api/conversations/{alices}"), None),
+    ] {
+        let reply = conversation_call(&app, method, &uri, Some(&bob), body).await?;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method} {uri}");
+        assert_eq!(reply.body, Value::String("找不到這串對話。".to_owned()));
+    }
+    let missing = conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{}", Uuid::new_v4()),
+        Some(&alice),
+        None,
+    )
+    .await?;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.body, Value::String("找不到這串對話。".to_owned()));
+    let malformed = conversation_call(
+        &app,
+        "GET",
+        "/api/conversations/not-a-uuid",
+        Some(&alice),
+        None,
+    )
+    .await?;
+    assert_eq!(malformed.status, StatusCode::NOT_FOUND);
+
+    let cleared = conversation_call(&app, "DELETE", "/api/conversations", Some(&bob), None).await?;
+    assert_eq!(cleared.status, StatusCode::NO_CONTENT);
+    let alices_list =
+        conversation_call(&app, "GET", "/api/conversations", Some(&alice), None).await?;
+    assert_eq!(
+        conversation_ids(&alices_list),
+        std::slice::from_ref(&alices)
+    );
+    let messages: i64 = sqlx::query_scalar("SELECT count(*) FROM conversation_messages")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        messages, 1,
+        "clearing one browser keeps the other's messages"
+    );
+
+    let deleted = conversation_call(
+        &app,
+        "DELETE",
+        &format!("/api/conversations/{alices}"),
+        Some(&alice),
+        None,
+    )
+    .await?;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM conversations")
+        .fetch_one(&pool)
+        .await?;
+    let remaining_messages: i64 = sqlx::query_scalar("SELECT count(*) FROM conversation_messages")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!((remaining, remaining_messages), (0, 0));
+    Ok(())
+}
+
+/// Collects everything the fmt subscriber writes while it is the default.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[sqlx::test]
+async fn the_client_token_never_reaches_the_log(pool: PgPool) -> anyhow::Result<()> {
+    let log = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+
+    let created = conversation_call(&app, "POST", "/api/conversations", None, None).await?;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let token = created.issued_token();
+    let id = created.body["conversation"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    for message in [
+        user_message("q1", "權杖不能外流嗎？"),
+        // Invalid, oversized and misplaced saves go through the error paths too.
+        serde_json::json!({ "id": "bad", "role": "system", "content": [] }),
+    ] {
+        save_conversation_message(&app, &token, &id, None, message).await?;
+    }
+    save_conversation_message(&app, &token, &id, Some("missing"), user_message("q9", "x")).await?;
+    conversation_call(&app, "GET", "/api/conversations", Some(&token), None).await?;
+    conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{}", Uuid::new_v4()),
+        Some(&token),
+        None,
+    )
+    .await?;
+    // A dropped connection mid-request still must not log the token.
+    pool.close().await;
+    let unavailable =
+        conversation_call(&app, "GET", "/api/conversations", Some(&token), None).await?;
+    assert_eq!(unavailable.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        unavailable.body,
+        Value::String("對話紀錄暫時無法使用，請稍後再試。".to_owned())
+    );
+
+    let log = String::from_utf8(log.0.lock().expect("log lock").clone())?;
+    assert!(log.contains("issued an anonymous client cookie"), "{log}");
+    assert!(log.contains("conversation query failed"), "{log}");
+    assert!(!log.contains(&token), "the log holds the client token");
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn conversations_store_only_the_token_hash_as_an_anonymous_owner(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let created = conversation_call(&app, "POST", "/api/conversations", None, None).await?;
+    let token = created.issued_token();
+    let id = created.body["conversation"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    save_conversation_message(&app, &token, &id, None, user_message("q1", "第一個問題")).await?;
+    create_conversation_for(&app, &crate::conversations::test_support::new_token()).await?;
+
+    let owners: Vec<(String, String)> =
+        sqlx::query_as("SELECT owner_kind, owner_id FROM conversations ORDER BY created_at")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(owners.len(), 2);
+    assert_eq!(
+        owners[0].1,
+        crate::conversations::test_support::hash(&token)
+    );
+    assert!(owners.iter().all(|(kind, _)| kind == "anonymous"));
+    let rows_with_token: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM conversations c WHERE c::text LIKE '%' || $1 || '%') \
+              + (SELECT count(*) FROM conversation_messages m WHERE m::text LIKE '%' || $1 || '%')",
+    )
+    .bind(&token)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(rows_with_token, 0);
+
+    // The schema refuses an unknown owner kind and an anonymous owner that is not a hash.
+    for (kind, owner_id) in [
+        ("robot", crate::conversations::test_support::hash(&token)),
+        ("anonymous", token.clone()),
+    ] {
+        let insert =
+            sqlx::query("INSERT INTO conversations (owner_kind, owner_id) VALUES ($1, $2)")
+                .bind(kind)
+                .bind(&owner_id)
+                .execute(&pool)
+                .await;
+        assert!(insert.is_err(), "{kind} {owner_id} must be rejected");
+    }
+    sqlx::query("INSERT INTO conversations (owner_kind, owner_id) VALUES ('user', 'account-42')")
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+#[sqlx::test]
+async fn the_51st_conversation_deletes_the_least_recently_updated(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let token = crate::conversations::test_support::new_token();
+    let other = crate::conversations::test_support::new_token();
+    let others = create_conversation_for(&app, &other).await?;
+    let mut ids = Vec::new();
+    for _ in 0..crate::conversations::MAX_CONVERSATIONS {
+        ids.push(create_conversation_for(&app, &token).await?);
+    }
+    // The second one gets a message so its messages must go with it; the first one is
+    // updated last, so the second is now the stalest.
+    save_conversation_message(&app, &token, &ids[1], None, user_message("q1", "舊的問題")).await?;
+    save_conversation_message(
+        &app,
+        &token,
+        &ids[0],
+        None,
+        user_message("q1", "最近的問題"),
+    )
+    .await?;
+    let stalest = ids[2].clone();
+
+    let created = conversation_call(&app, "POST", "/api/conversations", Some(&token), None).await?;
+    assert_eq!(created.status, StatusCode::CREATED);
+    assert_eq!(created.body["removedIds"], serde_json::json!([stalest]));
+    let newest = created.body["conversation"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let listed = conversation_call(&app, "GET", "/api/conversations", Some(&token), None).await?;
+    let listed = conversation_ids(&listed);
+    assert_eq!(listed.len(), 50);
+    assert_eq!(listed[0], newest);
+    assert_eq!(listed[1], ids[0]);
+    assert!(!listed.contains(&stalest));
+    assert!(listed.contains(&ids[1]));
+    let others_list =
+        conversation_call(&app, "GET", "/api/conversations", Some(&other), None).await?;
+    assert_eq!(conversation_ids(&others_list), [others]);
+
+    // Once more: now the third-created one goes, taking its messages with it.
+    save_conversation_message(&app, &token, &ids[3], None, user_message("q1", "x")).await?;
+    let created = conversation_call(&app, "POST", "/api/conversations", Some(&token), None).await?;
+    assert_eq!(created.body["removedIds"], serde_json::json!([ids[4]]));
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM conversations WHERE owner_id = $1")
+        .bind(crate::conversations::test_support::hash(&token))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(total, 50);
+    Ok(())
+}
+
+#[sqlx::test]
+async fn conversation_messages_are_capped_checked_and_idempotent(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let app = api_router(test_state(
+        &pool,
+        CloudModelClient::for_test(),
+        Storage::memory(),
+    ));
+    let token = crate::conversations::test_support::new_token();
+    let id = create_conversation_for(&app, &token).await?;
+
+    let limit = crate::conversations::MAX_MESSAGES_PER_CONVERSATION as usize;
+    let mut parent: Option<String> = None;
+    for index in 0..limit {
+        let message_id = format!("m{index}");
+        let message = if index % 2 == 0 {
+            user_message(&message_id, &format!("問題 {index}"))
+        } else {
+            assistant_message(&message_id, &format!("回答 {index}"), serde_json::json!([]))
+        };
+        let reply =
+            save_conversation_message(&app, &token, &id, parent.as_deref(), message).await?;
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "message {index}: {:?}",
+            reply.body
+        );
+        parent = Some(message_id);
+    }
+
+    let over = save_conversation_message(
+        &app,
+        &token,
+        &id,
+        parent.as_deref(),
+        user_message("m-over", "第 201 則"),
+    )
+    .await?;
+    assert_eq!(over.status, StatusCode::CONFLICT);
+    assert_eq!(
+        over.body,
+        Value::String("這串對話已達 200 則訊息，無法再保存。".to_owned())
+    );
+
+    // Resending a saved id replaces it in place, even at the limit.
+    let resent = save_conversation_message(
+        &app,
+        &token,
+        &id,
+        None,
+        user_message("m0", "改寫過的第一個問題"),
+    )
+    .await?;
+    assert_eq!(resent.status, StatusCode::OK);
+    let stored: Vec<(String, i32, Value)> = sqlx::query_as(
+        "SELECT message_id, position, message FROM conversation_messages \
+         WHERE conversation_id = $1::uuid ORDER BY position",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(stored.len(), limit);
+    assert_eq!(stored[0].0, "m0");
+    assert_eq!(stored[0].1, 0);
+    assert_eq!(stored[0].2["content"][0]["text"], "改寫過的第一個問題");
+    assert!(
+        stored
+            .iter()
+            .enumerate()
+            .all(|(index, row)| row.1 == index as i32)
+    );
+
+    let fresh = create_conversation_for(&app, &token).await?;
+    let missing_parent = save_conversation_message(
+        &app,
+        &token,
+        &fresh,
+        Some("nowhere"),
+        user_message("q1", "x"),
+    )
+    .await?;
+    assert_eq!(missing_parent.status, StatusCode::CONFLICT);
+    let invalid = save_conversation_message(
+        &app,
+        &token,
+        &fresh,
+        None,
+        serde_json::json!({ "id": "q1", "role": "tool", "content": [] }),
+    )
+    .await?;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid.body,
+        Value::String("訊息格式不正確，無法保存。".to_owned())
+    );
+    let not_json = conversation_call(
+        &app,
+        "POST",
+        &format!("/api/conversations/{fresh}/messages"),
+        Some(&token),
+        Some(Value::String("not an object".to_owned())),
+    )
+    .await?;
+    assert_eq!(not_json.status, StatusCode::BAD_REQUEST);
+
+    let max = crate::conversations::MAX_MESSAGE_BYTES;
+    let mut at_limit = user_message("q1", "");
+    let overhead = serde_json::to_vec(&at_limit)?.len();
+    at_limit["content"][0]["text"] = Value::String("a".repeat(max - overhead));
+    assert_eq!(serde_json::to_vec(&at_limit)?.len(), max);
+    let accepted = save_conversation_message(&app, &token, &fresh, None, at_limit).await?;
+    assert_eq!(accepted.status, StatusCode::OK);
+    for extra in [1, 64 * 1024] {
+        let mut too_large = user_message("q2", "");
+        too_large["content"][0]["text"] = Value::String("a".repeat(max - overhead + extra));
+        let rejected =
+            save_conversation_message(&app, &token, &fresh, Some("q1"), too_large).await?;
+        assert_eq!(
+            rejected.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "+{extra} bytes"
+        );
+        assert_eq!(
+            rejected.body,
+            Value::String("單則訊息超過 256 KiB，無法保存。".to_owned())
+        );
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM conversation_messages WHERE conversation_id = $1::uuid",
+    )
+    .bind(&fresh)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[sqlx::test]
+async fn the_first_question_titles_a_conversation_without_any_model_request(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (models, mock, server) = spawn_embedding_mock(false).await;
+    let app = api_router(test_state(&pool, models, Storage::memory()));
+    let token = crate::conversations::test_support::new_token();
+    let id = create_conversation_for(&app, &token).await?;
+
+    let question = "  𠀋𡈽三號廠區\n\n冷卻水塔今年第三季有哪些異常紀錄、各自如何處理、負責人是誰？";
+    let saved =
+        save_conversation_message(&app, &token, &id, None, user_message("q1", question)).await?;
+    let title = "𠀋𡈽三號廠區 冷卻水塔今年第三季有哪些異常紀錄、各自如何處理";
+    assert_eq!(title.chars().count(), 30);
+    assert_eq!(saved.body["conversation"]["title"], title);
+
+    for (parent, message) in [
+        ("q1", assistant_message("a1", "回答", serde_json::json!([]))),
+        ("a1", user_message("q2", "第二個問題不會改標題")),
+    ] {
+        let reply = save_conversation_message(&app, &token, &id, Some(parent), message).await?;
+        assert_eq!(reply.body["conversation"]["title"], title);
+    }
+    let fetched = conversation_call(
+        &app,
+        "GET",
+        &format!("/api/conversations/{id}"),
+        Some(&token),
+        None,
+    )
+    .await?;
+    assert_eq!(fetched.body["title"], title);
+
+    for requests in [
+        &mock.requests,
+        &mock.summary_requests,
+        &mock.rerank_requests,
+    ] {
+        assert!(
+            requests.lock().expect("mock requests").is_empty(),
+            "titling must not reach a model endpoint"
+        );
+    }
+    server.abort();
     Ok(())
 }

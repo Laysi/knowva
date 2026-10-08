@@ -8,8 +8,8 @@
 
 | 分類 | 內容 |
 | --- | --- |
-| 應做 | 文件上傳、原檔保存、頁面化前處理(PDF/Office/圖片逐頁轉圖 + Embed VL 嵌入,見 §6)、md/txt 標題感知 chunk、pgvector、文字層 hybrid search、Rerank VL、AI 回答(Gemma 直讀需要看圖的來源頁圖,其餘頁只讀文字層;見 #38)、來源引用(檔名+頁碼)。 |
-| 可做但限縮 | 文字層加值:PDF 內嵌文字抽出供 BM25/引用片段/「圖+文」嵌入;掃描頁 MVP 先走純圖嵌入(OCR 列選配),不承諾所有格式完美。 |
+| 應做 | 文件上傳、原檔保存、頁面化前處理(PDF/Office/圖片逐頁轉圖 + Embed VL 嵌入,見 §6)、md/txt 標題感知 chunk、pgvector dense 檢索、Rerank VL、AI 回答(Gemma 直讀需要看圖的來源頁圖,其餘頁只讀文字層;見 #38)、來源引用(檔名+頁碼)。 |
+| 可做但限縮 | 文字層加值:PDF 內嵌文字抽出供文字頁嵌入/引用片段/「圖+文」嵌入;掃描頁 MVP 先走純圖嵌入(OCR 列選配),不承諾所有格式完美。 |
 | 不做(非目標 — 本產品不是 SaaS) | 多租戶、雲端帳號體系、計費。 |
 | 先不做(留給未來方案或視客戶需求) | SSO/複雜權限繼承、GraphRAG、agent workflow、知識圖譜、完整 admin 後台、部署器、維運監控、標準欄位全填(bbox/confidence)。 |
 
@@ -25,10 +25,10 @@
 
 | 狀態 | 項目 |
 | --- | --- |
-| 已有 | 上傳與原檔保存、PDF/Office/圖片頁面化、PDF 文字層抽取、MD/TXT 標題感知 chunk、四種 Nemotron Embed VL 輸入、`halfvec(2048)` + HNSW、dense/BM25 各 top-50 + deterministic RRF、SSE 串流問答與來源引用。 |
+| 已有 | 上傳與原檔保存、PDF/Office/圖片頁面化、PDF 文字層抽取、MD/TXT 標題感知 chunk、四種 Nemotron Embed VL 輸入、`halfvec(2048)` + HNSW、dense top-20 + Rerank VL、SSE 串流問答與來源引用。 |
 | 已完成:模型與入庫對齊 | Gemma 4 / Nemotron Embed VL / Nemotron Rerank VL family 已鎖定;舊 `vector(1024)` 已淘汰。artifact unit 以 bounded concurrency 嵌入,全部成功且 transaction 內計數一致才把文件設為 ready;失敗不會發布部分新向量。 |
-| 已完成:候選檢索 | ready-only dense 召回(頁與 chunk 同一 2048d index)+ 文字層真正 Okapi BM25，再以固定 k=60 的 RRF 合併；兩路各 top_k 50。 |
-| 待補:精排與回答多模態整合 | Gemma 4 直接讀取召回頁圖，以及 RRF 候選串接 Rerank VL（top_n 3-8 頁）仍是後續 issue。 |
+| 已完成:候選檢索 | ready-only dense 召回(頁與 chunk 同一 2048d index)取前 20 筆。原本另有文字層 Okapi BM25 與 k=60 的 RRF 合併，#60 量測後拿掉(見 `docs/measurements/README.md` §8.16)。 |
+| 已完成:精排與回答多模態整合 | dense 候選串接 Rerank VL（top_n 3-8 頁）；需要看圖的頁由 Gemma 4 直接讀取頁圖（#38）。 |
 | 待補:部署驗證 | 現有 multi-stage Dockerfile、compose、Pdfium、LibreOffice 與 CJK 字型需持續做 cloud API 環境的整合 smoke;不在 MVP 新增本地推論 runtime。 |
 | 本次已調整 | UI 整體放大、對話框視覺強化(純 CSS,見 §5);前處理重新規劃為頁面視覺檢索(2026-07-10,見 §5、§6)。 |
 
@@ -36,7 +36,7 @@
 
 1. 客戶自己的文件能否被正確問答?
 2. 答案是否穩定附上正確來源(檔名、頁碼)?
-3. rerank 是否明顯改善命中率?(對照組:純向量 vs hybrid + Rerank VL)
+3. rerank 是否明顯改善命中率?(對照組:純向量 vs 向量 + Rerank VL)
 4. 掃描頁 / PPT / 表格走「頁圖直檢 + Gemma 讀頁圖」後,問答是否可用?繁中文件的視覺檢索命中率是否達標(官方評測以英文為主)?
 5. 回答 context 夾帶 3-6 張頁圖時,雲端 Gemma 4 的首字延遲與 payload 成本是否可接受?
 6. 同一份 compose 能否穩定完成轉檔、雲端推論與資料庫入庫?
@@ -56,8 +56,8 @@
 1. **原檔保存**(不變)。
 2. **頁面化**:PDF 以 pdfium 逐頁轉圖(約 150-200 DPI);圖片檔視為單頁;DOCX/PPTX/XLSX 先經 LibreOffice headless 轉 PDF 再轉圖(容器含 CJK 字型);md/txt 不轉圖,沿用標題感知 chunk。
 3. **嵌入**:頁圖與文字 chunk 都用 llama-nemotron-embed-vl-1b-v2,同一 2048 維空間、同一索引(pgvector `halfvec(2048)` + HNSW);需要看圖的頁(`needs_vision`)有 PDF 文字層時用「圖+文」合併嵌入(官方評測三種輸入中命中率最高),文字層足以代表整頁的頁只用文字嵌入。2026-10-02 起由 #38 取代原本「有文字層一律圖+文」的規格:地端推理的成本幾乎都在圖片,而多數頁面的圖沒有文字層以外的資訊。
-4. **文字層(加值,非關鍵路徑)**:PDF 內嵌文字直接抽出填 `content` — 供 BM25、引用片段、摘要;掃描頁 MVP 先純圖嵌入,OCR/VLM 轉錄列選配,缺文字層不阻擋入庫。
+4. **文字層(加值,非關鍵路徑)**:PDF 內嵌文字直接抽出填 `content` — 供文字頁嵌入、引用片段、摘要;掃描頁 MVP 先純圖嵌入,OCR/VLM 轉錄列選配,缺文字層不阻擋入庫。
 5. **ready 契約**:每文件 bounded concurrency 呼叫 embedding;每個回應必須恰為 2048 維 finite float。所有 unit 成功後才在單一 transaction 內替換 `document_units`、核對 artifact/unit 計數並設為 ready。摘要/標籤目前不在關鍵路徑產生。
-6. **查詢與回答**:query 使用同模型的 text query embedding；dense top-50 與文字 BM25 top-50 已用 RRF(k=60) 合併，既有 chat 暫取融合前 8 筆。Rerank VL 與 Gemma 4 直讀召回頁圖由後續 issue 串接。
+6. **查詢與回答**:query 使用同模型的 text query embedding；dense 前 20 筆送 Rerank VL 精排，取前 6 筆(可設 3-8)給 Gemma 4，需要看圖的頁由 Gemma 直讀頁圖。
 
 相對「VLM 全文轉錄」路線的收益:前處理關鍵路徑只呼叫固定 Embed VL;表格/圖表/掃描頁不經轉錄失真;逐頁處理並限制單一 payload;PPT 經轉檔自然支援;檢索單位就是頁,頁碼引用天然精確。

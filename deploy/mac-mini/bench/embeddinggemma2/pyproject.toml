@@ -1,0 +1,26 @@
+[project]
+name = "eg2-bench"
+version = "0.0.0"
+description = "EmbeddingGemma 2 (MLX) vs Nemotron Embed VL retrieval comparison on the Knowva Mac mini"
+requires-python = "==3.12.*"
+dependencies = [
+    "mlx>=0.32.3",
+    # The revision the mlx-community conversions were made and validated with.
+    "mlx-vlm @ https://github.com/Blaizzy/mlx-vlm/archive/3d87e88402f307efbf68e568971aa887ee7d9ed0.tar.gz",
+    # First release with EmbeddingGemma2Processor (image preprocessing).
+    "transformers==5.19.0",
+    "torch>=2.9",
+    "torchvision>=0.24",
+    "numpy>=2",
+    "pillow>=11",
+    "huggingface-hub>=1.0",
+]
+
+[dependency-groups]
+# PyTorch reference for checking the MLX path on the same inputs.
+reference = ["sentence-transformers>=6.1.0"]
+
+[tool.uv]
+package = false
+python-preference = "only-system"
+python-downloads = "never"

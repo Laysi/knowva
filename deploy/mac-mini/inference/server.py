@@ -3,15 +3,22 @@ through to Ollama.
 
 This is docs/measurements/nim_shim.py moved from the CPU host to Apple Silicon.
 Both Nemotron VL models run on MPS in float16, which docs/measurements §4
-verified as op-complete and ranking-correct on an M1.
+verified as op-complete and ranking-correct on an M1. Either can instead run
+on MLX through nemotron-vl-mlx, a port that reads the same snapshots; with
+both on MLX the service never imports PyTorch.
 
-    KM_DEVICE           mps (default) | cpu
+    KM_DEVICE           mps (default) | cpu, for the models on PyTorch
     KM_DTYPE            float16 (default) | bfloat16 | float32
-    KM_EMBED_PATH       local snapshot of nvidia/llama-nemotron-embed-vl-1b-v2
-    KM_RERANK_PATH      local snapshot of nvidia/llama-nemotron-rerank-vl-1b-v2
+    KM_EMBED_PATH       local snapshot of Laysi-ai/llama-nemotron-embed-vl-1b-v2-mlx
+                        (MLX), or of nvidia/llama-nemotron-embed-vl-1b-v2 (either)
+    KM_RERANK_PATH      local snapshot of Laysi-ai/llama-nemotron-rerank-vl-1b-v2-mlx
+                        (MLX), or of nvidia/llama-nemotron-rerank-vl-1b-v2 (either)
     KM_MAX_TILES        image tiles per page for embedding, 6 = model default
     KM_RERANK_TILES     tiles for rerank only, defaults to KM_MAX_TILES
     KM_RERANK_INPUT     both (default) | text | image: what of a page to rank
+    KM_EMBED_BACKEND    torch (default) | mlx: what runs embed, at KM_DTYPE
+    KM_RERANK_BACKEND   torch (default) | mlx: what runs rerank, at KM_DTYPE
+    KM_MLX_CACHE_MB     MLX buffer cache limit, default 256
     KM_IDLE_SECS        seconds a model stays loaded after its last request,
                         default 600; negative keeps both loaded for good
     KM_HOST, KM_PORT    listen address, default 127.0.0.1:9500
@@ -30,7 +37,6 @@ import threading
 import time
 
 import httpx
-import torch
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, StreamingResponse
@@ -38,7 +44,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 DEVICE = os.environ.get("KM_DEVICE", "mps")
-DTYPE = getattr(torch, os.environ.get("KM_DTYPE", "float16"))
+DTYPE_NAME = os.environ.get("KM_DTYPE", "float16")
 EMBED_PATH = os.environ["KM_EMBED_PATH"]
 RERANK_PATH = os.environ["KM_RERANK_PATH"]
 MAX_TILES = int(os.environ.get("KM_MAX_TILES", "6"))
@@ -61,6 +67,23 @@ if RERANK_INPUT not in ("both", "text", "image"):
     raise SystemExit(f"KM_RERANK_INPUT must be both, text or image, not {RERANK_INPUT!r}")
 # Token budgets the model card sets per modality.
 RERANK_MAX_LENGTH = {"text": 8192, "image": 2048, "text_image": 10240}
+# MLX ranks a 50-candidate question about 1.5x faster than MPS
+# (docs/measurements §8.14), mostly because it runs each passage at its own
+# length instead of padding the batch.
+RERANK_BACKEND = os.environ.get("KM_RERANK_BACKEND", "torch")
+EMBED_BACKEND = os.environ.get("KM_EMBED_BACKEND", "torch")
+BACKENDS = {"embed": EMBED_BACKEND, "rerank": RERANK_BACKEND}
+for kind, backend in BACKENDS.items():
+    if backend not in ("torch", "mlx"):
+        raise SystemExit(f"KM_{kind.upper()}_BACKEND must be torch or mlx, not {backend!r}")
+if "torch" in BACKENDS.values():
+    import torch
+
+    DTYPE = getattr(torch, DTYPE_NAME)
+# MLX keeps freed buffers for reuse with no practical limit by default; every
+# passage has its own length, so the cache grew to 13.8 GiB over 36 questions.
+# 256 MB cost 2% of rerank time against an unlimited cache (§8.14).
+MLX_CACHE_MB = int(os.environ.get("KM_MLX_CACHE_MB", "256"))
 OLLAMA_URL = os.environ.get("KM_OLLAMA_URL", "http://127.0.0.1:11434/v1/chat/completions")
 REASONING_EFFORT = os.environ.get("KM_REASONING_EFFORT", "none")
 # Gemma 4 spends image tokens in proportion to pixels: a 1600 px page (the
@@ -89,7 +112,11 @@ def _release(kind):
     if _models.pop(kind, None) is None:
         return
     gc.collect()
-    if DEVICE == "mps":
+    if BACKENDS[kind] == "mlx":
+        import mlx.core as mx
+
+        mx.clear_cache()
+    elif DEVICE == "mps":
         torch.mps.empty_cache()
 
 
@@ -147,6 +174,28 @@ def _rerank_model():
     return _models["rerank"]
 
 
+def _mlx_embedder():
+    if "embed" not in _models:
+        import mlx.core as mx
+        from nemotron_vl_mlx import Embedder
+
+        mx.set_cache_limit(MLX_CACHE_MB * 2**20)
+        _models["embed"] = Embedder(EMBED_PATH, dtype=getattr(mx, DTYPE_NAME), max_input_tiles=MAX_TILES)
+    return _models["embed"]
+
+
+def _mlx_reranker():
+    if "rerank" not in _models:
+        import mlx.core as mx
+        from nemotron_vl_mlx import Reranker
+
+        mx.set_cache_limit(MLX_CACHE_MB * 2**20)
+        _models["rerank"] = Reranker(
+            RERANK_PATH, dtype=getattr(mx, DTYPE_NAME), max_input_tiles=RERANK_TILES, use_thumbnail=True
+        )
+    return _models["rerank"]
+
+
 def _rerank_processor(modality):
     """The processor carries the modality's token budget, so one per modality."""
     if modality not in _processors:
@@ -199,9 +248,10 @@ class RerankRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": DEVICE, "dtype": str(DTYPE), "loaded": sorted(_models),
+    return {"status": "ok", "device": DEVICE, "dtype": DTYPE_NAME, "loaded": sorted(_models),
             "idle_secs": IDLE_SECS, "tiles": MAX_TILES, "rerank_tiles": RERANK_TILES,
-            "rerank_input": RERANK_INPUT, "chat_image_max_side": CHAT_IMAGE_MAX_SIDE}
+            "rerank_input": RERANK_INPUT, "embed_backend": EMBED_BACKEND, "rerank_backend": RERANK_BACKEND,
+            "chat_image_max_side": CHAT_IMAGE_MAX_SIDE}
 
 
 @app.post("/v1/embeddings")
@@ -228,12 +278,21 @@ def embeddings(request: EmbeddingRequest):
 
     with _lock:
         try:
-            with torch.inference_mode():
-                model = _embed_model()
-                if request.input_type == "query":
-                    vectors = model.encode_query(documents)
-                else:
-                    vectors = model.encode_document(documents)
+            if EMBED_BACKEND == "mlx":
+                from nemotron_vl_mlx import Passage
+
+                vectors = _mlx_embedder()(
+                    [Passage(text=d) if isinstance(d, str) else Passage(image=d) if isinstance(d, Image.Image)
+                     else Passage(text=d["text"], image=d["image"]) for d in documents],
+                    "query" if request.input_type == "query" else "passage",
+                )
+            else:
+                with torch.inference_mode():
+                    model = _embed_model()
+                    if request.input_type == "query":
+                        vectors = model.encode_query(documents)
+                    else:
+                        vectors = model.encode_document(documents)
         finally:
             _after_request("embed")
 
@@ -271,15 +330,24 @@ def ranking(request: RerankRequest):
 
     with _lock:
         try:
-            with torch.no_grad():
-                model = _rerank_model()
-                batch = _rerank_processor(modality).process_queries_documents_crossencoder(examples)
-                batch = {
-                    key: value.to(DEVICE) if torch.is_tensor(value) else value
-                    for key, value in batch.items()
-                }
-                logits = model(**batch, return_dict=True).logits.squeeze(-1)
-                scores = logits.reshape(-1).float().cpu().tolist()
+            if RERANK_BACKEND == "mlx":
+                from nemotron_vl_mlx import Passage
+
+                scores = _mlx_reranker()(
+                    request.query.text,
+                    [Passage(text=e["doc_text"], image=e["doc_image"] or None) for e in examples],
+                    RERANK_MAX_LENGTH[modality],
+                ).tolist()
+            else:
+                with torch.no_grad():
+                    model = _rerank_model()
+                    batch = _rerank_processor(modality).process_queries_documents_crossencoder(examples)
+                    batch = {
+                        key: value.to(DEVICE) if torch.is_tensor(value) else value
+                        for key, value in batch.items()
+                    }
+                    logits = model(**batch, return_dict=True).logits.squeeze(-1)
+                    scores = logits.reshape(-1).float().cpu().tolist()
         finally:
             _after_request("rerank")
 

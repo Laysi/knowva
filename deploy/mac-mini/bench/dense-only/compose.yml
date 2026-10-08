@@ -1,0 +1,52 @@
+# Isolated Knowva instance for #60: the 2026-10-08 replay corpus (17 documents,
+# 397 units, restored from §8.15's dump) on its own database and files, served
+# on 127.0.0.1:8081 against the production inference service. Production
+# (~/knowva, port 8080) is untouched. KNOWVA_IMAGE is built by ./Dockerfile.
+#   docker compose -p knowva-dense60 -f compose.yml --env-file dense60.env up -d
+services:
+  app:
+    image: ${KNOWVA_IMAGE:-knowva:dense60}
+    restart: "no"
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8081:8080"
+    environment:
+      DATABASE_URL: postgres://knowva:${POSTGRES_PASSWORD:?}@postgres:5432/knowva
+      FILES_DIR: /app/backend/data/files
+      PORT: "8080"
+      STORAGE_BACKEND: local
+      MODEL_BASE_URL: http://host.docker.internal:9500
+      GEMMA_4_MODEL_ID: ${GEMMA_4_MODEL_ID:?}
+      NEMOTRON_EMBED_MODEL_ID: nvidia/llama-nemotron-embed-vl-1b-v2
+      NEMOTRON_RERANK_MODEL_ID: nvidia/llama-nemotron-rerank-vl-1b-v2
+      RERANK_CANDIDATE_TOP_K: ${RERANK_CANDIDATE_TOP_K:-50}
+      RERANK_TOP_N: ${RERANK_TOP_N:-6}
+      RERANK_BATCH_SIZE: ${RERANK_BATCH_SIZE:-8}
+      RETRIEVAL_MODE: ${RETRIEVAL_MODE:-hybrid}
+      RERANK_ENABLED: ${RERANK_ENABLED:-true}
+      MODEL_REQUEST_TIMEOUT_SECS: ${MODEL_REQUEST_TIMEOUT_SECS:-300}
+    volumes:
+      - app_files:/app/backend/data/files
+  # Published on loopback so replay.ts can run search.rs's SQL against it.
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: "no"
+    environment:
+      POSTGRES_USER: knowva
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: knowva
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U knowva"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+volumes:
+  app_files:
+  pgdata:

@@ -1,0 +1,104 @@
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it } from "vitest";
+import { DocumentList } from "./Documents";
+import {
+  documentFailureMessage,
+  documentRequestErrorMessage,
+} from "@knowva/core";
+import type { DocumentRow } from "@knowva/core";
+
+const NOW = Date.parse("2026-07-12T08:00:00.000Z");
+const RAW_SECRET = "provider response: Authorization Bearer sk-secret-123";
+
+const documents: DocumentRow[] = [
+  {
+    id: "native-pdf",
+    filename: "原生規範.pdf",
+    status: "ready",
+    processingStage: "ready",
+    summary: null,
+    tags: ["原生 PDF", "品質規範"],
+    processingError: null,
+    createdAt: "2026-07-12T07:55:00.000Z",
+    pageCount: 5,
+    unitCount: 18,
+  },
+  {
+    id: "scan-pdf",
+    filename: "掃描手冊.pdf",
+    status: "processing",
+    processingStage: "extracting",
+    summary: null,
+    tags: ["掃描 PDF"],
+    processingError: null,
+    createdAt: "2026-07-12T07:59:30.000Z",
+    pageCount: 8,
+    unitCount: 0,
+  },
+  {
+    id: "slides",
+    filename: "新人訓練.pptx",
+    status: "processing",
+    processingStage: "queued",
+    summary: "簡報涵蓋新人報到與安全訓練。",
+    tags: ["簡報", "新人訓練"],
+    processingError: null,
+    createdAt: "2026-07-12T07:58:00.000Z",
+    pageCount: 12,
+    unitCount: 24,
+  },
+  {
+    id: "markdown",
+    filename: "維運筆記.md",
+    status: "failed",
+    processingStage: "failed",
+    summary: null,
+    tags: null,
+    processingError: { code: "provider_failure", message: RAW_SECRET },
+    error: RAW_SECRET,
+    createdAt: "2026-07-11T08:00:00.000Z",
+    pageCount: 0,
+    unitCount: 6,
+  },
+];
+
+describe("DocumentList", () => {
+  it("renders native PDF, scanned PDF, PPTX and Markdown states with separate counts", () => {
+    const html = renderToStaticMarkup(
+      <DocumentList documents={documents} now={NOW} />,
+    );
+    const snapshotMarkup = html.replace(/<svg\b[\s\S]*?<\/svg>/g, "<svg />");
+
+    expect(snapshotMarkup).toMatchSnapshot();
+    expect(html).toContain("排隊中");
+    expect(html).toContain("讀取內容中");
+    expect(html).toContain("可查詢");
+    expect(html).toContain("失敗");
+    expect(html).toContain("尚無摘要");
+    expect(html).toContain("5 頁");
+    expect(html).toContain("18 段");
+    expect(html).toContain("原生 PDF");
+    expect(html).toContain("新人訓練");
+    expect(html).not.toContain("段落");
+    expect(html).not.toContain(RAW_SECRET);
+  });
+
+  it("never exposes canonical or legacy raw failure messages", () => {
+    const legacyOnly: DocumentRow = {
+      ...documents[3]!,
+      id: "legacy-error",
+      processingError: null,
+      error: RAW_SECRET,
+    };
+    const rendered = renderToStaticMarkup(
+      <DocumentList documents={[legacyOnly]} now={NOW} />,
+    );
+
+    expect(documentFailureMessage(documents[3]!)).not.toContain(RAW_SECRET);
+    expect(documentFailureMessage(legacyOnly)).not.toContain(RAW_SECRET);
+    expect(rendered).not.toContain(RAW_SECRET);
+    expect(documentRequestErrorMessage("upload", 500)).not.toContain(
+      RAW_SECRET,
+    );
+  });
+});

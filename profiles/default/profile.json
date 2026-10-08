@@ -1,0 +1,21 @@
+{
+  "theme": "default",
+  "brand": {
+    "name": "Knowva 知星",
+    "tagline": "點亮你的知識星系"
+  },
+  "pages": {
+    "chat": { "title": "知識問答" },
+    "documents": { "title": "文件管理" }
+  },
+  "suggestions": [
+    { "text": "知識庫裡有哪些主題？", "catalog": true },
+    { "text": "整理知識庫的重點", "catalog": false },
+    { "text": "新人該先看哪幾份文件？", "catalog": false }
+  ],
+  "composerPlaceholder": "問問你的文件…",
+  "catalogKeywords": {
+    "scope": ["知識庫", "資料庫", "專案", "全庫", "所有文件", "整個"],
+    "intent": ["主題", "文件", "內容", "涵蓋", "有哪些", "什麼資料"]
+  }
+}

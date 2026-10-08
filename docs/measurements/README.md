@@ -381,7 +381,7 @@ Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重）�
 - MLX 的頁圖 token 分 280／560／1120 三檔：長邊 1280 的頁約 1104 token，896–1152 約 539 token；QAT 在 1280 是 570 token。1152 的 token 少一半，但首字與吞吐和 1280 差不多。
 - MLX runner 載入後 `msg=memory held` 是 7.81 GiB，之後隨 prefix cache 一路漲到 15.0–15.4 GiB（peak 17.5 GiB），兩組都一樣；結束時 `/api/ps` 的大小是 16.1 GB（QAT 8.0 GB）。Ollama 0.35.0 的 `OLLAMA_*` 環境變數裡沒有限制它的設定，QAT 那條路有 `LLAMA_ARG_CACHE_RAM=2048`。`mlx-1152` 跑到一半時的 `top`：Ollama MLX runner 16 GB（其中 7.2 GB 被壓縮）、推論服務 10 GB、Colima VM 3.1 GB。四組都沒有 OOM 或 Metal 錯誤，可用記憶體最低 0.06–0.08 GiB。
 - 和 `qat-base` 相比多錯的題目：`mlx-1280` 是 `png-arm-color`、`cross-crane`、`poster-machine-measures`；`mlx-1152` 是 `jpg-brand`（KUKA 讀成 FANUC）、`nf-press-tonnage`、`png-arm-color`、`poster-machine-measures`。反過來，`qat-base` 沒過的 `osha-follow-up` 在兩組 MLX 都通過。
-- `qat-k6` 比 `qat-base` 多錯 14 題（examples 5、realistic 9），其中 11 題是正確來源沒進前 6 名（`not-retrieved`）：圖片與 EML 題、OSHA 單頁題、PPTX 統計與機器人事故題、海報題。它多答對三題 XLSX：`xlsx-deaths-112` 的 6 個來源與順序和 `qat-base` 完全一樣，差在回答本身；`xlsx-peak-month`、`xlsx-construction` 各有一到兩頁來源不同，`xlsx-construction` 的答案引自 `qat-base` 沒選進的第 7 頁。
+- `qat-k6` 比 `qat-base` 多錯 14 題（examples 5、realistic 9），其中 11 題是正確來源沒進前 6 名（`not-retrieved`）。這組只拿掉 rerank，BM25 與 RRF 仍在，送進 context 的是 RRF 前 6 名，所以結論只適用於「BM25＋RRF 不加 rerank」；只用 dense 的量測見 §8.16。多錯的題目包括圖片與 EML 題、OSHA 單頁題、PPTX 統計與機器人事故題、海報題。它多答對三題 XLSX：`xlsx-deaths-112` 的 6 個來源與順序和 `qat-base` 完全一樣，差在回答本身；`xlsx-peak-month`、`xlsx-construction` 各有一到兩頁來源不同，`xlsx-construction` 的答案引自 `qat-base` 沒選進的第 7 頁。
 - `qat-k6` 一次一題的首字比 `qat-base` 快約 8s：rerank 平均 1.0s（`qat-base` 7.4s），每題 context 的圖片平均 1.7 張（`qat-base` 3.0 張），prefill 也比較短。
 - 一次一題時 rerank 平均 7.4s（`qat-base`，50 筆候選），和 §8.12 一格的 7.3s 相近；多人同時時平均多出約 14s，包含 embed／rerank 共用一把鎖的排隊與同時跑 Gemma 的 GPU 競爭，這次沒有拆開量。
 - 上傳壓力（2026-10-06，`gemma4:12b-mlx`、頁圖 1280）：先跑一次 realistic（32/39）把 prefix cache 填滿，再用 `concurrency.ts --levels 4 --rounds 3` 連續三輪 4 人同時提問，同時依序上傳 Machine Guarding（75 頁）與 OSHA 3080（32 頁）的複本，ready 後就刪掉。每輪全部答完 69.0–81.3s（平均 77.0s），平均／最慢首字 59.0／79.8s（沒有上傳的 `mlx-1280` 是 70.5s、53.4／69.0s），12 題答對 11 題（`jpg-brand` 又讀成別的廠牌）。兩份上傳分別 64.4s、66.4s ready（§8.11 單獨上傳 Machine Guarding 是 28.1s）。swap 最高 11.8 GiB；系統記憶體壓力有 4 個取樣點（約 8 秒）到 critical，都在 Gemma 寫上傳摘要或 4 題同時 prefill 時，wired 從約 9.6 GiB 升到 15.4 GiB。Ollama、推論服務、app 的 log 都沒有錯誤；系統 log 只有 macOS 把閒置的系統 daemon 以 idle-exit 結束，沒有砍到這三個服務。腳本與結果在 `knowva-mac:~/knowva-inference/bench-results/stress-20261005-235428/`。
@@ -404,3 +404,299 @@ Ollama 0.35.0 在 Mac 上另有 MLX runner（`gemma4:12b-mlx`，nvfp4 權重）�
   | 上傳壓力：swap 最高、critical | 11.8 GiB、4 個取樣點 | 4.8 GiB、0 次 |
 
   答錯的題目兩組差在 `jpg-brand`（2 GiB 這組在同時處理與 examples 各錯一次）與 `cross-crane`（2 GiB 這組通過）；上傳壓力的第二輪兩組也都錯在 `jpg-brand`。上限 2 GiB 後，追問少了前一輪的重用，但首字時間沒有變。兩組的 log 都沒有錯誤。
+
+### 8.14 Rerank 與 Embed 改跑 MLX（#47，2026-10-06）
+
+把 Nemotron Rerank VL 移植到 MLX 0.32.3（直接讀原始 `model.safetensors`），和推論服務現行的 PyTorch 2.14.1 MPS 比。前處理和模型的 transformers processor 逐 token、逐 pixel 相同（tiles 1 與 6、文字／圖／圖＋文、截斷都比過）。
+
+先用合成候選比（正式服務改跑 MLX 之後擷取的實際候選在本節後段）：`examples.json` 與 `realistic.json` 裡來源是 PDF 或圖片的 34 題（兩題追問的每輪各算一題，共 36 題），以 BM25 從 4 份 PDF（共 53 頁）與 4 張圖片選出每題前 50 名；其中 7 筆帶頁圖（上傳的圖片與 iiot 報告第 7 頁優先，不足依名次補），頁圖是 180 DPI、長邊上限 1600 的 PNG。送進模型的方式照後端與推論服務：同一 modality 一批、每批最多 8 筆、循序，`KM_RERANK_TILES=1`，token 上限依 modality。每組各自一個程序、先跑 1 題暖機；每組開跑前推論服務都沒有載入模型，Gemma（MLX、上限 2 GiB）常駐。這份候選每題 rerank 5.87s，比 §8.13 實際候選的 7.4s 短。
+
+| 每題 50 筆 | 平均 | 與 fp32 參考的 logit 最大差 | 前 6 名集合不同 | 前 6 名順序不同 | 使用中記憶體峰值（不含快取） |
+| --- | --- | --- | --- | --- | --- |
+| PyTorch MPS fp32（參考） | 18.16s | — | — | — | 9.12 GiB |
+| PyTorch MPS fp16（現行） | 5.87s | 0.0106 | 0/36 | 1 | 4.89 GiB |
+| PyTorch MPS fp16，逐筆不補 padding | 4.43s | 0.0094 | 0/36 | 1 | 3.89 GiB |
+| MLX fp32（`MLX_ENABLE_TF32=0`） | 18.33s | 0.00001 | 0/36 | 0 | 7.69 GiB |
+| MLX bf16 | 5.03s | 0.0776 | 0/36 | 2 | 3.85 GiB |
+| MLX fp16 | 5.09s | 0.0103 | 0/36 | 0 | 3.87 GiB |
+| MLX fp16，逐筆不補 padding | 3.79s | 0.0086 | 0/36 | 0 | 3.83 GiB |
+
+- 同一種批次方式下，MLX fp16 比 PyTorch MPS fp16 快 1.15 倍（補 padding）與 1.17 倍（不補）。最快的 MLX 比現行快 1.55 倍，其中 1.33 倍來自不補 padding，PyTorch 也做得到（#48）。#47 的門檻是 2 倍。
+- 這台的 PyTorch MPS 與 MLX 跑 matmul 一樣快（TFLOPS，`deploy/mac-mini/nemotron-vl-mlx/tools/matmul_peak.py`）：
+
+  | M×K×N | MLX fp16 | MPS fp16 | MLX bf16 | MPS bf16 |
+  | --- | --- | --- | --- | --- |
+  | 4096×4096×4096 | 18.0 | 18.7 | 19.1 | 18.7 |
+  | 19200×2048×8192 | 18.2 | 18.8 | 19.6 | 18.8 |
+  | 600×2048×8192 | 13.6 | 16.7 | 13.8 | 15.6 |
+  | 600×8192×2048 | 10.2 | 13.4 | 12.1 | 13.0 |
+
+  每題有效 token 約 2.0 萬、補齊後約 3.2 萬（有效 63%），約 79 TFLOP；PyTorch MPS fp16 每題 5.87s 相當於約 13.5 TFLOPS。
+- 精度：PyTorch MPS fp32 和 CPU fp32 在 4 個固定批次上差 1e-5，MLX fp32 和它們也差 1e-5。MLX 在 M6 上預設讓 float32 matmul 走 TF32（`MLX_ENABLE_TF32`），沒關掉時差 0.0036，比 PyTorch fp16 還大。
+- 記憶體要看程序的 phys_footprint（`top` 的 MEM）：macOS 的 RSS 不算 GPU buffer，`mx.get_peak_memory()` 不算 MLX 的 buffer cache。MLX 的 buffer cache 預設沒有實際上限，每筆長度不同，釋放的 buffer 被留著重用，36 題後長到 13.8 GiB。單獨跑 rerank、逐筆不補 padding、fp16（`rerank-cache-20261006-030622/`）：
+
+  | | 每題 | 程序 footprint |
+  | --- | --- | --- |
+  | MLX，預設 cache | 3.80s | 17 GB |
+  | MLX，cache 上限 0 | 3.99s | 3.6 GB |
+  | MLX，cache 上限 256 MB | 3.88s | 3.8 GB |
+  | MLX，cache 上限 1 GB | 3.88s | 4.6 GB |
+  | PyTorch MPS | 4.34s | 5.0 GB |
+
+- 推論服務本身（`server.py` 加 `KM_RERANK_BACKEND`，在 9502 埠另跑一份，正式服務沒動）：先 embed 一次查詢讓 embed 常駐，等同有人在問的狀態，再用 HTTP 照後端格式送 36 題（`nemotron-vl-mlx/tools/knowva/server-test.sh`）。
+
+  | `KM_RERANK_BACKEND` | 每題 rerank | footprint 峰值 | 跑完時 footprint | 記憶體壓力 |
+  | --- | --- | --- | --- | --- |
+  | torch | 5.90s | 10.0 GB | 9.2 GB | normal |
+  | mlx，`KM_MLX_CACHE_MB=256` | 3.96s | 9.9 GB | 8.4 GB | normal |
+  | mlx，沒設上限 | 4.08s | 23 GB | — | warn，swap 增加 4.1 GB |
+
+  embed 仍跑 PyTorch，程序裡還是有 PyTorch runtime 與 MPS 快取，所以峰值幾乎一樣。結果在 `rerank-server2-20261006-025831/`（沒設上限）與 `rerank-server3-20261006-031952/`。
+- MLX 第一版載入時同時持有 bf16 原檔與 fp16 副本，可用記憶體一度剩 0.15 GiB、記憶體壓力 critical 2 秒、swap 增加 2.3 GiB；改成逐個 tensor 轉換後沒有再出現。
+- 移植與量測工具在 `deploy/mac-mini/nemotron-vl-mlx/`（`tools/knowva/build_sets.py` 組候選、`bench_sets.py` 量時間與 logit、`compare_runs.py` 比較、`run-sets.sh` 依序執行並取樣記憶體、`cache-sweep.sh` 與 `server-test.sh`）。以上結果都在 `knowva-mac:~/knowva-inference/bench-results/` 底下，36 題的比較在 `rerank-sets-20261006-015536/` 與 `rerank-sets2-20261006-023640/`。
+
+正式推論服務 09:40 改成 `KM_RERANK_BACKEND=mlx`、`KM_MLX_CACHE_MB=256`（embed 仍是 PyTorch），照 §8.13 跑一輪 e2e（`mlx-rerank-e2e-20261006-094336/`），對照同一天 PyTorch 的 `km1-20261006-002433/`。這一輪 app 的 rerank 請求經過 `tools/knowva/capture-proxy.ts` 轉送，原樣記下請求與回應（`capture-e2e.sh`，跑完路由改回直連）。
+
+| | MLX rerank | PyTorch（km1） |
+| --- | --- | --- |
+| 1／2／3／4 人同時提問，每分鐘答完 | 5.15／4.44／3.98／4.18 | 4.03／3.86／3.30／3.65 |
+| 同時提問時每題 rerank 平均／最長 | 14.6s／26.2s | 21.5s／33.9s |
+| examples／realistic 答對 | 30/34、33/39 | 29/34、32/39 |
+| 首字中位數 examples／realistic | 13.4s／12.9s | 16.8s／16.2s |
+| 記憶體壓力 warn 的取樣比例 | 2.8% | 36% |
+| 跑的期間 swap | 1.5→2.7 GiB | 1.4→5.2 GiB |
+
+- 同時提問時，各人的 rerank 批次在推論服務裡排隊（一次一個 forward），所以每題 rerank 比單人時長；單人時 MLX 每題約 5.8s。
+- swap 最高 9.7 GiB 是開跑前留下的（第一筆取樣時推論服務還沒載入模型），跑的期間一路降到 1.5 GiB 再回升。
+- 答對題不同的有 jpg-brand、xlsx-peak-month（MLX 對、km1 錯）與 poster-machine-causes、poster-hoisting-hazards（兩邊都錯，缺的關鍵字不同）。用下面的重播比，只有 poster-machine-causes 的前 6 名和 PyTorch fp16 不同（第 3、4 名對調）；其他三題前 6 名相同，差異來自 rerank 之後。
+
+擷取到的 520 個請求是 73 題（examples 34、realistic 39）、每題 50 筆的實際候選，3650 筆裡 524 筆帶頁圖（24 張不同的圖），以 `tools/knowva/capture_to_sets.py` 轉成 `bench_sets.py` 的格式。MLX 照服務設定（TF32 開、cache 256 MB）重播時，73 題的 logit 和服務當時回傳的完全相同，所以重播能代表正式服務。結果在 `rerank-captured-20261006/`：
+
+| 實際候選，每題 50 筆 | 平均 | 與 fp32 參考的 logit 最大差 | 前 6 名集合不同 | 前 6 名順序不同 | 程序 footprint |
+| --- | --- | --- | --- | --- | --- |
+| PyTorch MPS fp32（參考） | 22.12s | — | — | — | 12 GB |
+| PyTorch MPS fp16（原本的服務） | 7.18s | 0.0082 | 2/73 | 0 | 7.3 GB |
+| MLX fp16（服務設定） | 4.91s | 0.0104 | 1/73 | 1 | 4.0 GB |
+
+- 前 6 名集合不同的題目，參考值的第 6、7 名只差 0.0018 與 0.0003；MLX 不同的那一題，PyTorch fp16 也一樣換掉。MLX 和 PyTorch fp16 之間 logit 最大差 0.0107，前 6 名集合不同 1 題（pptx-content，第 6 名）、順序不同 1 題（poster-machine-causes）。
+- MLX 比 PyTorch fp16 快 1.46 倍（中位數 1.54 倍）。實際候選比合成的長（PyTorch 每題 7.18s 對 5.87s）。
+- TF32 開或關，fp16 的 logit 完全相同：fp16 模型裡只有 score head 是 float32 matmul。
+- 頁面文字的 `\r\n` 要原樣送：工具一開始用文字模式讀候選，換行被改成 `\n`，重播和服務的 logit 差到 0.45、前 6 名 18 題不同。合成候選（`build_sets.py`）同樣把 `\r\n` 換成 `\n`；各組拿到的文字相同，前面的比較仍成立，只是和 app 送出的差在換行。
+
+Embed VL 用同一套移植（`Embedder`）：和 sentence-transformers 一樣的 `query: `／`passage: ` prompt、4096 token 截斷、不正規化的 mean pooling；前處理和原版逐 token、逐 pixel 相同（`tools/check_embed_processing.py`）。量測用 `bench-pages/` 的 14 頁（iiot 報告，頁圖與文字層）和 `realistic.json` 前 20 題，每筆各送一次，和後端一樣；`KM_MAX_TILES=6`，每組各自一個程序，開跑前推論服務沒有載入模型（`tools/knowva/run-embed.sh`，結果在 `embed-20261006/`）。
+
+| 每筆 | 查詢 | 文字頁 | 頁圖 | 頁圖＋文字 | 程序 footprint | 與 PyTorch fp32 的 cosine 最小值 |
+| --- | --- | --- | --- | --- | --- | --- |
+| PyTorch MPS fp32（參考） | 0.054s | 0.196s | 2.78s | 2.99s | 9.9 GB | — |
+| PyTorch MPS fp16（原本的服務） | 0.026s | 0.068s | 1.00s | 1.06s | 4.7 GB | 0.999992 |
+| MLX fp16 | 0.022s | 0.055s | 0.84s | 0.91s | 4.3 GB | 0.999990 |
+| MLX fp32（`MLX_ENABLE_TF32=0`） | 0.038s | 0.189s | 2.74s | 2.94s | 7.4 GB | 1.000000 |
+
+- 用每題查詢向量對 14 頁取 cosine 前 5 頁（`tools/compare_embed.py`）：MLX fp16 和 PyTorch fp16 一樣，在文字頁、頁圖、頁圖＋文字各有 0–1 題的前 5 名集合和 fp32 參考不同。
+- 不用重新 embed：MLX fp16 的查詢向量去比 PyTorch fp16 的頁向量（也就是資料庫裡現有的），三種頁的前 5 名都和 PyTorch fp16 自己比的完全相同（0/20）。
+- 推論服務在 9502 埠另跑一份、embed 與 rerank 都設 MLX：後端會送的四種輸入（查詢、文字、頁圖、頁圖＋文字）經 HTTP 拿到的向量和直接呼叫 `Embedder` 逐位相同；程序沒有載入任何 PyTorch 函式庫，兩個模型都載入後 footprint 6.95 GB（`embed-service-smoke-20261006/`）。
+
+接著正式推論服務改成 `KM_EMBED_BACKEND=mlx`（rerank 已是 MLX），之後的 e2e 不改任何設定（`tools/knowva/acceptance-e2e.sh`，`mlx-all-e2e-20261006-112335/`）：examples、realistic、1–4 人同時提問，再上傳兩份文件的複本、同時 4 人各問 3 輪（`stress-upload.ts`，上傳完即刪除，和 km1 的上傳階段相同）。
+
+| | PyTorch（km1） | Rerank MLX | 全 MLX |
+| --- | --- | --- | --- |
+| 1／2／3／4 人同時提問，每分鐘答完 | 4.03／3.86／3.30／3.65 | 5.15／4.44／3.98／4.18 | 5.11／4.36／3.85／4.34 |
+| 同時提問時每題 rerank 平均／最長 | 21.5s／33.9s | 14.6s／26.2s | 14.8s／25.3s |
+| examples／realistic 答對 | 29/34、32/39 | 30/34、33/39 | 28/34、32/39 |
+| 首字中位數 examples／realistic | 16.8s／16.2s | 13.4s／12.9s | 13.3s／12.9s |
+| 推論服務 footprint 中位數／最高 | — | 8.7／10.2 GB | 7.5／8.4 GB |
+
+| 上傳 + 4 人各問 3 輪 | PyTorch（km1） | 全 MLX（兩次） |
+| --- | --- | --- |
+| 每分鐘答完 | 3.19 | 3.93、3.83 |
+| 首字平均 | 56.7s | 44.4s、47.4s |
+| 每題 rerank 平均 | 34.6s | 24.2s、25.0s |
+| pptx（75 頁）可問答 | 54.3s | 88.4s、92.4s |
+| PDF（32 頁）可問答 | 69.4s | 69.3s、68.3s |
+| 記憶體壓力 warn 的取樣比例 | 57% | 20%（第一次） |
+| 階段中 swap 增加 | 0.8 GiB | 0.4 GiB（第一次） |
+
+- 全 MLX 和 rerank MLX 的 73 題取到的來源完全相同；和 km1 比只有 pptx-content、poster-machine-causes 兩題不同（就是重播裡前 6 名和 PyTorch fp16 不同的兩題，三輪都答錯）。答對題不同的 jpg-brand、jpg-task、xlsx-peak-month 來源都相同，是 Gemma 對同樣的來源給了不同答案，例如 jpg-brand 一次讀成 KUKA、一次讀成 FANUC。
+- pptx 在有人提問時變慢：同一份 pptx 沒人提問時 23.1s 可問答，其中 embed 11.6s。有人提問時 embed 要 48s，推論服務的存取紀錄顯示上傳的 embed 和 4 人的 rerank 批次輪流取得 GPU（約 4 個 embed、4 個 rerank 交替），上傳的進度被 rerank 綁住；km1 沒留推論服務紀錄，無法比較它當時的順序。第二次在 `mlx-all-upload-20261006/`，沒有取樣記憶體。同一段時間答題變多、首字變快，PDF 沒有變慢。
+- 推論服務不再載入 PyTorch，footprint 中位數少 1.2 GB、最高少 1.8 GB。上傳階段推論服務最高 8.3 GB。
+
+之後權重改從 Hugging Face 的 `Laysi-ai/llama-nemotron-{embed,rerank}-vl-1b-v2-mlx` 下載（`setup/fetch-models.ts`）。這是 NVIDIA 權重換成移植的參數名稱與版面，bf16 數值不變。切換前後，推論服務對同一組請求的回應逐位相同：15 個 embed（查詢、文字、頁圖、頁圖＋文字）和 9 個 rerank（文字、頁圖、頁圖＋文字各 3 題）。切換前同一份服務連跑兩次也逐位相同，所以這個比對有效。切換後透過 app 問 realistic 第一題，答案正確，答案用到的頁排第一。比對工具是 `tools/knowva/service_outputs.py`，結果在 `hf-weights-switch-20261006/`。
+
+### 8.15 EmbeddingGemma 2（MLX）對 Nemotron Embed VL（2026-10-08）
+
+Google 10/06 發布的 EmbeddingGemma 2（740M：文字 270M、視覺 170M、音訊 300M；768 維，可截成 512／256／128；Apache 2.0），用 mlx-community 的 MLX 轉檔（`embeddinggemma-2-bf16` revision 1a4ffdd、`embeddinggemma-2-mxfp8` 0536fa4；mlx-vlm 3d87e884、MLX 0.32.3、transformers 5.19.0）和現行的 Nemotron Embed VL（MLX fp16、6 tiles，§8.14）比。只換 dense 這一段，BM25、RRF 與 Nemotron rerank 都不變。
+
+- 語料：用 main（ed45d8b）的映像在開發機另起一份 Knowva、接全新的資料庫，依序上傳 §8.9 的 8 份範例與 §8.10 的 9 份真實文件；入庫的 Nemotron 向量經 SSH 通道由 knowva-mac 的正式推論服務計算，和正式環境同一條路。共 397 個 unit，25 個送圖（21 個頁圖＋文字、4 張只有圖），各文件的看圖頁和 §8.11 相同。
+- 題目：兩份題組中有標準來源的 61 題，用最後一輪的提問檢索（後端只看最後一則使用者訊息，所以兩題追問的第二輪沒有上下文）。命中的定義同題組：檔名相符，有 `pages` 時頁碼也要相符（`null` 是文字 unit）。
+- EG2 的輸入照模型卡：查詢加 `task: search result | query: `（另試 `task: question answering | query: `）；文字 unit 與不送圖的頁是 `title: none | text: ` 加內容；送圖的頁是同一段前綴、頁面文字、再接圖（順序同 Nemotron 的 text_image）；只有圖的不加前綴（前綴只用在文字）。圖片預設 280 soft tokens，另試 1120。
+- 和官方 PyTorch fp32（sentence-transformers 6.1.0）在 11 個 unit（四種輸入都有）與 8 題 × 2 種查詢前綴上比 cosine：MLX bf16 最小 0.99984，mxfp8 最小 0.9982；1120 的圖片輸入和 280 的參考只有 0.91–0.98，預算確實改變了圖片的表示。
+
+速度與記憶體（`embed_corpus.py`）：每筆一個 forward、循序，和入庫時每頁一個請求相同；每組各自一個程序，MLX cache 上限 256 MB 同推論服務；開跑前正式推論服務沒有載入模型，Gemma 常駐。`run_embeds.sh` 依序跑完全部各組；先前另跑過一輪，向量逐位相同，每種輸入的平均時間差最多 6.2%（那一輪的查詢時間沒算前處理，不比）。
+
+| 每筆平均 | 文字（372） | 頁圖＋文字（21） | 只有圖（4） | 查詢 | 397 筆合計 | 程序 footprint 載入後／最高 | MLX 峰值 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Nemotron MLX fp16，6 tiles（現行） | 0.087s | 0.870s | 0.772s | 0.021s | 53.9s | 3.25／4.40 GiB | 3.81 GiB |
+| EG2 bf16，280 | 0.047s | 0.175s | 0.209s | 0.006s | 21.9s | 2.30／3.35 GiB | 2.11 GiB |
+| EG2 bf16，280，不載音訊塔 | 0.047s | 0.177s | 0.204s | 0.006s | 21.9s | 1.44／2.49 GiB | 1.54 GiB |
+| EG2 mxfp8，280 | 0.051s | 0.184s | 0.215s | 0.008s | 23.5s | 2.05／3.09 GiB | 1.86 GiB |
+| EG2 mxfp8，280，不載音訊塔 | 0.051s | 0.185s | 0.216s | 0.008s | 23.6s | 1.19／2.26 GiB | 1.29 GiB |
+| EG2 bf16，1120 | 0.046s | 1.216s | 1.244s | 0.006s | 47.8s | 2.29／4.73 GiB | 3.38 GiB |
+
+- footprint 是程序的 phys_footprint（`proc_pid_rusage`），查詢與每筆時間都含前處理。EG2 的程序含 PyTorch 與 transformers（見下面的部署條件），Nemotron 的沒有，所以比記憶體要看 footprint，不是 MLX 峰值。
+- Nemotron 這組用推論服務自己的 venv 與 `nemotron_vl_mlx`，算出的向量和資料庫裡的完全相同（cosine 1.0），所以量到的是正式服務的路徑。
+- 不載音訊塔的向量和完整模型逐位相同。EG2 文字 unit 的 token 數中位數 1237。
+
+檢索（`eval.ts`）：dense 取前 50，BM25 直接跑 `search.rs` 的 SQL，RRF k=60 取前 50，送正式推論服務的 Nemotron rerank（同一 modality 一批、每批 8 筆）取前 6。向量照資料庫轉成 halfvec：沒轉時 dense 第 11 名以後的順序和資料庫不同，轉了以後 61 題的前 50 名和後端 SQL 逐名相同（`dense-check.ts`；這個規模 Postgres 走 seq scan）。同一個實例用 `/api/chat` 問 4 題（pdf-p7-figure、poster-machine-causes、eml-subject、osha-p12-air-hose），後端回傳的 6 個來源和重現結果逐名相同（`backend-check.ts`）。
+
+| 61 題，標準來源在前幾名 | dense 第 1 | dense 前 6 | dense 前 10 | dense 前 50 | dense MRR | RRF 前 6 | RRF 前 50（rerank 候選） | 最終第 1 | 最終前 6 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Nemotron（現行） | 48 | 57 | 59 | 60 | 0.851 | 45 | 60 | 51 | 60 |
+| EG2 bf16，280 | 47 | 58 | 58 | 60 | 0.841 | 45 | 60 | 51 | 60 |
+| EG2 bf16，280，256 維 | 47 | 57 | 58 | 60 | 0.830 | 43 | 59 | — | — |
+| EG2 bf16，280，QA 前綴 | 46 | 58 | 59 | 60 | 0.827 | 46 | 60 | — | — |
+| EG2 bf16，1120 | 48 | 56 | 57 | 60 | 0.834 | 45 | 60 | — | — |
+| EG2 mxfp8，280 | 47 | 58 | 59 | 60 | 0.840 | 45 | 60 | — | — |
+
+- rerank 之後完全打平；最終前 6 名找不到的都是 pptx-content（投影片只有 Lorem ipsum，#41）。兩邊的最終前 6 名有 28 題逐名相同，平均重疊 4.9 筆。每題 rerank 6.3s 對 6.7s。在這份語料上換 embed 不改變最終取到的來源，差別在入庫速度（合計 53.9s→21.9s，頁圖＋文字快 5.0 倍）與記憶體（程序 footprint 最高 4.40→3.35 GiB，不載音訊塔 2.49 GiB，已含 PyTorch 與 transformers）。問答時查詢 embed 只要 0.02s 對 0.006s，每題 rerank 6.3s，換 embed 對問答速度幾乎沒有影響。
+- dense 的差異：EG2 把 §8.10 取不回的「機械災害預防海報」兩題從第 17、10 名拉到第 1 名，但 rerank 後兩邊都只排第 5、3 名。EG2 較差的是 eml-subject（dense 7→20，最終 3→5）、jpg-task（dense 1→6，最終都是第 1）與 pdf-follow-up 的第二輪（dense 1→11）。
+- 語料只有 397 個 unit，dense 前 50 兩邊都已涵蓋 60/61。文件多的時候候選池要靠 dense 前段的名次，這次前 10 是 59 對 58，看不出差別。
+- 1120 對文字頁沒有影響，圖片題反而較差（png-logo dense 2→12、png-arm-color 2→18）。截成 256 維 dense 幾乎不變，但 RRF 前 50 少 1 題。
+- rerank 偏好送圖的 passage，兩個模型都一樣：答案在文字的 40 題，RRF 候選中送圖的 passage 佔 12.4%（EG2 17.5%），最終前 6 名佔 37.5%（EG2 42.9%）。例如 osha-p9-circular-saw 的前 3 名是 OSHA 的第 3 頁、封面與封底（都是看圖頁），答案的第 9 頁（文字頁）排第 4。EG2 帶進較多圖片 passage，送給 Gemma 的圖也會多一些。
+
+部署條件：
+
+- transformers 5.19 的 `EmbeddingGemma2Processor` 沒有 PyTorch 就載入不了。推論服務若改用 EG2 要裝回 PyTorch（§8.14 剛拿掉），或像 `nemotron_vl_mlx` 一樣把前處理改寫成 numpy。空程序逐步 import 的 footprint：mlx、numpy、PIL 0.02 GiB，加 torch 與 torchvision 0.23 GiB，再加 transformers 與 EG2 處理器（詞表 26 萬）0.59 GiB，前處理 5 張頁圖後 0.67 GiB；現行服務的 import（`nemotron_vl_mlx`、fastapi）是 0.05 GiB。改寫前處理只省得掉 torch 那一段，tokenizer 仍要載入。
+- 向量從 2048 維改成 768 維，`document_units.embedding`（`halfvec(2048)`）與索引都要改，所有文件要重新 embed。rerank 仍是 Nemotron，它的權重還是要留。
+- mlx-vlm 的 EG2 支援在 3d87e884 這個 commit，main 已合併但還沒發版（PyPI 最新 0.7.6）。
+
+工具在 `deploy/mac-mini/bench/embeddinggemma2/`：`upload.ts` 依序上傳、`export-corpus.sh` 匯出語料與題目、`run_embeds.sh` 在 knowva-mac 上依序跑各組（`embed_corpus.py`）與 PyTorch 參考（`reference.py`）、`eval.ts` 重現檢索、`summarize.ts` 彙總、`dense-check.ts` 與 `backend-check.ts` 核對重現結果。結果在 `knowva-mac:~/knowva-inference/bench-results/embeddinggemma2-20261008/`，同一目錄另有入庫後的資料庫 dump（`knowva_eg2.dump`，`pg_dump -Fc`）與它的 FILES_DIR（`knowva_eg2-files.tgz`），還原後不必重新入庫就能重跑 `eval.ts`。
+
+### 8.16 只用 dense 檢索（#60，2026-10-08）
+
+現行 `/api/chat` 的檢索是 dense 前 50 ＋ BM25 前 50 → RRF（k=60）前 50 → Nemotron Rerank VL → 前 6 名。§8.13 的 `qat-k6` 只拿掉 rerank，BM25 與 RRF 仍在。這次比較三種只用 dense 的設定：
+
+- `dense-6`、`dense-8`：dense 前 6／8 名直接送 Gemma，不呼叫 BM25，也不呼叫 rerank（`RETRIEVAL_MODE=dense`、`RERANK_ENABLED=false`、`RERANK_TOP_N=6／8`）。
+- `dense-rerank-20`：dense 前 20 名送 rerank，取前 6（`RETRIEVAL_MODE=dense`、`RERANK_CANDIDATE_TOP_K=20`）。20 由下面的重播決定。
+
+後端開關在分支 `feat/dense-retrieval-mode`：`RETRIEVAL_MODE=hybrid|dense`、`RERANK_ENABLED=true|false`，未設定時仍走 BM25＋RRF＋rerank（有單元測試）。同一分支也把 `rag_context.rs` 的 `MAX_RAG_SOURCES` 從固定 6 改成 `RERANK_TOP_N` 的上限 8：原本 `RERANK_TOP_N` 設 7、8 時，送進 context 的仍只有前 6 筆；預設 6 筆不變。第一次跑 `dense-8` 時還沒改這個上限，送給 Gemma 的其實是 dense 前 6 名，那一輪保留下來，當作 `dense-6` 的重跑。
+
+- 語料：§8.15 的資料庫 dump 與 FILES_DIR（17 份文件、397 個 unit），還原到 knowva-mac 上另起的一份 Knowva（compose 專案 `knowva-dense60`，port 8081，有自己的資料庫與檔案）。app 是正式映像 `dev-page-vision-20261003-2` 換上這個分支編出的 `knowva-server`。推論服務與 Gemma 都用正式的那一套：`gemma4:12b-mlx`、prefix cache 上限 2 GiB、頁圖長邊 1280、embed 與 rerank 都跑 MLX。
+- 正式環境不受影響：正式的 `~/knowva/.env`、`docker-compose.yml` 與推論服務 plist 都沒有動，實測前後的 sha256 相同。正式 app 全程沒有重啟，實測後 `/api/health` 正常，透過它問 `md-port` 答對。
+- 題目：`examples.json`（34 題）、`realistic.json`（39 題），加上新的 `identifiers.json`（18 題）。新題組都是精確字詞查詢，來源都在現有的 17 份文件裡：
+  - 出版品、補助與表格編號：OSHA 3104、SH-05029-SH8、表 7-2
+  - 通訊錄：Birmingham, AL 的 Area Office、Region V、電話 (847) 297-4810
+  - 法規條號：1910.212(a)(1)、1926.300(b)(2)、1928.57(b)(1)(i)、職安衛管理辦法第八十條
+  - 型號、料號、SKU：ENC28J60、STEP 檔 93520-GA、SKU OCR-002
+  - 縮寫：ANSI B11.19、AN128
+  - 人名：Jason Bloomberg
+  - 識別字與函式名：Message-ID、`UA_Server_runUntilInterrupt`
+- 新題組評分：有兩題的關鍵字原本太窄（Gemma 答「以太網」「主護盾」），實測後放寬，四組都用放寬後的關鍵字重新評分（`rescore.ts`）。是否取到來源、是否引用正確，判斷方式不變。
+
+重播（`replay.ts`）：直接在這個實例的資料庫上跑 `search.rs` 的 dense 與 BM25 SQL，查詢向量與 rerank 都打正式推論服務，作法同 §8.15 的 `eval.ts`。舊的 61 題 dense 名次和 §8.15 完全相同（第 1 名 48、前 6 名 57、前 10 名 59、前 50 名 60）。
+
+| 標準來源進入 context | examples（27） | realistic（34） | 新題組（18） | 合計（79） | 排第 1 | 每題 rerank（一次一題） |
+| --- | --- | --- | --- | --- | --- | --- |
+| 現行 | 26 | 34 | 18 | 78 | 69 | 5.10s |
+| dense-6 | 25 | 32 | 15 | 72 | 62 | — |
+| dense-8 | 26 | 32 | 16 | 74 | 62 | — |
+| dense 前 8 → rerank | 26 | 32 | 16 | 74 | 69 | 0.72s |
+| dense 前 10 → rerank | 26 | 33 | 17 | 76 | 70 | 0.89s |
+| dense 前 12 → rerank | 26 | 33 | 18 | 77 | 71 | 1.06s |
+| dense 前 16 → rerank | 26 | 33 | 18 | 77 | 71 | 1.44s |
+| dense 前 20 → rerank | 26 | 34 | 18 | 78 | 71 | 1.80s |
+| dense 前 24 → rerank | 26 | 34 | 18 | 78 | 71 | 2.19s |
+
+- 79 題中仍然沒有任何一題是 BM25 前 50 找得到、dense 前 50 漏掉的。三種設定都找不到的只有 `pptx-content`（投影片只有 Lorem ipsum，#41）；除了這題，dense 前 20 涵蓋全部題目。
+- 新題組的前 6 名：BM25 16/18，比 dense 的 15/18 多；RRF 18/18。
+- dense 前 6 名漏掉、但都在前 20 名內的六題（括號內是 dense 名次）：
+  - 新題組：`id-iiot-bloomberg`（8）、`id-osha-847-phone`（10）、`id-iiot-an128`（12）
+  - 舊題：`eml-subject`（7）、`poster-machine-measures`（10）、`poster-machine-causes`（17）
+
+  rerank 收 dense 前 20 名，就能把這六題都排進前 6。
+- 實測的 `dense-rerank` 用 20：這是命中數追上現行的最小候選數。
+
+實測（`run.sh`）：依序跑 `dense-6`、`dense-8`（上限 6 的那一輪，即重跑）、`dense-rerank-20`、現行，最後用改過上限的執行檔再跑一次 `dense-8`。每組的步驟：
+
+1. 卸載 Gemma。
+2. 跑 `bench/concurrency.ts --levels 1,2,3,4`（同 §8.12 的 20 題）。
+3. 一次一題跑三份題組。
+
+全程每 3 秒記一次 swap、記憶體壓力與推論服務 footprint（`top` 的 MEM）。兩組只用 dense 的設定在開跑前，先等推論服務釋放 rerank（`/health` 的 `loaded` 只剩 `embed`），所以它們的 footprint 不含 rerank。
+
+| | dense-6 | dense-8 | dense-rerank-20 | 現行 |
+| --- | --- | --- | --- | --- |
+| 答對：examples／realistic／新題組 | 29／33／15 | 30／32／16 | 29／33／18 | 28／32／18 |
+| 答對合計（91 題） | 77 | 78 | 80 | 78 |
+| 取到標準來源（可回答的 79 題） | 72 | 74 | 78 | 78 |
+| 首字中位數：examples／realistic／新題組（一次一題） | 6.2／6.3／7.5s | 8.1／7.4／9.9s | 9.4／8.7／9.7s | 13.0／12.7／13.6s |
+| 每分鐘答完（1／2／3／4 人） | 12.4／7.9／6.7／7.9 | 10.0／6.4／5.3／5.9 | 8.3／6.4／5.1／5.6 | 5.1／4.4／3.9／4.3 |
+| 4 人同時：平均／最慢首字 | 16.8／29.9s | 22.8／42.4s | 26.4／44.5s | 38.5／59.5s |
+| 同時處理那 20 題答對 | 17/20 | 18/20 | 20/20 | 19/20 |
+| rerank 平均：同時處理（含排隊）／一次一題 | — | — | 5.3／1.8s | 14.8／5.1s |
+| 每題送給 Gemma 的圖（平均） | 1.16 | 1.40 | 1.85 | 2.94 |
+| 推論服務 footprint：最高／中位數 | 3.96／3.89 GiB | 4.49／3.75 GiB | 8.03／7.32 GiB | 8.37／7.60 GiB |
+| 記憶體壓力 warn 的取樣點 | 0 | 0 | 13 | 2 |
+
+- 實測取到來源的題數，和重播的命中數逐組相同。
+- 全部四組都沒有錯誤，也沒有到 critical。
+- swap 不比：各組開跑時就有 0.5–2.1 GiB 是前面留下來的。
+- BM25 這一段的延遲中位數是 11 ms，dense 是 55 ms，所以拿掉 BM25 省不到時間。時間差主要來自 rerank 本身與排隊，以及送給 Gemma 的圖變少：現行的 rerank 偏好送圖的頁（#59）。
+- 同一設定兩次執行的差距：`dense-6` 的重跑答對 29／32／15，每分鐘答完 12.1／7.3／6.6／7.7，同時處理 18/20。和第一次差在 `xlsx-peak-month` 與同時處理的一題，兩邊取到的來源都一樣，只差在 Gemma 的回答。所以每份題組差 1 題，是同一設定重跑就會出現的差距。
+
+和現行結果不同的題目：
+
+| 題目 | dense-6 | dense-8 | dense-rerank-20 | 現行 | 差在 |
+| --- | --- | --- | --- | --- | --- |
+| `eml-subject` | 沒取到 | 對 | 對 | 對 | 來源（dense 第 7） |
+| `pdf-p14-reference` | 對 | 對 | 錯：沒引用 | 錯：沒引用 | 答案（來源都取到） |
+| `xlsx-vendor` | 對 | 對 | 對 | 錯 | 答案 |
+| `jpg-task` | 對 | 對 | 錯 | 對 | 答案（同一張圖） |
+| `png-arm-color` | 錯：沒引用 | 錯：沒引用 | 對 | 錯 | 答案 |
+| `xlsx-peak-month` | 對 | 錯 | 錯 | 錯 | 答案 |
+| `xlsx-construction` | 對 | 對 | 錯 | 錯 | 答案 |
+| `pptx-guard-types` | 錯 | 錯 | 對 | 對 | 來源（只用 dense 時沒取到列出四種護罩的第 23 張投影片） |
+| `poster-machine-measures` | 沒取到 | 沒取到 | 對 | 錯：缺「防護設施」 | 來源（dense 第 10）／讀圖 |
+| `id-osha-847-phone` | 沒取到 | 沒取到 | 對 | 對 | 來源（dense 第 10） |
+| `id-iiot-an128` | 沒取到 | 沒取到 | 對 | 對 | 來源（dense 第 12） |
+| `id-iiot-bloomberg` | 沒取到 | 對 | 對 | 對 | 來源（dense 第 8） |
+
+四組都錯的題目不在表內，都是已知的既有問題：
+
+- `pptx-content`：投影片只有 Lorem ipsum（#41）。
+- `jpg-brand`、`png-logo`、`poster-machine-causes`、`poster-hoisting-hazards`：Gemma 讀圖讀錯。`poster-machine-causes` 在 `dense-6`、`dense-8` 是根本沒取到來源（dense 第 17 名）。
+- `xlsx-deaths-112`、`xlsx-manufacturing`：XLSX 轉檔把表格切頁。
+
+結論：
+
+- 拿掉 BM25 與 RRF、保留 rerank、候選從 50 降到 20：
+  - 答對：比現行多 2 題（80 對 78），取到的來源相同（78/79）。新題組也是 18/18，所以這份語料裡，精確字詞查詢不需要 BM25，只要 rerank 看得到 dense 前 20 名。
+  - 速度：一次一題的首字快 3.6–4.0s，1–4 人同時提問每分鐘多答 30–62%，rerank 時間約剩三分之一。
+  - 記憶體：rerank 模型仍然常駐，推論服務 footprint 只少 0.3 GiB。
+- 完全不 rerank（`dense-6`）：
+  - 速度：每分鐘答完是現行的 1.7–2.4 倍。
+  - 記憶體：推論服務 footprint 少 4.4 GiB（8.37→3.96 GiB）。
+  - 代價：取不到 6 題的來源，其中 3 題是精確字詞題。
+  - `dense-8` 救回其中 2 題（`eml-subject`、`id-iiot-bloomberg`），但多送的兩個來源讓它比 `dense-6` 慢，footprint 最高 4.49 GiB。
+- 語料只有 17 份文件、397 個 unit，dense 前 20 名占了 5%。文件變多時，前 20 名占的比例會下降，dense 前段的名次會更關鍵。所以如果改用 dense，候選數要在更大的語料上再確認。
+
+工具在 `deploy/mac-mini/bench/dense-only/`：
+
+- `replay.ts`：重播。
+- `compose.yml` 與 `Dockerfile`：隔離實例。
+- `run.sh`：依序實測各組；可另外指定只跑其中幾組。
+- `compare.ts`：彙總。
+- `rescore.ts`：關鍵字修改後重新評分。
+
+新題組在 `deploy/mac-mini/bench/identifiers.json`。結果在 `knowva-mac:~/knowva-inference/bench-results/dense-60-20261008/`：
+
+- `replay/`：重播結果。
+- `e2e/`：各組的問答、同時處理、記憶體、app／Ollama log，以及 `compare.md`。重跑的結果檔名是 `dense-6b`；`orig-keys/` 是放寬關鍵字前的評分。
+- 實例設定、正式設定前後的 sha256、有線網路的切換紀錄。
+
+knowva-mac 的有線網路很慢（約 0.85 MB/s，Wi-Fi 約 40 MB/s），所以實測期間暫時關閉、只用 Wi-Fi。結束後已恢復，服務順序、IP 與預設路由都和實測前相同。
+
+採用（2026-10-08）：預設改成 `dense-rerank-20`。
+
+- BM25 與 RRF 的程式拿掉，migration `0009_dense_retrieval.sql` 移除 `0004` 加的 token 欄位、GIN index、語料統計表與 trigger。`RERANK_CANDIDATE_TOP_K` 的預設從 50 改成 20。
+- `RETRIEVAL_MODE` 開關也一起拿掉，因為只剩 dense 一路。`RERANK_ENABLED=false` 保留，也就是 `dense-6`／`dense-8` 那種不 rerank 的設定，給記憶體優先的機器用。
+- 上面的工具和 §8.15 的 `eval.ts` 會直接跑 BM25 的 SQL，`run.sh` 也會設 `RETRIEVAL_MODE`，所以只能在 `0008` 之前的資料庫和映像上重跑：bench-results 裡的 dump，以及隔離實例的映像 `knowva:dense60-ctx8`。

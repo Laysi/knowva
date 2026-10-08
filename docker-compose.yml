@@ -26,9 +26,10 @@ services:
       GEMMA_4_MODEL_ID: ${GEMMA_4_MODEL_ID:-}
       NEMOTRON_EMBED_MODEL_ID: ${NEMOTRON_EMBED_MODEL_ID:-nvidia/llama-nemotron-embed-vl-1b-v2}
       NEMOTRON_RERANK_MODEL_ID: ${NEMOTRON_RERANK_MODEL_ID:-nvidia/llama-nemotron-rerank-vl-1b-v2}
-      RERANK_CANDIDATE_TOP_K: ${RERANK_CANDIDATE_TOP_K:-50}
+      RERANK_CANDIDATE_TOP_K: ${RERANK_CANDIDATE_TOP_K:-20}
       RERANK_TOP_N: ${RERANK_TOP_N:-6}
       RERANK_BATCH_SIZE: ${RERANK_BATCH_SIZE:-8}
+      RERANK_ENABLED: ${RERANK_ENABLED:-true}
       MODEL_CHAT_URL: ${MODEL_CHAT_URL:-}
       MODEL_EMBED_URL: ${MODEL_EMBED_URL:-}
       MODEL_RERANK_URL: ${MODEL_RERANK_URL:-}
@@ -37,6 +38,7 @@ services:
       DOCUMENT_CONVERSION_TIMEOUT_SECS: ${DOCUMENT_CONVERSION_TIMEOUT_SECS:-120}
       PDFIUM_LIBRARY_PATH: /usr/local/lib/libpdfium.so
       LIBREOFFICE_BIN: /usr/bin/libreoffice
+      KNOWVA_PROFILE: ${KNOWVA_PROFILE:-default}
     ports:
       - "${APP_PORT:-8080}:8080"
     volumes:

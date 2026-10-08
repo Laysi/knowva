@@ -15,7 +15,9 @@ pub const DEFAULT_EMBED_MODEL_ID: &str = "nvidia/llama-nemotron-embed-vl-1b-v2";
 pub const DEFAULT_RERANK_MODEL_ID: &str = "nvidia/llama-nemotron-rerank-vl-1b-v2";
 pub const EMBEDDING_DIMENSIONS: usize = 2048;
 pub const MAX_EMBED_IMAGE_BYTES: usize = 25 * 1024 * 1024;
-pub const DEFAULT_RERANK_CANDIDATE_TOP_K: usize = 50;
+/// Dense candidates reranked per question. Twenty was the smallest pool that
+/// matched the hybrid pipeline's source hits in the issue #60 replay.
+pub const DEFAULT_RERANK_CANDIDATE_TOP_K: usize = 20;
 pub const DEFAULT_RERANK_TOP_N: usize = 6;
 pub const DEFAULT_RERANK_BATCH_SIZE: usize = 8;
 pub const MIN_RERANK_TOP_N: usize = 3;
@@ -73,6 +75,7 @@ pub struct CloudModelConfig {
     embed_model: String,
     rerank_model: String,
     request_timeout: Duration,
+    rerank_enabled: bool,
     rerank_candidate_top_k: usize,
     rerank_top_n: usize,
     rerank_batch_size: usize,
@@ -89,6 +92,7 @@ impl fmt::Debug for CloudModelConfig {
             .field("embed_model", &self.embed_model)
             .field("rerank_model", &self.rerank_model)
             .field("request_timeout", &self.request_timeout)
+            .field("rerank_enabled", &self.rerank_enabled)
             .field("rerank_candidate_top_k", &self.rerank_candidate_top_k)
             .field("rerank_top_n", &self.rerank_top_n)
             .field("rerank_batch_size", &self.rerank_batch_size)
@@ -163,6 +167,15 @@ impl CloudModelConfig {
                 })?,
             None => DEFAULT_TIMEOUT_SECS,
         };
+        let rerank_enabled = match optional_value(&mut get, "RERANK_ENABLED").as_deref() {
+            None | Some("true") => true,
+            Some("false") => false,
+            Some(_) => {
+                return Err(CloudModelConfigError(
+                    "RERANK_ENABLED must be true or false".to_string(),
+                ));
+            }
+        };
         let rerank_candidate_top_k = positive_usize_setting(
             &mut get,
             "RERANK_CANDIDATE_TOP_K",
@@ -196,6 +209,7 @@ impl CloudModelConfig {
             embed_model,
             rerank_model,
             request_timeout: Duration::from_secs(timeout_secs),
+            rerank_enabled,
             rerank_candidate_top_k,
             rerank_top_n,
             rerank_batch_size,
@@ -228,6 +242,10 @@ impl CloudModelConfig {
 
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    pub fn rerank_enabled(&self) -> bool {
+        self.rerank_enabled
     }
 
     pub fn rerank_candidate_top_k(&self) -> usize {
@@ -779,6 +797,7 @@ pub struct CloudModelClient {
     embed_model: String,
     rerank_model: String,
     request_timeout: Duration,
+    rerank_enabled: bool,
     rerank_candidate_top_k: usize,
     rerank_top_n: usize,
     rerank_batch_size: usize,
@@ -807,6 +826,7 @@ impl CloudModelClient {
             embed_model: config.embed_model,
             rerank_model: config.rerank_model,
             request_timeout: config.request_timeout,
+            rerank_enabled: config.rerank_enabled,
             rerank_candidate_top_k: config.rerank_candidate_top_k,
             rerank_top_n: config.rerank_top_n,
             rerank_batch_size: config.rerank_batch_size,
@@ -831,6 +851,7 @@ impl CloudModelClient {
             embed_model: DEFAULT_EMBED_MODEL_ID.to_string(),
             rerank_model: DEFAULT_RERANK_MODEL_ID.to_string(),
             request_timeout: Duration::from_secs(1),
+            rerank_enabled: true,
             rerank_candidate_top_k: DEFAULT_RERANK_CANDIDATE_TOP_K,
             rerank_top_n: DEFAULT_RERANK_TOP_N,
             rerank_batch_size: DEFAULT_RERANK_BATCH_SIZE,
@@ -950,6 +971,10 @@ impl CloudModelClient {
 
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    pub fn rerank_enabled(&self) -> bool {
+        self.rerank_enabled
     }
 
     pub fn rerank_candidate_top_k(&self) -> usize {
@@ -2198,6 +2223,7 @@ mod tests {
             embed_model: DEFAULT_EMBED_MODEL_ID.to_owned(),
             rerank_model: DEFAULT_RERANK_MODEL_ID.to_owned(),
             request_timeout: Duration::from_secs(1),
+            rerank_enabled: true,
             rerank_candidate_top_k: DEFAULT_RERANK_CANDIDATE_TOP_K,
             rerank_top_n: DEFAULT_RERANK_TOP_N,
             rerank_batch_size: DEFAULT_RERANK_BATCH_SIZE,
@@ -2497,6 +2523,31 @@ mod tests {
         ])
         .expect_err("hosted batch limit must fail before startup");
         assert!(error.to_string().contains("RERANK_BATCH_SIZE"));
+    }
+
+    #[test]
+    fn config_defaults_to_reranked_retrieval_and_parses_the_rerank_switch() {
+        let base = [
+            ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
+            ("MODEL_BASE_URL", TEST_BASE_URL),
+        ];
+        for unset in [&[][..], &[("RERANK_ENABLED", " ")][..]] {
+            let config = config_from(&[&base[..], unset].concat()).expect("default retrieval");
+            assert!(config.rerank_enabled());
+            assert_eq!(config.rerank_candidate_top_k(), 20);
+        }
+
+        let config = config_from(&[&base[..], &[("RERANK_ENABLED", "false")]].concat())
+            .expect("dense retrieval without rerank");
+        assert!(!config.rerank_enabled());
+        let client = CloudModelClient::new(config).expect("cloud client");
+        assert!(!client.rerank_enabled());
+
+        for value in ["0", "no", "False"] {
+            let error = config_from(&[&base[..], &[("RERANK_ENABLED", value)]].concat())
+                .expect_err("unknown rerank switch must fail before startup");
+            assert!(error.to_string().contains("RERANK_ENABLED"));
+        }
     }
 
     #[tokio::test]
@@ -2817,9 +2868,6 @@ mod tests {
                 needs_vision: true,
                 dense_rank: Some(1),
                 dense_score: Some(0.9),
-                bm25_rank: None,
-                bm25_score: None,
-                rrf_score: 0.1,
                 rerank_score: Some(0.8),
                 rerank_rank: Some(1),
             },
@@ -2835,9 +2883,6 @@ mod tests {
                 needs_vision: false,
                 dense_rank: Some(2),
                 dense_score: Some(0.8),
-                bm25_rank: Some(1),
-                bm25_score: Some(2.0),
-                rrf_score: 0.09,
                 rerank_score: Some(0.7),
                 rerank_rank: Some(2),
             },

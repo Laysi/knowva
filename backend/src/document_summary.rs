@@ -232,9 +232,6 @@ fn summary_candidate(
         needs_vision,
         dense_rank: Some(unit_id as usize),
         dense_score: None,
-        bm25_rank: None,
-        bm25_score: None,
-        rrf_score: 0.0,
         rerank_score: None,
         rerank_rank: None,
     }

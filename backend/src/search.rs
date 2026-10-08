@@ -9,20 +9,10 @@ use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt, stream};
 use pgvector::HalfVector;
 use serde::Serialize;
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use uuid::Uuid;
-
-pub const DEFAULT_DENSE_TOP_K: usize = 50;
-pub const DEFAULT_BM25_TOP_K: usize = 50;
-pub const DEFAULT_FINAL_TOP_N: usize = 50;
-pub const RRF_K: f64 = 60.0;
-
-// Okapi BM25 defaults used by the database-side scoring expression.
-const BM25_K1: f64 = 1.2;
-const BM25_B: f64 = 0.75;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidateMetadata {
@@ -61,9 +51,6 @@ pub struct RetrievalCandidate {
     pub needs_vision: bool,
     pub dense_rank: Option<usize>,
     pub dense_score: Option<f64>,
-    pub bm25_rank: Option<usize>,
-    pub bm25_score: Option<f64>,
-    pub rrf_score: f64,
     pub rerank_score: Option<f64>,
     pub rerank_rank: Option<usize>,
 }
@@ -240,7 +227,7 @@ impl std::error::Error for RerankStageError {}
 pub enum CandidateRetrievalError {
     DenseModel(CloudModelError),
     Dense(anyhow::Error),
-    Bm25(anyhow::Error),
+    Catalog(anyhow::Error),
     Configuration(anyhow::Error),
 }
 
@@ -255,7 +242,7 @@ impl fmt::Display for CandidateRetrievalError {
         match self {
             Self::DenseModel(error) => write!(formatter, "dense model retrieval failed: {error}"),
             Self::Dense(error) => write!(formatter, "dense database retrieval failed: {error}"),
-            Self::Bm25(error) => write!(formatter, "BM25 database retrieval failed: {error}"),
+            Self::Catalog(error) => write!(formatter, "catalog database retrieval failed: {error}"),
             Self::Configuration(error) => {
                 write!(formatter, "retrieval configuration failed: {error}")
             }
@@ -324,49 +311,6 @@ impl RerankBackend for CloudModelClient {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetrievalConfig {
-    pub dense_top_k: usize,
-    pub bm25_top_k: usize,
-    pub final_top_n: usize,
-}
-
-impl RetrievalConfig {
-    pub fn new(dense_top_k: usize, bm25_top_k: usize, final_top_n: usize) -> anyhow::Result<Self> {
-        anyhow::ensure!(final_top_n > 0, "final_top_n must be greater than zero");
-        anyhow::ensure!(
-            dense_top_k >= final_top_n,
-            "dense_top_k ({dense_top_k}) must be at least final_top_n ({final_top_n})"
-        );
-        anyhow::ensure!(
-            bm25_top_k >= final_top_n,
-            "bm25_top_k ({bm25_top_k}) must be at least final_top_n ({final_top_n})"
-        );
-        Ok(Self {
-            dense_top_k,
-            bm25_top_k,
-            final_top_n,
-        })
-    }
-}
-
-impl Default for RetrievalConfig {
-    fn default() -> Self {
-        Self {
-            dense_top_k: DEFAULT_DENSE_TOP_K,
-            bm25_top_k: DEFAULT_BM25_TOP_K,
-            final_top_n: DEFAULT_FINAL_TOP_N,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RetrievalDebug {
-    pub dense: Vec<RankedCandidate>,
-    pub bm25: Vec<RankedCandidate>,
-    pub fused: Vec<RetrievalCandidate>,
-}
-
 #[derive(Debug, sqlx::FromRow)]
 struct CatalogDocumentRow {
     document_id: Uuid,
@@ -374,6 +318,19 @@ struct CatalogDocumentRow {
     summary: Option<String>,
     tags: Option<Vec<String>>,
     unit_id: Option<i64>,
+}
+
+/// The text a catalog answer sees for one document. Opening that citation
+/// (`GET /api/documents/{id}/units/{unitId}/catalog`) shows the same text.
+pub fn catalog_card(filename: &str, summary: Option<&str>, tags: Option<&[String]>) -> String {
+    let mut content = format!("文件名稱：{filename}");
+    if let Some(summary) = summary.filter(|value| !value.trim().is_empty()) {
+        content.push_str(&format!("\n摘要：{}", summary.trim()));
+    }
+    if let Some(tags) = tags.filter(|values| !values.is_empty()) {
+        content.push_str(&format!("\n標籤：{}", tags.join("、")));
+    }
+    content
 }
 
 /// Returns one compact, text-only source per ready document for catalog questions.
@@ -393,13 +350,7 @@ pub async fn catalog_candidates(pool: &sqlx::PgPool) -> anyhow::Result<Vec<Retri
         .into_iter()
         .enumerate()
         .map(|(index, row)| {
-            let mut content = format!("文件名稱：{}", row.filename);
-            if let Some(summary) = row.summary.filter(|value| !value.trim().is_empty()) {
-                content.push_str(&format!("\n摘要：{}", summary.trim()));
-            }
-            if let Some(tags) = row.tags.filter(|values| !values.is_empty()) {
-                content.push_str(&format!("\n標籤：{}", tags.join("、")));
-            }
+            let content = catalog_card(&row.filename, row.summary.as_deref(), row.tags.as_deref());
             let unit_id = row.unit_id.unwrap_or(0);
             RetrievalCandidate {
                 unit_id,
@@ -413,9 +364,6 @@ pub async fn catalog_candidates(pool: &sqlx::PgPool) -> anyhow::Result<Vec<Retri
                 needs_vision: false,
                 dense_rank: None,
                 dense_score: None,
-                bm25_rank: None,
-                bm25_score: None,
-                rrf_score: 0.0,
                 rerank_score: None,
                 rerank_rank: Some(index + 1),
             }
@@ -450,22 +398,14 @@ impl ObservedRetrievalStage {
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct ObservedModeRetrieval {
     pub dense: ObservedRetrievalStage,
-    pub bm25: ObservedRetrievalStage,
-    pub rrf: ObservedRetrievalStage,
     pub rerank: ObservedRetrievalStage,
     pub final_candidates: Vec<RetrievalCandidate>,
     pub failure: Option<ObservedRetrievalFailure>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObservedFailureStage {
-    Bm25,
-    Rerank,
-}
-
+/// A mode failure after the shared dense stage, which only rerank can cause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedRetrievalFailure {
-    pub stage: ObservedFailureStage,
     pub code: &'static str,
     pub safe_message: String,
     pub retryable: bool,
@@ -487,15 +427,9 @@ pub struct ObservedRerankOutcome {
     pub fallback: bool,
 }
 
-/// Injectable boundary around the two independently testable candidate stages.
+/// Injectable boundary around the dense candidate stage.
 pub trait CandidateRetrievalBackend: Send + Sync {
     fn dense_candidates<'a>(
-        &'a self,
-        query: &'a str,
-        top_k: usize,
-    ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>>;
-
-    fn bm25_candidates<'a>(
         &'a self,
         query: &'a str,
         top_k: usize,
@@ -557,18 +491,6 @@ impl CandidateRetrievalBackend for PostgresRetrievalBackend<'_> {
             dense_candidates_from_pool(&self.state.pool, &embedding, top_k)
                 .await
                 .map_err(CandidateRetrievalError::Dense)
-        })
-    }
-
-    fn bm25_candidates<'a>(
-        &'a self,
-        query: &'a str,
-        top_k: usize,
-    ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>> {
-        Box::pin(async move {
-            bm25_candidates_from_pool(&self.state.pool, query, top_k)
-                .await
-                .map_err(CandidateRetrievalError::Bm25)
         })
     }
 }
@@ -644,137 +566,14 @@ pub(crate) async fn dense_candidates_from_pool(
         .collect())
 }
 
-pub(crate) async fn bm25_candidates_from_pool(
-    pool: &sqlx::PgPool,
-    query: &str,
-    top_k: usize,
-) -> anyhow::Result<Vec<RankedCandidate>> {
-    let limit = i64::try_from(top_k)?;
-    let rows = sqlx::query_as::<_, CandidateRow>(
-        "WITH query_terms AS MATERIALIZED ( \
-           SELECT DISTINCT token AS term \
-           FROM unnest(knowva_bm25_tokenize($1)) AS token \
-           WHERE token <> '' \
-         ), query_token_array AS ( \
-           SELECT COALESCE(array_agg(term ORDER BY term), ARRAY[]::text[]) AS terms \
-           FROM query_terms \
-         ), candidate_units AS MATERIALIZED ( \
-           SELECT u.id AS unit_id, u.unit_index, u.document_id, u.kind, \
-                  u.page_number, u.image_path, u.content, u.needs_vision, u.bm25_tokens, \
-                  u.bm25_length \
-           FROM document_units AS u \
-           CROSS JOIN query_token_array AS query \
-           WHERE u.retrieval_ready \
-             AND u.content IS NOT NULL \
-             AND btrim(u.content) <> '' \
-             AND u.bm25_tokens && query.terms \
-         ), scored AS ( \
-           SELECT candidate.unit_id, candidate.unit_index, candidate.document_id, document.filename, \
-                  candidate.kind, candidate.page_number, candidate.image_path, \
-                  candidate.content, candidate.needs_vision, \
-                  sum( \
-                    ln(1.0 + ( \
-                      (greatest(corpus.document_count - term_stats.document_frequency, 0)::double precision + 0.5) \
-                      / (term_stats.document_frequency::double precision + 0.5) \
-                    )) \
-                    * ((frequency.tf * ($3::double precision + 1.0)) \
-                      / (frequency.tf + $3::double precision * ( \
-                        1.0 - $4::double precision \
-                        + $4::double precision * candidate.bm25_length::double precision \
-                          / greatest( \
-                              corpus.total_length::double precision \
-                                / corpus.document_count::double precision, \
-                              1.0 \
-                            ) \
-                      ))) \
-                  )::double precision AS score \
-           FROM candidate_units AS candidate \
-           JOIN documents AS document ON document.id = candidate.document_id \
-           CROSS JOIN knowva_bm25_corpus_stats AS corpus \
-           JOIN query_terms AS query ON query.term = ANY(candidate.bm25_tokens) \
-           JOIN knowva_bm25_term_stats AS term_stats ON term_stats.term = query.term \
-           CROSS JOIN LATERAL ( \
-             SELECT cardinality(array_positions(candidate.bm25_tokens, query.term))::double precision AS tf \
-           ) AS frequency \
-           WHERE corpus.singleton \
-             AND document.status = 'ready' \
-             AND corpus.document_count > 0 \
-             AND frequency.tf > 0 \
-           GROUP BY candidate.unit_id, candidate.unit_index, candidate.document_id, document.filename, \
-                    candidate.kind, candidate.page_number, candidate.image_path, \
-                    candidate.content, candidate.needs_vision \
-         ) \
-         SELECT unit_id, unit_index, document_id, filename, kind, page_number, image_path, content, \
-                needs_vision, score \
-         FROM scored \
-         ORDER BY score DESC, unit_id \
-         LIMIT $2",
-    )
-    .bind(query)
-    .bind(limit)
-    .bind(BM25_K1)
-    .bind(BM25_B)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .enumerate()
-        .map(|(index, row)| row.into_ranked(index + 1))
-        .collect())
-}
-
-/// Runs dense and lexical retrieval once each, then performs one deterministic fusion.
-pub async fn retrieve_with_backend<B: CandidateRetrievalBackend + ?Sized>(
-    backend: &B,
-    query: &str,
-    config: RetrievalConfig,
-) -> anyhow::Result<RetrievalDebug> {
-    // Validate externally constructed configs too, not only values made via new().
-    let config = RetrievalConfig::new(config.dense_top_k, config.bm25_top_k, config.final_top_n)?;
-    let dense = async {
-        let started = Instant::now();
-        let candidates = backend.dense_candidates(query, config.dense_top_k).await?;
-        tracing::info!(
-            stage = "dense",
-            candidate_count = candidates.len(),
-            latency_ms = started.elapsed().as_millis() as u64,
-            "retrieval stage completed"
-        );
-        Ok::<_, anyhow::Error>(candidates)
-    };
-    let bm25 = async {
-        let started = Instant::now();
-        let candidates = backend.bm25_candidates(query, config.bm25_top_k).await?;
-        tracing::info!(
-            stage = "bm25",
-            candidate_count = candidates.len(),
-            latency_ms = started.elapsed().as_millis() as u64,
-            "retrieval stage completed"
-        );
-        Ok::<_, anyhow::Error>(candidates)
-    };
-    let (dense, bm25) = tokio::try_join!(dense, bm25)?;
-    let fusion_started = Instant::now();
-    let fused = reciprocal_rank_fusion(&dense, &bm25, config.final_top_n);
-    tracing::info!(
-        stage = "rrf",
-        dense_candidate_count = dense.len(),
-        bm25_candidate_count = bm25.len(),
-        candidate_count = fused.len(),
-        latency_ms = fusion_started.elapsed().as_millis() as u64,
-        "retrieval stage completed"
-    );
-    Ok(RetrievalDebug { dense, bm25, fused })
-}
-
 /// Evaluates the control and treatment retrieval paths over one shared dense call.
 ///
-/// Mode A is strictly dense-only. Its lexical, fusion, and rerank observations are
-/// empty and report zero requests. Mode B reuses the exact dense candidate values,
-/// calls BM25 once, performs deterministic RRF, and invokes only the locked rerank
-/// backend. The reused B dense observation has `request_count = 0`, so summing the
-/// two mode observations still represents the one physical dense backend call.
+/// Mode A is strictly dense-only: its context is the dense prefix and its
+/// rerank observation is empty with zero requests. Mode B reuses the exact
+/// dense candidate values and reranks them with the locked rerank backend,
+/// which is the production path. The reused B dense observation has
+/// `request_count = 0`, so summing the two mode observations still represents
+/// the one physical dense backend call.
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn retrieve_ab_with_backends<
     C: CandidateRetrievalBackend + ?Sized,
@@ -784,15 +583,8 @@ pub async fn retrieve_ab_with_backends<
     rerank_backend: &R,
     query: &str,
     storage: &Storage,
-    retrieval_config: RetrievalConfig,
     rerank_config: RerankConfig,
 ) -> Result<ObservedAbRetrieval, RetrieveError> {
-    let retrieval_config = RetrievalConfig::new(
-        retrieval_config.dense_top_k,
-        retrieval_config.bm25_top_k,
-        retrieval_config.final_top_n,
-    )
-    .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Configuration(error)))?;
     let rerank_config = RerankConfig::new(
         rerank_config.candidate_top_k,
         rerank_config.top_n,
@@ -802,11 +594,11 @@ pub async fn retrieve_ab_with_backends<
 
     let dense_started = Instant::now();
     let dense = candidate_backend
-        .dense_candidates(query, retrieval_config.dense_top_k)
+        .dense_candidates(query, rerank_config.candidate_top_k)
         .await
         .map_err(RetrieveError::Candidates)?;
     let dense_latency_ms = dense_started.elapsed().as_millis() as u64;
-    let dense_candidates = ranked_route_candidates(&dense, true);
+    let dense_candidates = dense_route_candidates(&dense);
     let mode_a_final = dense_candidates
         .iter()
         .take(rerank_config.top_n)
@@ -828,95 +620,45 @@ pub async fn retrieve_ab_with_backends<
     };
     let mode_a = ObservedModeRetrieval {
         dense: mode_a_dense,
-        bm25: ObservedRetrievalStage::empty(),
-        rrf: ObservedRetrievalStage::empty(),
         rerank: ObservedRetrievalStage::empty(),
         final_candidates: mode_a_final,
         failure: None,
     };
 
-    let bm25_started = Instant::now();
-    let bm25 = match candidate_backend
-        .bm25_candidates(query, retrieval_config.bm25_top_k)
-        .await
+    let rerank_started = Instant::now();
+    let counted_reranker = CountingRerankBackend::new(rerank_backend);
+    let reranked = match rerank_candidates_observed(
+        &counted_reranker,
+        query,
+        &mode_b_dense.candidates,
+        storage,
+        rerank_config,
+    )
+    .await
     {
-        Ok(candidates) => candidates,
-        Err(_) => {
+        Ok(reranked) => reranked,
+        Err(error) => {
             return Ok(ObservedAbRetrieval {
                 mode_a,
                 mode_b: ObservedModeRetrieval {
                     dense: mode_b_dense,
-                    bm25: ObservedRetrievalStage {
+                    rerank: ObservedRetrievalStage {
                         candidates: Vec::new(),
-                        latency_ms: bm25_started.elapsed().as_millis() as u64,
-                        request_count: 1,
+                        latency_ms: rerank_started.elapsed().as_millis() as u64,
+                        request_count: counted_reranker.request_count(),
                         reused: false,
                         fallback: false,
                     },
-                    rrf: ObservedRetrievalStage::empty(),
-                    rerank: ObservedRetrievalStage::empty(),
                     final_candidates: Vec::new(),
                     failure: Some(ObservedRetrievalFailure {
-                        stage: ObservedFailureStage::Bm25,
-                        code: "bm25_failed",
-                        safe_message: "知識庫詞彙檢索暫時無法使用（錯誤代碼：bm25_retrieval）"
-                            .to_owned(),
-                        retryable: false,
+                        code: "rerank_failed",
+                        safe_message: error.client_message(),
+                        retryable: error.is_transient(),
                     }),
                 },
             });
         }
     };
-    let mode_b_bm25 = ObservedRetrievalStage {
-        candidates: ranked_route_candidates(&bm25, false),
-        latency_ms: bm25_started.elapsed().as_millis() as u64,
-        request_count: 1,
-        reused: false,
-        fallback: false,
-    };
-
-    let rrf_started = Instant::now();
-    let fused = reciprocal_rank_fusion(&dense, &bm25, retrieval_config.final_top_n);
-    let mode_b_rrf = ObservedRetrievalStage {
-        candidates: fused.clone(),
-        latency_ms: rrf_started.elapsed().as_millis() as u64,
-        request_count: 0,
-        reused: false,
-        fallback: false,
-    };
-
-    let rerank_started = Instant::now();
-    let counted_reranker = CountingRerankBackend::new(rerank_backend);
-    let reranked =
-        match rerank_candidates_observed(&counted_reranker, query, &fused, storage, rerank_config)
-            .await
-        {
-            Ok(reranked) => reranked,
-            Err(error) => {
-                return Ok(ObservedAbRetrieval {
-                    mode_a,
-                    mode_b: ObservedModeRetrieval {
-                        dense: mode_b_dense,
-                        bm25: mode_b_bm25,
-                        rrf: mode_b_rrf,
-                        rerank: ObservedRetrievalStage {
-                            candidates: Vec::new(),
-                            latency_ms: rerank_started.elapsed().as_millis() as u64,
-                            request_count: counted_reranker.request_count(),
-                            reused: false,
-                            fallback: false,
-                        },
-                        final_candidates: Vec::new(),
-                        failure: Some(ObservedRetrievalFailure {
-                            stage: ObservedFailureStage::Rerank,
-                            code: "rerank_failed",
-                            safe_message: error.client_message(),
-                            retryable: error.is_transient(),
-                        }),
-                    },
-                });
-            }
-        };
     let mode_b_rerank = ObservedRetrievalStage {
         candidates: reranked.candidates.clone(),
         latency_ms: rerank_started.elapsed().as_millis() as u64,
@@ -929,8 +671,6 @@ pub async fn retrieve_ab_with_backends<
         mode_a,
         mode_b: ObservedModeRetrieval {
             dense: mode_b_dense,
-            bm25: mode_b_bm25,
-            rrf: mode_b_rrf,
             rerank: mode_b_rerank,
             final_candidates: reranked.candidates,
             failure: None,
@@ -946,75 +686,83 @@ pub async fn retrieve_ab_observed(
     state: &AppState,
     query: &str,
 ) -> Result<ObservedAbRetrieval, RetrieveError> {
-    let rerank_config = RerankConfig::from_client(&state.models);
-    let route_top_k = DEFAULT_DENSE_TOP_K.max(rerank_config.candidate_top_k);
-    let retrieval_config = RetrievalConfig::new(
-        route_top_k,
-        DEFAULT_BM25_TOP_K.max(rerank_config.candidate_top_k),
-        rerank_config.candidate_top_k,
-    )
-    .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Configuration(error)))?;
     let backend = PostgresRetrievalBackend { state };
     retrieve_ab_with_backends(
         &backend,
         &state.models,
         query,
         &state.storage,
-        retrieval_config,
-        rerank_config,
+        RerankConfig::from_client(&state.models),
     )
     .await
 }
 
-/// Retrieves a stable RRF pool, reranks it with the locked VL model, and
-/// returns the configured top 3-8 candidates. Exhausted transient model
-/// failures fall back to the unchanged RRF prefix; contract/artifact failures
-/// remain diagnostic errors.
+/// Retrieves the dense candidate pool and returns its top 3-8 candidates,
+/// reranked with the locked VL model unless rerank is disabled.
 pub async fn retrieve(
     state: &AppState,
     query: &str,
 ) -> Result<Vec<RetrievalCandidate>, RetrieveError> {
-    let rerank_config = RerankConfig::from_client(&state.models);
-    let route_top_k = DEFAULT_DENSE_TOP_K.max(rerank_config.candidate_top_k);
-    let retrieval_config = RetrievalConfig::new(
-        route_top_k,
-        DEFAULT_BM25_TOP_K.max(rerank_config.candidate_top_k),
-        rerank_config.candidate_top_k,
-    )
-    .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Configuration(error)))?;
-    let debug = retrieve_debug(state, query, retrieval_config)
-        .await
-        .map_err(|error| RetrieveError::Candidates(CandidateRetrievalError::Dense(error)))?;
-    rerank_candidates(
+    let backend = PostgresRetrievalBackend { state };
+    retrieve_with_backends(
+        &backend,
         &state.models,
         query,
-        &debug.fused,
         &state.storage,
-        rerank_config,
+        state.models.rerank_enabled(),
+        RerankConfig::from_client(&state.models),
     )
     .await
-    .map_err(RetrieveError::Rerank)
 }
 
-/// Runs the production PostgreSQL stages while retaining both route rankings
-/// for diagnostics and evaluation fixtures.
-pub async fn retrieve_debug(
-    state: &AppState,
+/// With rerank the dense pool is the first `candidate_top_k` units; without it
+/// only the first `top_n` are fetched and returned in dense order. Exhausted
+/// transient rerank failures fall back to the unchanged dense prefix;
+/// contract/artifact failures remain diagnostic errors.
+async fn retrieve_with_backends<
+    C: CandidateRetrievalBackend + ?Sized,
+    R: RerankBackend + ?Sized,
+>(
+    candidate_backend: &C,
+    rerank_backend: &R,
     query: &str,
-    config: RetrievalConfig,
-) -> anyhow::Result<RetrievalDebug> {
-    let backend = PostgresRetrievalBackend { state };
-    retrieve_with_backend(&backend, query, config).await
+    storage: &Storage,
+    rerank: bool,
+    rerank_config: RerankConfig,
+) -> Result<Vec<RetrievalCandidate>, RetrieveError> {
+    let pool_size = if rerank {
+        rerank_config.candidate_top_k
+    } else {
+        rerank_config.top_n
+    };
+    let started = Instant::now();
+    let dense = candidate_backend
+        .dense_candidates(query, pool_size)
+        .await
+        .map_err(RetrieveError::Candidates)?;
+    tracing::info!(
+        stage = "dense",
+        candidate_count = dense.len(),
+        latency_ms = started.elapsed().as_millis() as u64,
+        "retrieval stage completed"
+    );
+    let pool = dense_route_candidates(&dense);
+    if !rerank {
+        return Ok(pool.into_iter().take(rerank_config.top_n).collect());
+    }
+    rerank_candidates(rerank_backend, query, &pool, storage, rerank_config)
+        .await
+        .map_err(RetrieveError::Rerank)
 }
 
 pub async fn rerank_candidates<B: RerankBackend + ?Sized>(
     backend: &B,
     query: &str,
-    rrf_candidates: &[RetrievalCandidate],
+    pool: &[RetrievalCandidate],
     storage: &Storage,
     config: RerankConfig,
 ) -> Result<Vec<RetrievalCandidate>, RerankStageError> {
-    rerank_candidates_observed(backend, query, rrf_candidates, storage, config)
+    rerank_candidates_observed(backend, query, pool, storage, config)
         .await
         .map(|outcome| outcome.candidates)
 }
@@ -1022,13 +770,13 @@ pub async fn rerank_candidates<B: RerankBackend + ?Sized>(
 pub async fn rerank_candidates_observed<B: RerankBackend + ?Sized>(
     backend: &B,
     query: &str,
-    rrf_candidates: &[RetrievalCandidate],
+    pool: &[RetrievalCandidate],
     storage: &Storage,
     config: RerankConfig,
 ) -> Result<ObservedRerankOutcome, RerankStageError> {
     let started = Instant::now();
-    let candidate_count = rrf_candidates.len().min(config.candidate_top_k);
-    let result = rerank_candidates_inner(backend, query, rrf_candidates, storage, config).await;
+    let candidate_count = pool.len().min(config.candidate_top_k);
+    let result = rerank_candidates_inner(backend, query, pool, storage, config).await;
     if let Err(error) = &result {
         tracing::error!(
             stage = "rerank",
@@ -1048,13 +796,13 @@ pub async fn rerank_candidates_observed<B: RerankBackend + ?Sized>(
 async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
     backend: &B,
     query: &str,
-    rrf_candidates: &[RetrievalCandidate],
+    pool: &[RetrievalCandidate],
     storage: &Storage,
     config: RerankConfig,
 ) -> Result<ObservedRerankOutcome, RerankStageError> {
     let config = RerankConfig::new(config.candidate_top_k, config.top_n, config.batch_size)
         .map_err(|error| RerankStageError::Mapping(error.to_string()))?;
-    let candidates = &rrf_candidates[..rrf_candidates.len().min(config.candidate_top_k)];
+    let candidates = &pool[..pool.len().min(config.candidate_top_k)];
     if candidates.is_empty() {
         tracing::info!(
             stage = "rerank",
@@ -1106,9 +854,9 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
                         model_id = backend.model_id(),
                         error_kind = stage_error.safe_kind(),
                         http_status = ?stage_error.http_status(),
-                        "rerank transient failure exhausted retries; using stable RRF fallback"
+                        "rerank transient failure exhausted retries; using the dense order"
                     );
-                    let fallback = rrf_fallback(candidates, config.top_n);
+                    let fallback = dense_fallback(candidates, config.top_n);
                     tracing::info!(
                         stage = "rerank",
                         candidate_count = candidates.len(),
@@ -1166,17 +914,17 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
         .iter()
         .cloned()
         .enumerate()
-        .map(|(rrf_index, mut candidate)| {
-            candidate.rerank_score = scores[rrf_index];
-            (rrf_index, candidate)
+        .map(|(pool_index, mut candidate)| {
+            candidate.rerank_score = scores[pool_index];
+            (pool_index, candidate)
         })
         .collect::<Vec<_>>();
-    reranked.sort_by(|(left_rrf_index, left), (right_rrf_index, right)| {
+    reranked.sort_by(|(left_pool_index, left), (right_pool_index, right)| {
         right
             .rerank_score
             .expect("all rerank scores were validated")
             .total_cmp(&left.rerank_score.expect("all rerank scores were validated"))
-            .then_with(|| left_rrf_index.cmp(right_rrf_index))
+            .then_with(|| left_pool_index.cmp(right_pool_index))
     });
     let mut reranked = reranked
         .into_iter()
@@ -1208,7 +956,7 @@ async fn rerank_candidates_inner<B: RerankBackend + ?Sized>(
 }
 
 /// Splits candidates into batches of one modality, each listing candidate
-/// indices in RRF order. A rerank request is processed as a single modality,
+/// indices in pool order. A rerank request is processed as a single modality,
 /// so mixing would make text passages pay the image cost and let their scores
 /// depend on batch-mates. Groups follow the order of their first candidate, so
 /// a single-modality list batches exactly as plain chunking would.
@@ -1338,8 +1086,7 @@ async fn prepare_rerank_passage(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn ranked_route_candidates(candidates: &[RankedCandidate], dense: bool) -> Vec<RetrievalCandidate> {
+fn dense_route_candidates(candidates: &[RankedCandidate]) -> Vec<RetrievalCandidate> {
     candidates
         .iter()
         .map(|ranked| RetrievalCandidate {
@@ -1352,18 +1099,15 @@ fn ranked_route_candidates(candidates: &[RankedCandidate], dense: bool) -> Vec<R
             image_path: ranked.metadata.image_path.clone(),
             content: ranked.metadata.content.clone(),
             needs_vision: ranked.metadata.needs_vision,
-            dense_rank: dense.then_some(ranked.rank),
-            dense_score: dense.then_some(ranked.score),
-            bm25_rank: (!dense).then_some(ranked.rank),
-            bm25_score: (!dense).then_some(ranked.score),
-            rrf_score: 0.0,
+            dense_rank: Some(ranked.rank),
+            dense_score: Some(ranked.score),
             rerank_score: None,
             rerank_rank: None,
         })
         .collect()
 }
 
-fn rrf_fallback(candidates: &[RetrievalCandidate], top_n: usize) -> Vec<RetrievalCandidate> {
+fn dense_fallback(candidates: &[RetrievalCandidate], top_n: usize) -> Vec<RetrievalCandidate> {
     candidates
         .iter()
         .take(top_n)
@@ -1374,106 +1118,6 @@ fn rrf_fallback(candidates: &[RetrievalCandidate], top_n: usize) -> Vec<Retrieva
             candidate
         })
         .collect()
-}
-
-/// Reciprocal Rank Fusion: score(d) = sum(1 / (60 + rank_i(d))).
-///
-/// A unit contributes at most once per ranking. Equal fused scores are ordered
-/// by best contributing rank and finally unit_id, making fixtures/UI stable.
-pub fn reciprocal_rank_fusion(
-    dense: &[RankedCandidate],
-    bm25: &[RankedCandidate],
-    final_top_n: usize,
-) -> Vec<RetrievalCandidate> {
-    #[derive(Debug)]
-    struct Accumulator {
-        candidate: RetrievalCandidate,
-    }
-
-    fn add_ranking(
-        accumulators: &mut HashMap<i64, Accumulator>,
-        ranking: &[RankedCandidate],
-        dense: bool,
-    ) {
-        let mut best_by_unit: HashMap<i64, &RankedCandidate> = HashMap::new();
-        for ranked in ranking {
-            if ranked.rank == 0 {
-                continue;
-            }
-            best_by_unit
-                .entry(ranked.metadata.unit_id)
-                .and_modify(|current| {
-                    if ranked.rank < current.rank
-                        || (ranked.rank == current.rank
-                            && ranked.score.total_cmp(&current.score).is_gt())
-                    {
-                        *current = ranked;
-                    }
-                })
-                .or_insert(ranked);
-        }
-
-        for ranked in best_by_unit.into_values() {
-            let accumulator = accumulators
-                .entry(ranked.metadata.unit_id)
-                .or_insert_with(|| Accumulator {
-                    candidate: RetrievalCandidate {
-                        unit_id: ranked.metadata.unit_id,
-                        unit_index: ranked.metadata.unit_index,
-                        document_id: ranked.metadata.document_id,
-                        filename: ranked.metadata.filename.clone(),
-                        kind: ranked.metadata.kind.clone(),
-                        page_number: ranked.metadata.page_number,
-                        image_path: ranked.metadata.image_path.clone(),
-                        content: ranked.metadata.content.clone(),
-                        needs_vision: ranked.metadata.needs_vision,
-                        dense_rank: None,
-                        dense_score: None,
-                        bm25_rank: None,
-                        bm25_score: None,
-                        rrf_score: 0.0,
-                        rerank_score: None,
-                        rerank_rank: None,
-                    },
-                });
-
-            accumulator.candidate.rrf_score += 1.0 / (RRF_K + ranked.rank as f64);
-            if dense {
-                accumulator.candidate.dense_rank = Some(ranked.rank);
-                accumulator.candidate.dense_score = Some(ranked.score);
-            } else {
-                accumulator.candidate.bm25_rank = Some(ranked.rank);
-                accumulator.candidate.bm25_score = Some(ranked.score);
-            }
-        }
-    }
-
-    let mut accumulators = HashMap::new();
-    add_ranking(&mut accumulators, dense, true);
-    add_ranking(&mut accumulators, bm25, false);
-
-    let mut fused: Vec<_> = accumulators
-        .into_values()
-        .map(|accumulator| accumulator.candidate)
-        .collect();
-    fused.sort_by(|left, right| {
-        right
-            .rrf_score
-            .total_cmp(&left.rrf_score)
-            .then_with(|| best_rank(left).cmp(&best_rank(right)))
-            .then_with(|| left.unit_id.cmp(&right.unit_id))
-    });
-    fused.truncate(final_top_n);
-    fused
-}
-
-fn best_rank(candidate: &RetrievalCandidate) -> usize {
-    candidate
-        .dense_rank
-        .into_iter()
-        .chain(candidate.bm25_rank)
-        .min()
-        .unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
@@ -1531,9 +1175,6 @@ mod tests {
             needs_vision: kind == "page",
             dense_rank: Some(unit_id as usize),
             dense_score: Some(1.0 / unit_id as f64),
-            bm25_rank: None,
-            bm25_score: None,
-            rrf_score: 1.0 / (RRF_K + unit_id as f64),
             rerank_score: None,
             rerank_rank: None,
         }
@@ -1585,80 +1226,29 @@ mod tests {
     }
 
     #[test]
-    fn dense_only_and_bm25_only_keep_rank_and_scores() {
-        let dense = reciprocal_rank_fusion(&[ranked(10, 1, 0.9), ranked(20, 2, 0.8)], &[], 10);
+    fn dense_route_keeps_rank_score_and_metadata() {
+        let candidates = dense_route_candidates(&[ranked(10, 1, 0.9), ranked(20, 2, 0.8)]);
         assert_eq!(
-            dense
+            candidates
                 .iter()
-                .map(|candidate| candidate.unit_id)
+                .map(|candidate| (
+                    candidate.unit_id,
+                    candidate.dense_rank,
+                    candidate.dense_score
+                ))
                 .collect::<Vec<_>>(),
-            vec![10, 20]
+            vec![(10, Some(1), Some(0.9)), (20, Some(2), Some(0.8))]
         );
-        assert_eq!(dense[0].dense_rank, Some(1));
-        assert_eq!(dense[0].dense_score, Some(0.9));
-        assert_eq!(dense[0].bm25_rank, None);
-
-        let bm25 = reciprocal_rank_fusion(&[], &[ranked(30, 1, 4.2), ranked(40, 2, 3.1)], 10);
-        assert_eq!(
-            bm25.iter()
-                .map(|candidate| candidate.unit_id)
-                .collect::<Vec<_>>(),
-            vec![30, 40]
-        );
-        assert_eq!(bm25[0].bm25_rank, Some(1));
-        assert_eq!(bm25[0].bm25_score, Some(4.2));
-        assert_eq!(bm25[0].dense_rank, None);
-    }
-
-    #[test]
-    fn overlap_is_deduplicated_and_outranks_single_route_candidates() {
-        let fused = reciprocal_rank_fusion(
-            &[ranked(1, 1, 0.99), ranked(2, 2, 0.8)],
-            &[ranked(3, 1, 6.0), ranked(1, 2, 5.0)],
-            10,
-        );
-        assert_eq!(
-            fused
-                .iter()
-                .map(|candidate| candidate.unit_id)
-                .collect::<Vec<_>>(),
-            vec![1, 3, 2]
-        );
-        assert_eq!(fused[0].dense_rank, Some(1));
-        assert_eq!(fused[0].bm25_rank, Some(2));
-        assert!((fused[0].rrf_score - (1.0 / 61.0 + 1.0 / 62.0)).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn disjoint_equal_scores_use_stable_unit_id_tie_breaker() {
-        let dense = vec![ranked(20, 1, 0.9), ranked(40, 2, 0.8)];
-        let bm25 = vec![ranked(10, 1, 5.0), ranked(30, 2, 4.0)];
-        let expected = vec![10, 20, 30, 40];
-        for _ in 0..100 {
-            let fused = reciprocal_rank_fusion(&dense, &bm25, 10);
-            assert_eq!(
-                fused
-                    .iter()
-                    .map(|candidate| candidate.unit_id)
-                    .collect::<Vec<_>>(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn duplicate_unit_in_one_route_contributes_only_at_best_occurrence() {
-        let fused = reciprocal_rank_fusion(&[ranked(1, 2, 0.8), ranked(1, 1, 0.9)], &[], 10);
-        assert_eq!(fused.len(), 1);
-        assert_eq!(fused[0].dense_rank, Some(1));
-        assert_eq!(fused[0].rrf_score, 1.0 / 61.0);
+        assert_eq!(candidates[0].filename, "document-10.pdf");
+        assert_eq!(candidates[0].page_number, Some(10));
+        assert!(candidates[0].needs_vision);
     }
 
     #[test]
     fn serialized_candidate_keeps_complete_nullable_contract() {
-        let fused = reciprocal_rank_fusion(&[ranked(1, 1, 0.9)], &[], 10);
-        let value = serde_json::to_value(&fused[0]).expect("serialize candidate");
-        for field in [
+        let candidates = dense_route_candidates(&[ranked(1, 1, 0.9)]);
+        let value = serde_json::to_value(&candidates[0]).expect("serialize candidate");
+        let fields = [
             "unitId",
             "unitIndex",
             "documentId",
@@ -1670,27 +1260,26 @@ mod tests {
             "needsVision",
             "denseRank",
             "denseScore",
-            "bm25Rank",
-            "bm25Score",
-            "rrfScore",
             "rerankScore",
             "rerankRank",
-        ] {
+        ];
+        assert_eq!(
+            value.as_object().expect("candidate object").len(),
+            fields.len()
+        );
+        for field in fields {
             assert!(
                 value.get(field).is_some(),
                 "missing candidate field {field}"
             );
         }
-        assert!(value["bm25Rank"].is_null());
-        assert!(value["bm25Score"].is_null());
         assert!(value["rerankScore"].is_null());
         assert!(value["rerankRank"].is_null());
     }
 
     #[test]
-    fn config_rejects_route_limits_below_final_top_n() {
-        assert!(RetrievalConfig::new(7, 8, 8).is_err());
-        assert!(RetrievalConfig::new(8, 7, 8).is_err());
+    fn rerank_config_rejects_a_pool_below_top_n_and_oversized_batches() {
+        assert!(RerankConfig::new(5, 6, 8).is_err());
         assert!(
             RerankConfig::new(
                 crate::cloud_models::MAX_RERANK_BATCH_SIZE + 1,
@@ -1699,10 +1288,7 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(
-            RetrievalConfig::default(),
-            RetrievalConfig::new(50, 50, 50).expect("valid defaults")
-        );
+        assert!(RerankConfig::new(6, 6, 8).is_ok());
     }
 
     fn text_only_page(unit_id: i64, image_path: String, content: &str) -> RetrievalCandidate {
@@ -1821,7 +1407,7 @@ mod tests {
                 candidates.push(text_only_page(unit_id, image_path, &content));
             }
         }
-        // RRF order is [1 vision, 2 text, 3 vision, 4 text]; batches are [1, 3]
+        // Pool order is [1 vision, 2 text, 3 vision, 4 text]; batches are [1, 3]
         // then [2, 4]. Batch-local index 0 of the second batch is unit 2.
         let responses = vec![
             Ok(RerankResponse {
@@ -1901,7 +1487,7 @@ mod tests {
             retrieval_candidate(2, "page", None, Some("text")),
             retrieval_candidate(3, "text", None, Some("chunk")),
         ];
-        // Groups follow the RRF position of their first member.
+        // Groups follow the pool position of their first member.
         assert_eq!(modality_batches(&mixed, 8), vec![vec![0, 2], vec![1]]);
     }
 
@@ -2001,7 +1587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn equal_rerank_scores_keep_the_original_rrf_order() {
+    async fn equal_rerank_scores_keep_the_original_dense_order() {
         let candidates = (1..=4)
             .map(|unit_id| retrieval_candidate(unit_id, "text", None, Some("chunk")))
             .collect::<Vec<_>>();
@@ -2096,7 +1682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_transient_error_uses_exact_rrf_prefix_without_fake_scores() {
+    async fn exhausted_transient_error_uses_exact_dense_prefix_without_fake_scores() {
         let candidates = (1..=6)
             .map(|unit_id| retrieval_candidate(unit_id, "text", None, Some("chunk")))
             .collect::<Vec<_>>();
@@ -2307,8 +1893,20 @@ mod tests {
     #[derive(Debug)]
     struct FakeBackend {
         dense: Vec<RankedCandidate>,
-        bm25: Vec<RankedCandidate>,
-        calls: Mutex<Vec<(&'static str, usize)>>,
+        calls: Mutex<Vec<usize>>,
+    }
+
+    impl FakeBackend {
+        fn new(dense: Vec<RankedCandidate>) -> Self {
+            Self {
+                dense,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<usize> {
+            self.calls.lock().expect("calls lock").clone()
+        }
     }
 
     impl CandidateRetrievalBackend for FakeBackend {
@@ -2318,22 +1916,8 @@ mod tests {
             top_k: usize,
         ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>> {
             Box::pin(async move {
-                self.calls
-                    .lock()
-                    .expect("calls lock")
-                    .push(("dense", top_k));
-                Ok(self.dense.clone())
-            })
-        }
-
-        fn bm25_candidates<'a>(
-            &'a self,
-            _query: &'a str,
-            top_k: usize,
-        ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>> {
-            Box::pin(async move {
-                self.calls.lock().expect("calls lock").push(("bm25", top_k));
-                Ok(self.bm25.clone())
+                self.calls.lock().expect("calls lock").push(top_k);
+                Ok(self.dense.iter().take(top_k).cloned().collect())
             })
         }
     }
@@ -2355,14 +1939,6 @@ mod tests {
                 ))
             })
         }
-
-        fn bm25_candidates<'a>(
-            &'a self,
-            _query: &'a str,
-            _top_k: usize,
-        ) -> BoxFuture<'a, Result<Vec<RankedCandidate>, CandidateRetrievalError>> {
-            Box::pin(async { panic!("BM25 must not run after dense retrieval fails") })
-        }
     }
 
     #[tokio::test]
@@ -2372,7 +1948,6 @@ mod tests {
             &FakeReranker::new(Vec::new()),
             "fixture query",
             &Storage::memory(),
-            RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
             RerankConfig::new(3, 3, 8).expect("rerank config"),
         )
         .await
@@ -2393,7 +1968,7 @@ mod tests {
             RetrieveError::Candidates(CandidateRetrievalError::Dense(anyhow::anyhow!(
                 "database unavailable"
             ))),
-            RetrieveError::Candidates(CandidateRetrievalError::Bm25(anyhow::anyhow!(
+            RetrieveError::Candidates(CandidateRetrievalError::Catalog(anyhow::anyhow!(
                 "database unavailable"
             ))),
             RetrieveError::Candidates(CandidateRetrievalError::DenseModel(
@@ -2407,31 +1982,89 @@ mod tests {
         assert!(errors.iter().all(|error| !error.is_retryable()));
     }
 
+    fn dense_text_pool(count: i64) -> FakeBackend {
+        FakeBackend::new(
+            (1..=count)
+                .map(|id| text_ranked(id, id as usize, 1.0 - id as f64 / 100.0))
+                .collect(),
+        )
+    }
+
     #[tokio::test]
-    async fn injected_routes_are_each_called_once_and_debug_keeps_rankings() {
-        let backend = FakeBackend {
-            dense: vec![ranked(1, 1, 0.9)],
-            bm25: vec![ranked(2, 1, 3.0)],
-            calls: Mutex::new(Vec::new()),
-        };
-        let debug = retrieve_with_backend(&backend, "fixture query", RetrievalConfig::default())
-            .await
-            .expect("hybrid retrieval");
-        assert_eq!(debug.dense, backend.dense);
-        assert_eq!(debug.bm25, backend.bm25);
-        assert_eq!(debug.fused.len(), 2);
-        let mut calls = backend.calls.lock().expect("calls lock").clone();
-        calls.sort_unstable();
-        assert_eq!(calls, vec![("bm25", 50), ("dense", 50)]);
+    async fn unset_retrieval_settings_rerank_the_top_twenty_dense_candidates() {
+        let config = crate::cloud_models::CloudModelConfig::from_lookup(|name| match name {
+            "GEMMA_4_MODEL_ID" => Some("hosted/gemma-4-test".to_owned()),
+            "MODEL_BASE_URL" => Some("http://127.0.0.1:9".to_owned()),
+            _ => None,
+        })
+        .expect("default model config");
+        let client = CloudModelClient::new(config).expect("cloud client");
+        let backend = dense_text_pool(30);
+        let reranker = FakeReranker::new(Vec::new());
+
+        let output = retrieve_with_backends(
+            &backend,
+            &reranker,
+            "fixture query",
+            &Storage::memory(),
+            client.rerank_enabled(),
+            RerankConfig::from_client(&client),
+        )
+        .await
+        .expect("dense reranked retrieval");
+
+        assert_eq!(backend.calls(), vec![20]);
+        // Twenty text candidates are reranked, eight per request.
+        let requests = reranker.requests.lock().expect("requests lock");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.as_array().expect("passages").len())
+                .collect::<Vec<_>>(),
+            vec![8, 8, 4]
+        );
+        assert_eq!(output.len(), 6);
+        assert!(
+            output
+                .iter()
+                .all(|candidate| candidate.rerank_rank.is_some() && candidate.unit_id <= 20)
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_rerank_returns_the_dense_prefix_without_calling_the_reranker() {
+        let backend = dense_text_pool(30);
+        let reranker = FakeReranker::new(Vec::new());
+        let output = retrieve_with_backends(
+            &backend,
+            &reranker,
+            "fixture query",
+            &Storage::memory(),
+            false,
+            RerankConfig::new(20, 6, 8).expect("rerank config"),
+        )
+        .await
+        .expect("dense retrieval");
+
+        assert_eq!(backend.calls(), vec![6]);
+        assert_eq!(
+            output
+                .iter()
+                .map(|candidate| candidate.unit_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert!(reranker.requests.lock().expect("requests lock").is_empty());
+        assert!(
+            output
+                .iter()
+                .all(|candidate| candidate.rerank_rank.is_none())
+        );
     }
 
     #[tokio::test]
     async fn ab_observation_shares_dense_and_keeps_mode_a_strictly_dense_only() {
-        let backend = FakeBackend {
-            dense: vec![text_ranked(1, 1, 0.9), text_ranked(2, 2, 0.8)],
-            bm25: vec![text_ranked(2, 1, 3.0)],
-            calls: Mutex::new(Vec::new()),
-        };
+        let backend = FakeBackend::new(vec![text_ranked(1, 1, 0.9), text_ranked(2, 2, 0.8)]);
         let reranker = FakeReranker::new(vec![Ok(RerankResponse {
             rankings: vec![
                 RerankResult {
@@ -2449,34 +2082,19 @@ mod tests {
             &reranker,
             "fixture query",
             &Storage::memory(),
-            RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
             RerankConfig::new(3, 3, 8).expect("rerank config"),
         )
         .await
         .expect("observed A/B retrieval");
 
-        let calls = backend.calls.lock().expect("calls lock").clone();
-        assert_eq!(
-            calls.iter().filter(|(stage, _)| *stage == "dense").count(),
-            1
-        );
-        assert_eq!(
-            calls.iter().filter(|(stage, _)| *stage == "bm25").count(),
-            1
-        );
+        assert_eq!(backend.calls(), vec![3]);
         assert_eq!(reranker.requests.lock().expect("requests lock").len(), 1);
 
         assert_eq!(observed.mode_a.dense.request_count, 1);
         assert!(!observed.mode_a.dense.reused);
-        for stage in [
-            &observed.mode_a.bm25,
-            &observed.mode_a.rrf,
-            &observed.mode_a.rerank,
-        ] {
-            assert!(stage.candidates.is_empty());
-            assert_eq!(stage.request_count, 0);
-            assert!(!stage.fallback);
-        }
+        assert!(observed.mode_a.rerank.candidates.is_empty());
+        assert_eq!(observed.mode_a.rerank.request_count, 0);
+        assert!(!observed.mode_a.rerank.fallback);
         assert_eq!(observed.mode_a.final_candidates.len(), 2);
         assert_eq!(
             observed.mode_a.dense.candidates,
@@ -2484,20 +2102,16 @@ mod tests {
         );
         assert!(observed.mode_b.dense.reused);
         assert_eq!(observed.mode_b.dense.request_count, 0);
-        assert_eq!(observed.mode_b.bm25.request_count, 1);
-        assert_eq!(observed.mode_b.rrf.request_count, 0);
         assert_eq!(observed.mode_b.rerank.request_count, 1);
         assert!(!observed.mode_b.rerank.fallback);
-        assert_eq!(observed.mode_b.final_candidates[0].unit_id, 1);
+        // A keeps the dense order; B's rerank scores put unit 2 first.
+        assert_eq!(observed.mode_a.final_candidates[0].unit_id, 1);
+        assert_eq!(observed.mode_b.final_candidates[0].unit_id, 2);
     }
 
     #[tokio::test]
     async fn observed_ab_marks_transient_rerank_fallback_explicitly() {
-        let backend = FakeBackend {
-            dense: vec![text_ranked(1, 1, 0.9)],
-            bm25: vec![text_ranked(1, 1, 3.0)],
-            calls: Mutex::new(Vec::new()),
-        };
+        let backend = FakeBackend::new(vec![text_ranked(1, 1, 0.9)]);
         let reranker = FakeReranker::new(vec![Err(CloudModelError::Timeout {
             operation: ModelOperation::Rerank,
             timeout: std::time::Duration::from_millis(1),
@@ -2507,7 +2121,6 @@ mod tests {
             &reranker,
             "fixture query",
             &Storage::memory(),
-            RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
             RerankConfig::new(3, 3, 8).expect("rerank config"),
         )
         .await
@@ -2517,7 +2130,7 @@ mod tests {
         assert_eq!(observed.mode_b.rerank.request_count, 1);
         assert_eq!(
             observed.mode_b.final_candidates,
-            observed.mode_b.rrf.candidates
+            observed.mode_b.dense.candidates
         );
         assert!(
             observed
@@ -2530,11 +2143,7 @@ mod tests {
 
     #[tokio::test]
     async fn permanent_b_rerank_failure_preserves_the_dense_control() {
-        let backend = FakeBackend {
-            dense: vec![text_ranked(1, 1, 0.9)],
-            bm25: vec![text_ranked(1, 1, 3.0)],
-            calls: Mutex::new(Vec::new()),
-        };
+        let backend = FakeBackend::new(vec![text_ranked(1, 1, 0.9)]);
         let reranker = FakeReranker::new(vec![Err(CloudModelError::InvalidResponse {
             operation: ModelOperation::Rerank,
             message: "malformed provider payload".to_owned(),
@@ -2544,7 +2153,6 @@ mod tests {
             &reranker,
             "fixture query",
             &Storage::memory(),
-            RetrievalConfig::new(3, 3, 3).expect("retrieval config"),
             RerankConfig::new(3, 3, 8).expect("rerank config"),
         )
         .await
@@ -2553,7 +2161,6 @@ mod tests {
         assert!(observed.mode_a.failure.is_none());
         assert_eq!(observed.mode_a.final_candidates.len(), 1);
         let failure = observed.mode_b.failure.expect("B failure");
-        assert_eq!(failure.stage, ObservedFailureStage::Rerank);
         assert_eq!(failure.code, "rerank_failed");
         assert!(!failure.retryable);
         assert_eq!(observed.mode_b.rerank.request_count, 1);
@@ -2568,7 +2175,7 @@ mod tests {
                 logit: 0.7,
             }],
         };
-        let candidates = reciprocal_rank_fusion(&[text_ranked(1, 1, 0.9)], &[], 3);
+        let candidates = dense_route_candidates(&[text_ranked(1, 1, 0.9)]);
         let legacy = rerank_candidates(
             &FakeReranker::new(vec![Ok(RerankResponse {
                 rankings: response.rankings.clone(),

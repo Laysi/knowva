@@ -8,7 +8,10 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const REPORT_SCHEMA_VERSION: &str = "1.0";
+/// 1.1 added the manifest's `profile_id` and `system_prompt_sha256`; 2.0
+/// removed the `bm25` and `rrf` stages, `top_n.bm25`, `top_n.rrf` and
+/// `config.rrf_k` along with BM25 retrieval.
+pub const REPORT_SCHEMA_VERSION: &str = "2.0";
 pub const THRESHOLD_SCHEMA_VERSION: &str = "2.0";
 static NEXT_STAGING_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -108,8 +111,6 @@ pub struct OperationalSummary {
 #[serde(deny_unknown_fields)]
 pub struct TopNConfig {
     pub dense: u32,
-    pub bm25: u32,
-    pub rrf: u32,
     pub rerank: u32,
     pub context: u32,
 }
@@ -138,7 +139,6 @@ pub enum FactMatchPolicy {
 pub struct LockedRunConfig {
     pub retrieval_cutoffs: Vec<u32>,
     pub comparison_epsilon: f64,
-    pub rrf_k: u32,
     pub max_answer_chars: u32,
     pub request_timeout_ms: u64,
     pub citation_policy: CitationPolicy,
@@ -174,6 +174,10 @@ pub struct RunManifest {
     pub subsets: Vec<String>,
     pub top_n: TopNConfig,
     pub prompt_version: String,
+    /// Industry profile the run answered under (`KNOWVA_PROFILE`).
+    pub profile_id: String,
+    /// Lowercase hex SHA-256 of the composed system prompt sent with every answer.
+    pub system_prompt_sha256: String,
     pub provider_seed_support: ProviderSeedSupport,
     pub config: LockedRunConfig,
     pub failures: Vec<ManifestFailure>,
@@ -835,9 +839,11 @@ pub fn validate_manifest(manifest: &RunManifest) -> ReportResult<()> {
             &manifest.locked_model_ids.generation_b,
         ),
         ("$.prompt_version", &manifest.prompt_version),
+        ("$.profile_id", &manifest.profile_id),
     ] {
         validate_safe_value(value, path)?;
     }
+    validate_sha256(&manifest.system_prompt_sha256, "$.system_prompt_sha256")?;
     if manifest.concurrency == 0 {
         return Err(ReportError::new(
             "concurrency_invalid",
@@ -862,8 +868,6 @@ pub fn validate_manifest(manifest: &RunManifest) -> ReportResult<()> {
     }
     if [
         manifest.top_n.dense,
-        manifest.top_n.bm25,
-        manifest.top_n.rrf,
         manifest.top_n.rerank,
         manifest.top_n.context,
     ]
@@ -877,7 +881,6 @@ pub fn validate_manifest(manifest: &RunManifest) -> ReportResult<()> {
     }
     if !manifest.config.comparison_epsilon.is_finite()
         || manifest.config.comparison_epsilon < 0.0
-        || manifest.config.rrf_k == 0
         || manifest.config.max_answer_chars == 0
         || manifest.config.request_timeout_ms == 0
     {
@@ -962,19 +965,23 @@ fn validate_operational_totals(totals: &OperationalStageTotals, path: &str) -> R
     }
 }
 
-fn validate_artifact(artifact: &ArtifactIdentity, path: &str) -> ReportResult<()> {
-    if artifact.sha256.len() != 64
-        || !artifact
-            .sha256
+fn validate_sha256(value: &str, path: &str) -> ReportResult<()> {
+    if value.len() != 64
+        || !value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(ReportError::new(
             "sha256_invalid",
-            format!("{path}.sha256"),
+            path,
             "sha256 must contain 64 lowercase hexadecimal characters",
         ));
     }
+    Ok(())
+}
+
+fn validate_artifact(artifact: &ArtifactIdentity, path: &str) -> ReportResult<()> {
+    validate_sha256(&artifact.sha256, &format!("{path}.sha256"))?;
     validate_safe_value(&artifact.source, &format!("{path}.source"))?;
     validate_safe_value(&artifact.version, &format!("{path}.version"))
 }
@@ -1459,12 +1466,12 @@ mod tests {
             subsets: vec!["all".to_owned()],
             top_n: TopNConfig {
                 dense: 20,
-                bm25: 20,
-                rrf: 20,
                 rerank: 10,
                 context: 5,
             },
             prompt_version: "prompt-v1".to_owned(),
+            profile_id: "default".to_owned(),
+            system_prompt_sha256: "c".repeat(64),
             provider_seed_support: ProviderSeedSupport {
                 mode_a: true,
                 mode_b: false,
@@ -1472,7 +1479,6 @@ mod tests {
             config: LockedRunConfig {
                 retrieval_cutoffs: vec![1, 3, 5],
                 comparison_epsilon: 0.001,
-                rrf_k: 60,
                 max_answer_chars: 4_000,
                 request_timeout_ms: 30_000,
                 citation_policy: CitationPolicy::ActualBracketedSourcesOnly,
@@ -1563,8 +1569,6 @@ mod tests {
                 },
                 stages: RetrievalTrace {
                     dense: trace.clone(),
-                    bm25: trace.clone(),
-                    rrf: trace.clone(),
                     rerank: trace,
                 },
                 context_sources: sources,
@@ -1836,5 +1840,27 @@ mod tests {
             validate_manifest(&value).unwrap_err().code,
             "unsafe_manifest_value"
         );
+    }
+
+    #[test]
+    fn manifest_records_the_profile_and_a_well_formed_prompt_hash() {
+        let json = render_manifest_json(&manifest()).expect("render manifest");
+        assert!(json.contains("\"profile_id\": \"default\""), "{json}");
+        assert!(
+            json.contains(&format!("\"system_prompt_sha256\": \"{}\"", "c".repeat(64))),
+            "{json}"
+        );
+
+        let mut value = manifest();
+        value.system_prompt_sha256 = "C".repeat(64);
+        let error = validate_manifest(&value).unwrap_err();
+        assert_eq!(error.code, "sha256_invalid");
+        assert_eq!(error.path, "$.system_prompt_sha256");
+
+        let mut value = manifest();
+        value.profile_id = "https://example.invalid/profile".to_owned();
+        let error = validate_manifest(&value).unwrap_err();
+        assert_eq!(error.code, "unsafe_manifest_value");
+        assert_eq!(error.path, "$.profile_id");
     }
 }

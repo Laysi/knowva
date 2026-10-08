@@ -6,6 +6,8 @@ requires-python = "==3.12.*"
 dependencies = [
     "fastapi>=0.115",
     "httpx>=0.28",
+    # Rerank on MLX (KM_RERANK_BACKEND=mlx); kept next to this service.
+    "nemotron-vl-mlx",
     "pillow>=11",
     # The model's remote processing code imports requests directly.
     "requests>=2.32",
@@ -24,3 +26,6 @@ environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 # The interpreter comes from proto (.prototools); uv must not fetch its own.
 python-preference = "only-system"
 python-downloads = "never"
+
+[tool.uv.sources]
+nemotron-vl-mlx = { path = "../nemotron-vl-mlx" }
