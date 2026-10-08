@@ -14,7 +14,7 @@
 | 向量嵌入 | `nvidia/llama-nemotron-embed-vl-1b-v2`，輸出 2048 維 float embedding |
 | 精排 | `nvidia/llama-nemotron-rerank-vl-1b-v2` |
 
-後端保留 OpenAI-compatible `/chat/completions` SSE，並提供 typed embedding 與 reranking client。頁面化 ingestion 先以模型無關的 artifact staging 產生可追蹤頁圖或標題感知文字單元，再用固定 Nemotron Embed VL 建立同一個 `halfvec(2048)` 檢索空間：文字 query 使用 `query/text`，MD/TXT 與文字層足以代表整頁的頁面（`needs_vision = false`）使用 `passage/text`，其餘頁面中無文字層者使用 `passage/image`、有同頁文字者使用 `passage/text_image`。每頁要不要送圖只在轉檔時判斷一次，之後 embedding、rerank、回答與摘要都依同一個結果，見「頁面是否送圖」。查詢會各取 dense 50 筆與文字 BM25 50 筆，再以 deterministic RRF 融合；沒有文字層的掃描頁仍可由 dense 路徑召回。
+後端保留 OpenAI-compatible `/chat/completions` SSE，並提供 typed embedding 與 reranking client。頁面化 ingestion 先以模型無關的 artifact staging 產生可追蹤頁圖或標題感知文字單元，再用固定 Nemotron Embed VL 建立同一個 `halfvec(2048)` 檢索空間：文字 query 使用 `query/text`，MD/TXT 與文字層足以代表整頁的頁面（`needs_vision = false`）使用 `passage/text`，其餘頁面中無文字層者使用 `passage/image`、有同頁文字者使用 `passage/text_image`。每頁要不要送圖只在轉檔時判斷一次，之後 embedding、rerank、回答與摘要都依同一個結果，見「頁面是否送圖」。查詢取 dense 前 20 筆送 Nemotron Rerank VL 精排，再取前 6 筆給 Gemma；沒有文字層的掃描頁同樣由 dense 召回。
 
 ## 技術架構
 
@@ -73,9 +73,10 @@ GEMMA_4_MODEL_ID=google/gemma-4-31b-it
 | `GEMMA_4_MODEL_ID` | 必填 | 放入 Chat request body 的 provider/model ID |
 | `NEMOTRON_EMBED_MODEL_ID` | 有鎖定預設 | 只接受 `llama-nemotron-embed-vl-1b-v2` family |
 | `NEMOTRON_RERANK_MODEL_ID` | 有鎖定預設 | 只接受 `llama-nemotron-rerank-vl-1b-v2` family |
-| `RERANK_CANDIDATE_TOP_K` | `50` | RRF 候選池送入 VL rerank 的數量，必須不小於 `RERANK_TOP_N` |
+| `RERANK_CANDIDATE_TOP_K` | `20` | dense 前幾筆送入 VL rerank，必須不小於 `RERANK_TOP_N` |
 | `RERANK_TOP_N` | `6` | 精排後回答 context 數量，只允許 3–8 |
 | `RERANK_BATCH_SIZE` | `8` | 每次 rerank request 的 passage 數量，範圍為 1–512 |
+| `RERANK_ENABLED` | `true` | `false` 時不呼叫 rerank，直接把 dense 前 `RERANK_TOP_N` 筆給 Gemma；推論服務不載入 rerank 模型，記憶體較省但會漏掉部分來源（見 `docs/measurements/README.md` §8.16） |
 | `MODEL_REQUEST_TIMEOUT_SECS` | 有預設 | 所有模型 HTTP/SSE request timeout，必須是正整數 |
 
 Chat model、endpoint 或 rerank 設定無效時，後端會在連接資料庫與接受流量前停止並顯示可理解的錯誤。URL 只指定服務的 operation route，model 分別放在 JSON request body；因此換一套服務只需修改 URL，不需修改程式。
@@ -399,20 +400,19 @@ DB 欄位（`documents.storage_path`、`document_artifact_sets.*_path`／`artifa
 
 - 頁圖照常轉出與儲存（`image_path` 仍是 NOT NULL），只是文字頁不拿它推理，也不讀取它。
 - 文字頁的 embedding 是 `passage/text`；rerank passage 只有 `text`；回答 context 的 block 沒有 `page_image:` 行與圖片 part；摘要只送文字。SSE `sources` 仍是 `kind: page` 加頁碼。
-- Rerank 依「有圖／純文字」分組送 batch，每組內維持 RRF 順序；推論服務對同一個 request 只用一種 processor，混合會讓文字 passage 也付圖片成本。
+- Rerank 依「有圖／純文字」分組送 batch，每組內維持 dense 順序；推論服務對同一個 request 只用一種 processor，混合會讓文字 passage 也付圖片成本。
 - 頁圖讀取失敗時，看圖頁照舊報錯，不會退回只送文字。
 - migration 前的頁面都是 `needs_vision = true`（它們的向量是用頁圖建的），重新處理後才套用新規則；不需要重建索引。
 - 入庫時每份文件記一行 info log（看圖頁數、文字頁數、原因），rerank 與回答也各記錄圖片與文字的筆數。
 
-## Hybrid retrieval 契約
+## 檢索契約
 
-- Dense 使用 query 的固定 2048 維 embedding 與 ready-only partial HNSW `halfvec_cosine_ops` index，cosine top-k 預設 50。HNSW nearest-neighbor query 先 materialize，再以 distance、`unit_id` 做穩定排序。
-- Lexical 是標準 Okapi BM25，不使用 `ILIKE`、`ts_rank` 或 `ts_rank_cd`。公式參數固定 `k1=1.2`、`b=0.75`；migration `0004_hybrid_retrieval.sql` 以 trigger 維護 ready-only corpus 的文件數、總 token 數與每詞 DF，query 在 PostgreSQL 內計算 TF/IDF/長度正規化，不會把 corpus 載入 Rust。
-- Lexical candidate index 是 non-empty `content` 上的 ready-only partial GIN token-array index。tokenizer 先做 Unicode NFKC、lowercase 與 dash normalization；繁中採 character unigram + adjacent bigram，原因是不用可變字典也能重現、可涵蓋未知企業詞；英文、數字與產品代號保留完整 token，hyphenated code 另產 compact 與 component variants，讓全形／半形或常見標點差異不會讓基本詞失效。
-- RRF 固定 `k=60`，`rrf_score(d) = Σ 1 / (60 + rank_i(d))`。以 `unit_id` 去重；同分依最佳 route rank、`unit_id` 排序。兩路預設各 50，融合預設保留 50，再以固定 `llama-nemotron-rerank-vl-1b-v2` 精排成 top 6（可設 3–8）。
-- Page passage 只讀已發布 artifact：`needs_vision` 頁有文字層時送 image+text，掃描頁送 image-only（完全省略 `text`）；文字頁與 MD/TXT chunk 送 text-only，不讀頁圖。物件 key 與本機路徑都不進 payload，圖片以有上限的並行讀取後只以記憶體 data URL 傳送；候選先依有圖／純文字分組，每組依 RRF 順序每批預設 8 筆，API 回應即使重排順序也依每批 local index 映回原 unit。
-- 每筆 `RetrievalCandidate` 直接帶 `unit_id`、0-based `unit_index`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、`needs_vision`、兩路 rank/score、`rrf_score` 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
-- Rerank 每批都嚴格驗證回應筆數、index 唯一且不越界、score finite，再驗證跨批映射。408、429、5xx、transport error 與 timeout 最多嘗試三次；耗盡後以原 RRF top_n 原序回退，且 rerank 欄位保持 null。設定、artifact 或模型服務 response contract 錯誤不回退，會回傳可診斷錯誤。Structured log 僅記錄各階段筆數、延遲、fallback 與 model id，不含 query、文件內容、secret 或 base64。
+- 檢索只有 dense 一路：query 的固定 2048 維 embedding 走 ready-only partial HNSW `halfvec_cosine_ops` index，取 cosine 前 `RERANK_CANDIDATE_TOP_K` 筆（預設 20）。HNSW nearest-neighbor query 先 materialize，再以 distance、`unit_id` 做穩定排序。
+- 不做 BM25、也不做 RRF 融合（migration `0009_dense_retrieval.sql` 移除了 `0004` 的 token 欄位、GIN index 與語料統計）。#60 量了 79 題（含 18 題型號、條號、人名等精確字詞題），沒有一題要靠 BM25 才取得到來源。只有圖的頁面、用中文問英文文件時，BM25 給不了分，這些 dense 找到的來源反而在 RRF 被往後擠。數據見 `docs/measurements/README.md` §8.16。
+- 候選再以固定 `llama-nemotron-rerank-vl-1b-v2` 精排成 top 6（可設 3–8）。`RERANK_ENABLED=false` 時只取 dense 前 `RERANK_TOP_N` 筆，不呼叫 rerank。
+- Page passage 只讀已發布 artifact：`needs_vision` 頁有文字層時送 image+text，掃描頁送 image-only（完全省略 `text`）；文字頁與 MD/TXT chunk 送 text-only，不讀頁圖。物件 key 與本機路徑都不進 payload，圖片以有上限的並行讀取後只以記憶體 data URL 傳送；候選先依有圖／純文字分組，每組依 dense 順序每批預設 8 筆，API 回應即使重排順序也依每批 local index 映回原 unit。
+- 每筆 `RetrievalCandidate` 直接帶 `unit_id`、0-based `unit_index`、`document_id`、`filename`、`kind`、1-based nullable `page_number`、nullable `image_path/content`、`needs_vision`、dense rank/score 與 nullable `rerank_score/rerank_rank`，後續階段不需重新查來源 metadata。
+- Rerank 每批都嚴格驗證回應筆數、index 唯一且不越界、score finite，再驗證跨批映射。408、429、5xx、transport error 與 timeout 最多嘗試三次；耗盡後以 dense 前 top_n 筆原序回退，且 rerank 欄位保持 null。設定、artifact 或模型服務 response contract 錯誤不回退，會回傳可診斷錯誤。Structured log 僅記錄各階段筆數、延遲、fallback 與 model id，不含 query、文件內容、secret 或 base64。
 - context 區塊採追加式排列：`POST /api/chat` 的 `previousSources` 帶回上一輪答案的來源與順序，本輪仍檢索到的來源就留在原位、原順序，本輪新進的來源再依排名接在尾端。推論服務的 prompt cache 是前綴比對，唯有這種排列能把「追問檢索到重疊來源」穩定換成快取命中；來源完全沒變時整段 prompt（連同它後面的對話歷史）都會命中。沒有 `previousSources` 時（第一個問題、catalog、文件摘要）就直接照排名排列——最相關的來源最可能在下一輪續留，把它放在最前面，下一輪能重用的前綴才最長。`[S1]`..`[Sn]` 依版面位置連號並與 SSE `sources` 事件一致；payload 或完整 request 超限時仍是從排名最低的來源開始整筆移除，再重新編號。
 
 ## A/B 評測
@@ -436,7 +436,7 @@ proto exec rust -- cargo run -- eval --dry-run \
 
 ### 正式 A/B run（`--cloud`）
 
-正式 run 是明確 opt-in，會 ingest fixtures 並實際呼叫設定好的 embedding、rerank 與 generation endpoint。端點是雲端服務時會產生費用，是地端服務時會佔用推論主機；CI 與一般測試絕不自動執行。A 是 dense-only control，B 共用 A 的同一批 dense candidates，再執行 BM25、RRF 與固定 VL reranker。兩組固定使用相同 embedding 與 Gemma 4 generation model id、相同 prompt version、相同 system prompt（選定 profile 的一般問答 prompt，與 `/api/chat` 用同一個組合函式產生）、相同 query、相同 context top_n 與 deterministic retry policy，只有 retrieval path 不同。provider 不支援 seed 時會在 run manifest 明確記為 false。為確保 telemetry 可歸因，目前正式 run 強制 `--concurrency 1`。
+正式 run 是明確 opt-in，會 ingest fixtures 並實際呼叫設定好的 embedding、rerank 與 generation endpoint。端點是雲端服務時會產生費用，是地端服務時會佔用推論主機；CI 與一般測試絕不自動執行。A 是 dense-only control，直接取 dense 前 top_n 筆；B 是正式流程，共用 A 的同一批 dense candidates，再以固定 VL reranker 精排。兩組固定使用相同 embedding 與 Gemma 4 generation model id、相同 prompt version、相同 system prompt（選定 profile 的一般問答 prompt，與 `/api/chat` 用同一個組合函式產生）、相同 query、相同 context top_n 與 deterministic retry policy，只有 retrieval path 不同。provider 不支援 seed 時會在 run manifest 明確記為 false。為確保 telemetry 可歸因，目前正式 run 強制 `--concurrency 1`。
 
 執行前必須完成下列事項：
 
@@ -448,7 +448,7 @@ proto exec rust -- cargo run -- eval --dry-run \
      "version": "<threshold-version>",
      "minimums": {
        "correct_page_recall_at_k": {
-         "stage": "<dense|bm25|rrf|rerank>",
+         "stage": "<dense|rerank>",
          "k": <positive-integer>,
          "minimum": <number-0-to-1>
        },

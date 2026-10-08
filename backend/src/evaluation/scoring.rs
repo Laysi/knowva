@@ -12,19 +12,15 @@ pub enum EvaluationMode {
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalStage {
     Dense,
-    Bm25,
-    Rrf,
     Rerank,
 }
 
 impl RetrievalStage {
-    pub const ALL: [Self; 4] = [Self::Dense, Self::Bm25, Self::Rrf, Self::Rerank];
+    pub const ALL: [Self; 2] = [Self::Dense, Self::Rerank];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dense => "dense",
-            Self::Bm25 => "bm25",
-            Self::Rrf => "rrf",
             Self::Rerank => "rerank",
         }
     }
@@ -69,8 +65,6 @@ pub struct StageTrace {
 #[serde(deny_unknown_fields)]
 pub struct RetrievalTrace {
     pub dense: StageTrace,
-    pub bm25: StageTrace,
-    pub rrf: StageTrace,
     pub rerank: StageTrace,
 }
 
@@ -78,8 +72,6 @@ impl RetrievalTrace {
     pub fn get(&self, stage: RetrievalStage) -> &StageTrace {
         match stage {
             RetrievalStage::Dense => &self.dense,
-            RetrievalStage::Bm25 => &self.bm25,
-            RetrievalStage::Rrf => &self.rrf,
             RetrievalStage::Rerank => &self.rerank,
         }
     }
@@ -1021,8 +1013,6 @@ mod tests {
         };
         RetrievalTrace {
             dense: stage.clone(),
-            bm25: stage.clone(),
-            rrf: stage.clone(),
             rerank: stage,
         }
     }

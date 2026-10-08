@@ -22,8 +22,7 @@ use crate::page_artifacts::ArtifactConfig;
 use crate::profile::{Profile, PromptKind};
 use crate::rag_context::{MAX_RAG_SOURCES, SourceRef, build_rag_context};
 use crate::search::{
-    DEFAULT_BM25_TOP_K, DEFAULT_DENSE_TOP_K, ObservedAbRetrieval, ObservedFailureStage,
-    ObservedModeRetrieval, ObservedRetrievalFailure, ObservedRetrievalStage, RRF_K,
+    ObservedAbRetrieval, ObservedModeRetrieval, ObservedRetrievalFailure, ObservedRetrievalStage,
     RetrievalCandidate, retrieve_ab_observed,
 };
 use crate::storage::{Storage, StorageConfig, ensure_initialization_lock};
@@ -965,9 +964,8 @@ fn scoring_candidate(
     }
     let score = match stage {
         RetrievalStage::Dense => candidate.dense_score,
-        RetrievalStage::Bm25 => candidate.bm25_score,
-        RetrievalStage::Rrf => Some(candidate.rrf_score),
-        RetrievalStage::Rerank => candidate.rerank_score.or(Some(candidate.rrf_score)),
+        // A transient rerank fallback keeps the dense order without rerank scores.
+        RetrievalStage::Rerank => candidate.rerank_score.or(candidate.dense_score),
     }
     .context("retrieval candidate is missing its stage score")?;
     Ok(ScoringCandidate {
@@ -1001,7 +999,7 @@ fn scoring_stage(
             retry_count,
             fallback: observed.fallback.then(|| FallbackTelemetry {
                 from: "rerank".to_owned(),
-                to: "rrf".to_owned(),
+                to: "dense".to_owned(),
                 reason_code: "transient_rerank_failure".to_owned(),
             }),
         },
@@ -1052,14 +1050,6 @@ fn mode_scoring_trace(
             dense_requests,
             dense_retries,
         )?,
-        bm25: scoring_stage(
-            &observed.bm25,
-            RetrievalStage::Bm25,
-            stable,
-            observed.bm25.request_count,
-            0,
-        )?,
-        rrf: scoring_stage(&observed.rrf, RetrievalStage::Rrf, stable, 0, 0)?,
         rerank: scoring_stage(
             &observed.rerank,
             RetrievalStage::Rerank,
@@ -1092,8 +1082,6 @@ fn empty_trace(
             embedding_requests,
             embedding_requests.saturating_sub(1),
         ),
-        bm25: empty(0, 0, 0),
-        rrf: empty(0, 0, 0),
         rerank: empty(0, rerank_requests, rerank_requests.saturating_sub(1)),
     }
 }
@@ -1226,10 +1214,6 @@ fn failed_answer(code: &str, safe_message: String, retryable: bool) -> ModeAnswe
 }
 
 fn failed_retrieval_answer(failure: &ObservedRetrievalFailure) -> ModeAnswer {
-    let stage = match failure.stage {
-        ObservedFailureStage::Bm25 => RetrievalStage::Bm25,
-        ObservedFailureStage::Rerank => RetrievalStage::Rerank,
-    };
     ModeAnswer {
         answer: String::new(),
         context_sources: BTreeMap::new(),
@@ -1238,7 +1222,7 @@ fn failed_retrieval_answer(failure: &ObservedRetrievalFailure) -> ModeAnswer {
         retry_count: 0,
         failure: Some(RunFailure {
             code: failure.code.to_owned(),
-            stage: Some(stage),
+            stage: Some(RetrievalStage::Rerank),
             safe_message: failure.safe_message.clone(),
             retryable: failure.retryable,
         }),
@@ -1535,9 +1519,7 @@ fn scoring_config_with_threshold_cutoff(threshold_k: u32) -> ScoringConfig {
 fn manifest_top_n(rerank_candidate_top_k: usize, rerank_top_n: usize) -> TopNConfig {
     let report_value = |value| u32::try_from(value).unwrap_or(u32::MAX);
     TopNConfig {
-        dense: report_value(DEFAULT_DENSE_TOP_K.max(rerank_candidate_top_k)),
-        bm25: report_value(DEFAULT_BM25_TOP_K.max(rerank_candidate_top_k)),
-        rrf: report_value(rerank_candidate_top_k),
+        dense: report_value(rerank_candidate_top_k),
         rerank: report_value(rerank_top_n),
         context: report_value(rerank_top_n.min(MAX_RAG_SOURCES)),
     }
@@ -1707,7 +1689,6 @@ async fn bootstrap_and_ingest(
         config: LockedRunConfig {
             retrieval_cutoffs: scoring_config.cutoffs.clone(),
             comparison_epsilon: 0.0,
-            rrf_k: RRF_K as u32,
             max_answer_chars: MAX_ANSWER_CHARS as u32,
             request_timeout_ms,
             citation_policy: CitationPolicy::ActualBracketedSourcesOnly,
@@ -2031,19 +2012,15 @@ mod tests {
 
     #[test]
     fn manifest_top_n_reports_resolved_retrieval_limits() {
-        let below_defaults = manifest_top_n(6, 6);
-        assert_eq!(below_defaults.dense, DEFAULT_DENSE_TOP_K as u32);
-        assert_eq!(below_defaults.bm25, DEFAULT_BM25_TOP_K as u32);
-        assert_eq!(below_defaults.rrf, 6);
-        assert_eq!(below_defaults.rerank, 6);
-        assert_eq!(below_defaults.context, 6);
+        let defaults = manifest_top_n(20, 6);
+        assert_eq!(defaults.dense, 20);
+        assert_eq!(defaults.rerank, 6);
+        assert_eq!(defaults.context, 6);
 
-        let above_defaults = manifest_top_n(73, 8);
-        assert_eq!(above_defaults.dense, 73);
-        assert_eq!(above_defaults.bm25, 73);
-        assert_eq!(above_defaults.rrf, 73);
-        assert_eq!(above_defaults.rerank, 8);
-        assert_eq!(above_defaults.context, MAX_RAG_SOURCES as u32);
+        let wide = manifest_top_n(73, 8);
+        assert_eq!(wide.dense, 73);
+        assert_eq!(wide.rerank, 8);
+        assert_eq!(wide.context, MAX_RAG_SOURCES as u32);
     }
 
     #[tokio::test]

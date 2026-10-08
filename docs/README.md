@@ -19,8 +19,8 @@
 | 交付形態 | 單一租戶、單機部署;開發與對內測試可走雲端 | 完全離線,落在客戶內網的地端 appliance |
 | LLM / VLM | 雲端 Gemma 4 — **與正式交付相同的模型,只是跑在雲端** | Gemma 4 12B(入門硬體)/ 31B(高階硬體),地端推理 |
 | Embedding | Llama Nemotron Embed VL 1B v2(頁圖與文字同一向量空間),從 MVP 第一天就固定(現行 demo 的 Titan/文字版 embed 屬過渡,汰換時整庫重嵌一次) | Llama Nemotron Embed VL 1B v2(不變,交付時免重建索引) |
-| 檢索 | 頁面級向量檢索起步,MVP 內補文字層 BM25 + rerank | Hybrid(文字層 BM25 + dense)召回 → Nemotron Rerank VL 精排(標配,單一 reranker 蓋文字與頁面) |
-| 文件解析(前處理) | 頁面化直檢:每頁轉圖 → Embed VL 直接嵌入,檢索不依賴轉錄(markitdown 與 VLM 全文轉錄路線皆已棄用) | 主路徑同左;PDF 文字層/OCR 只作加值(BM25、引用、「圖+文」嵌入) |
+| 檢索 | 頁面級向量檢索 + Nemotron Rerank VL 精排(文字層 BM25 + RRF 在 #60 量測後拿掉) | dense 召回 → Nemotron Rerank VL 精排(標配,單一 reranker 蓋文字與頁面) |
+| 文件解析(前處理) | 頁面化直檢:每頁轉圖 → Embed VL 直接嵌入,檢索不依賴轉錄(markitdown 與 VLM 全文轉錄路線皆已棄用) | 主路徑同左;PDF 文字層/OCR 只作加值(文字頁嵌入、引用、「圖+文」嵌入) |
 | 硬體 | 不綁硬體;任一 NVIDIA GPU 機器即可驗證 | 雙 RTX 5060 Ti 16GB 主機(合計 32GB)約 10 萬 → DGX Spark 128GB / RTX 5090 主機 約 20 萬(全線 NVIDIA Linux) |
 | DB / 儲存 | PostgreSQL + pgvector;本機檔案系統 | 相同;原檔儲存可換 S3-compatible |
 | 部署 | docker compose;模型一律走 OpenAI-compatible endpoint(雲端) | **同一套全容器部署法**:app + DB + 模型皆容器,一份 compose 通用全落點(見 [deployment.md](deployment.md)) |

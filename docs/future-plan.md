@@ -31,7 +31,7 @@
 - 5060 Ti 16GB 單卡行情約 1.4-1.7 萬,雙卡加整機仍壓在 10 萬內;單卡頻寬 448GB/s 低於 5070 Ti/5080,但仍遠高於統一記憶體方案,12B Q4 互動問答體感佳;單卡 180W,一般塔式機殼 + 750W 電源即可,主機板需雙 PCIe 槽(x8/x8 即可 — 模型分卡部署,卡間溝通極少)。
 - 合計 32GB 理論可測 31B Q4(vLLM tensor parallel ×2),但受 PCIe 與頻寬限制,不承諾、不作賣點 — 31B 仍屬 Enterprise 落點。
 - 消費卡的保固與採購觀感需評估;偏好單卡時 RTX PRO 4000 24GB(觀感/保固較佳)或 5070 Ti/5080 16GB 為替代,但三顆模型同卡即回到量化 + 降候選的緊配置。
-- retriever 資源不足時先降候選數(dense top_k 50、BM25 top_k 50、rerank top_n 3-8 頁),再考慮暫關 rerank(dense-only),不改 API。
+- retriever 資源不足時先降候選數(rerank 候選預設 dense 前 20、rerank top_n 3-8 頁),再考慮暫關 rerank(`RERANK_ENABLED=false`),不改 API。
 - **工控選配:Jetson AGX Orin 64GB(約 6-8 萬)** — 低功耗/無風扇/長供貨,64GB 記憶體充足,但算力弱:RAG 長 prompt 的首字延遲預估 15-30 秒,僅適合批次解析或可容忍延遲的場景,不作互動式預設;需 Jetson 專用(l4t)容器 image。
 - macOS 不在標準支援清單;個別客戶堅持 Mac 時另案評估,不列 SKU。
 
@@ -48,10 +48,10 @@
 | --- | --- |
 | 1. 原檔保存 | PDF、DOCX、PPTX、PNG、JPG、email 等原檔保存到本機 storage(未來 S3-compatible)。 |
 | 2. 頁面化 | Office 檔經 LibreOffice headless 轉 PDF;PDF 以 pdfium 逐頁轉圖(約 150-200 DPI,PNG/WebP);圖片檔視為單頁;md/txt 不轉圖,依標題感知切 chunk。 |
-| 3. 文字層(加值,非關鍵路徑) | PDF 內嵌文字直接抽出;掃描頁選配 OCR / VLM 轉錄。供 BM25、引用片段、摘要與「圖+文」嵌入;缺文字層不阻擋入庫。 |
+| 3. 文字層(加值,非關鍵路徑) | PDF 內嵌文字直接抽出;掃描頁選配 OCR / VLM 轉錄。供文字頁嵌入、引用片段、摘要與「圖+文」嵌入;缺文字層不阻擋入庫。 |
 | 4. 標準化輸出 | 每頁輸出 document_id、page、content(可後補)、table、figure、bbox、source_hash、confidence。 |
 | 5. 建立索引 | Embed VL 產生向量:頁面用「圖+文」(有文字層)或純圖嵌入,md/txt chunk 用文字嵌入 — 同一 2048 維空間;Postgres/pgvector(`halfvec` + HNSW)保存 vector 與 metadata。 |
-| 6. 查詢召回 | query 文字嵌入(同一空間)dense 召回 top 50-100;有文字層者併 BM25,RRF 合併。 |
+| 6. 查詢召回 | query 文字嵌入(同一空間)dense 召回前 20 筆。原本併 BM25 再做 RRF,#60 量測後拿掉(見 `docs/measurements/README.md` §8.16)。 |
 | 7. Rerank 精排 | Rerank VL 對候選頁/chunk 精排,取 top 3-8 作為回答 context。 |
 | 8. 回答與引用 | Gemma 4 直讀來源頁圖(+文字片段)產生回答,附文件名、頁碼、原文片段或 chunk id。 |
 
@@ -67,7 +67,7 @@
 | --- | --- | --- |
 | LLM:雲端 Gemma → 地端 Gemma | 換推理端點(雲端 API → 本地 runtime);模型相同,prompt 與 SSE 協定不動 | 否 |
 | Embedding | MVP 起即固定 llama-nemotron-embed-vl-1b-v2,交付時不用換、不用重建。例外是現行 demo(Titan / NVIDIA 文字 embed):切換當下需一次性 schema migration(`vector(1024)` → `halfvec(2048)`)+ 重跑前處理(向量空間不同,整庫重嵌) | 原則上否(demo 汰換時一次) |
-| 檢索:加 BM25 + Rerank VL | 加模組(文字層 tsvector/BM25 + Rerank VL 服務),既有向量照用 | 否 |
+| 檢索:加 Rerank VL | 加 Rerank VL 服務,既有向量照用(BM25 + RRF 曾加入,#60 量測後拿掉) | 否 |
 | 前處理:VLM 直讀轉錄 → 頁面化 + VL 嵌入 | 重建 ingestion 前段(轉檔 + 轉圖 + 嵌入);之後 parser/OCR 只是文字層加值的升級,不再動檢索主路徑 | 一次(原檔都在,重跑前處理即可) |
 | Schema:版本欄位 | `chunks` 加 `embedding_model` / `embedding_version` 欄位與 migration 流程,支援日後 embedding 大版本升級 | — |
 

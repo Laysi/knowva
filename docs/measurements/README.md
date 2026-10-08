@@ -694,3 +694,9 @@ Google 10/06 發布的 EmbeddingGemma 2（740M：文字 270M、視覺 170M、音
 - 實例設定、正式設定前後的 sha256、有線網路的切換紀錄。
 
 knowva-mac 的有線網路很慢（約 0.85 MB/s，Wi-Fi 約 40 MB/s），所以實測期間暫時關閉、只用 Wi-Fi。結束後已恢復，服務順序、IP 與預設路由都和實測前相同。
+
+採用（2026-10-08）：預設改成 `dense-rerank-20`。
+
+- BM25 與 RRF 的程式拿掉，migration `0009_dense_retrieval.sql` 移除 `0004` 加的 token 欄位、GIN index、語料統計表與 trigger。`RERANK_CANDIDATE_TOP_K` 的預設從 50 改成 20。
+- `RETRIEVAL_MODE` 開關也一起拿掉，因為只剩 dense 一路。`RERANK_ENABLED=false` 保留，也就是 `dense-6`／`dense-8` 那種不 rerank 的設定，給記憶體優先的機器用。
+- 上面的工具和 §8.15 的 `eval.ts` 會直接跑 BM25 的 SQL，`run.sh` 也會設 `RETRIEVAL_MODE`，所以只能在 `0008` 之前的資料庫和映像上重跑：bench-results 裡的 dump，以及隔離實例的映像 `knowva:dense60-ctx8`。

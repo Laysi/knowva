@@ -846,9 +846,6 @@ mod tests {
             needs_vision: kind == "page",
             dense_rank: Some(unit_id as usize),
             dense_score: Some(1.0 / unit_id as f64),
-            bm25_rank: None,
-            bm25_score: None,
-            rrf_score: 1.0 / (60.0 + unit_id as f64),
             rerank_score: Some(10.0 - unit_id as f64),
             rerank_rank: Some(unit_id as usize),
         }
@@ -1195,9 +1192,6 @@ IL050 table\n\
                 needs_vision: false,
                 dense_rank: None,
                 dense_score: None,
-                bm25_rank: None,
-                bm25_score: None,
-                rrf_score: 0.0,
                 rerank_score: None,
                 rerank_rank: None,
             })

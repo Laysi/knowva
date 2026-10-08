@@ -42,7 +42,7 @@
 | `vision-explicit-mask-variants.pdf` | true, true, true, true | 4 頁同一份串流，第 3、4 頁套不同的 stencil `/Mask`；畫出來不同 |
 | `vision-stencil-colors.pdf` | true, true, true, true | 4 頁同一個 stencil 遮罩，第 1、2 頁紅色、第 3、4 頁藍色；填色不同就不是同一張 |
 
-其中 `scanned-one-page.pdf` 同時是 hybrid retrieval 的 dense-only fixture：它沒有 `content`，不得出現在 BM25 route，但仍須由 2048 維頁圖 embedding 召回。database fixtures 另以相同文字的不同 1-based page 驗證它們保留不同 `unit_id`，只有同一頁在 dense/BM25 重疊時才會去重。
+其中 `scanned-one-page.pdf` 同時是沒有 `content` 的檢索 fixture：它只能由 2048 維頁圖 embedding 召回。database fixtures 另以相同文字的不同 1-based page 驗證它們保留不同 `unit_id`。
 
 一般 `cargo test` 會用 mock cloud endpoint 驗證 embedding payload、圖片正規化、MD/TXT 入庫、DB constraint、重試與刪除清理。真實 Pdfium／LibreOffice 轉換測試標記為 ignored，避免缺少 native dependency 的 CI 假失敗；安裝依賴後執行：
 

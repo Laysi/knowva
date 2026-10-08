@@ -15,30 +15,14 @@ pub const DEFAULT_EMBED_MODEL_ID: &str = "nvidia/llama-nemotron-embed-vl-1b-v2";
 pub const DEFAULT_RERANK_MODEL_ID: &str = "nvidia/llama-nemotron-rerank-vl-1b-v2";
 pub const EMBEDDING_DIMENSIONS: usize = 2048;
 pub const MAX_EMBED_IMAGE_BYTES: usize = 25 * 1024 * 1024;
-pub const DEFAULT_RERANK_CANDIDATE_TOP_K: usize = 50;
+/// Dense candidates reranked per question. Twenty was the smallest pool that
+/// matched the hybrid pipeline's source hits in the issue #60 replay.
+pub const DEFAULT_RERANK_CANDIDATE_TOP_K: usize = 20;
 pub const DEFAULT_RERANK_TOP_N: usize = 6;
 pub const DEFAULT_RERANK_BATCH_SIZE: usize = 8;
 pub const MIN_RERANK_TOP_N: usize = 3;
 pub const MAX_RERANK_TOP_N: usize = 8;
 pub const MAX_RERANK_BATCH_SIZE: usize = 512;
-
-/// Candidate routes that feed the answer context. `Hybrid` fuses dense and
-/// BM25 candidates with RRF; `Dense` uses the dense ranking alone and never
-/// queries BM25.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetrievalMode {
-    Hybrid,
-    Dense,
-}
-
-impl RetrievalMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Hybrid => "hybrid",
-            Self::Dense => "dense",
-        }
-    }
-}
 
 /// Model traffic goes to a self-hosted inference service that speaks the
 /// OpenAI-compatible chat/embeddings routes and the NVIDIA ranking route.
@@ -91,7 +75,6 @@ pub struct CloudModelConfig {
     embed_model: String,
     rerank_model: String,
     request_timeout: Duration,
-    retrieval_mode: RetrievalMode,
     rerank_enabled: bool,
     rerank_candidate_top_k: usize,
     rerank_top_n: usize,
@@ -109,7 +92,6 @@ impl fmt::Debug for CloudModelConfig {
             .field("embed_model", &self.embed_model)
             .field("rerank_model", &self.rerank_model)
             .field("request_timeout", &self.request_timeout)
-            .field("retrieval_mode", &self.retrieval_mode)
             .field("rerank_enabled", &self.rerank_enabled)
             .field("rerank_candidate_top_k", &self.rerank_candidate_top_k)
             .field("rerank_top_n", &self.rerank_top_n)
@@ -185,15 +167,6 @@ impl CloudModelConfig {
                 })?,
             None => DEFAULT_TIMEOUT_SECS,
         };
-        let retrieval_mode = match optional_value(&mut get, "RETRIEVAL_MODE").as_deref() {
-            None | Some("hybrid") => RetrievalMode::Hybrid,
-            Some("dense") => RetrievalMode::Dense,
-            Some(_) => {
-                return Err(CloudModelConfigError(
-                    "RETRIEVAL_MODE must be hybrid or dense".to_string(),
-                ));
-            }
-        };
         let rerank_enabled = match optional_value(&mut get, "RERANK_ENABLED").as_deref() {
             None | Some("true") => true,
             Some("false") => false,
@@ -236,7 +209,6 @@ impl CloudModelConfig {
             embed_model,
             rerank_model,
             request_timeout: Duration::from_secs(timeout_secs),
-            retrieval_mode,
             rerank_enabled,
             rerank_candidate_top_k,
             rerank_top_n,
@@ -270,10 +242,6 @@ impl CloudModelConfig {
 
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
-    }
-
-    pub fn retrieval_mode(&self) -> RetrievalMode {
-        self.retrieval_mode
     }
 
     pub fn rerank_enabled(&self) -> bool {
@@ -829,7 +797,6 @@ pub struct CloudModelClient {
     embed_model: String,
     rerank_model: String,
     request_timeout: Duration,
-    retrieval_mode: RetrievalMode,
     rerank_enabled: bool,
     rerank_candidate_top_k: usize,
     rerank_top_n: usize,
@@ -859,7 +826,6 @@ impl CloudModelClient {
             embed_model: config.embed_model,
             rerank_model: config.rerank_model,
             request_timeout: config.request_timeout,
-            retrieval_mode: config.retrieval_mode,
             rerank_enabled: config.rerank_enabled,
             rerank_candidate_top_k: config.rerank_candidate_top_k,
             rerank_top_n: config.rerank_top_n,
@@ -885,7 +851,6 @@ impl CloudModelClient {
             embed_model: DEFAULT_EMBED_MODEL_ID.to_string(),
             rerank_model: DEFAULT_RERANK_MODEL_ID.to_string(),
             request_timeout: Duration::from_secs(1),
-            retrieval_mode: RetrievalMode::Hybrid,
             rerank_enabled: true,
             rerank_candidate_top_k: DEFAULT_RERANK_CANDIDATE_TOP_K,
             rerank_top_n: DEFAULT_RERANK_TOP_N,
@@ -1006,10 +971,6 @@ impl CloudModelClient {
 
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
-    }
-
-    pub fn retrieval_mode(&self) -> RetrievalMode {
-        self.retrieval_mode
     }
 
     pub fn rerank_enabled(&self) -> bool {
@@ -2262,7 +2223,6 @@ mod tests {
             embed_model: DEFAULT_EMBED_MODEL_ID.to_owned(),
             rerank_model: DEFAULT_RERANK_MODEL_ID.to_owned(),
             request_timeout: Duration::from_secs(1),
-            retrieval_mode: RetrievalMode::Hybrid,
             rerank_enabled: true,
             rerank_candidate_top_k: DEFAULT_RERANK_CANDIDATE_TOP_K,
             rerank_top_n: DEFAULT_RERANK_TOP_N,
@@ -2566,43 +2526,27 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_to_hybrid_reranked_retrieval_and_parses_the_switches() {
+    fn config_defaults_to_reranked_retrieval_and_parses_the_rerank_switch() {
         let base = [
             ("GEMMA_4_MODEL_ID", "hosted/gemma-4-production"),
             ("MODEL_BASE_URL", TEST_BASE_URL),
         ];
-        for unset in [
-            &[][..],
-            &[("RETRIEVAL_MODE", ""), ("RERANK_ENABLED", " ")][..],
-        ] {
+        for unset in [&[][..], &[("RERANK_ENABLED", " ")][..]] {
             let config = config_from(&[&base[..], unset].concat()).expect("default retrieval");
-            assert_eq!(config.retrieval_mode(), RetrievalMode::Hybrid);
             assert!(config.rerank_enabled());
+            assert_eq!(config.rerank_candidate_top_k(), 20);
         }
 
-        let config = config_from(
-            &[
-                &base[..],
-                &[("RETRIEVAL_MODE", "dense"), ("RERANK_ENABLED", "false")],
-            ]
-            .concat(),
-        )
-        .expect("dense retrieval without rerank");
-        assert_eq!(config.retrieval_mode(), RetrievalMode::Dense);
+        let config = config_from(&[&base[..], &[("RERANK_ENABLED", "false")]].concat())
+            .expect("dense retrieval without rerank");
         assert!(!config.rerank_enabled());
         let client = CloudModelClient::new(config).expect("cloud client");
-        assert_eq!(client.retrieval_mode(), RetrievalMode::Dense);
         assert!(!client.rerank_enabled());
 
-        for (name, value) in [
-            ("RETRIEVAL_MODE", "bm25"),
-            ("RETRIEVAL_MODE", "Dense"),
-            ("RERANK_ENABLED", "0"),
-            ("RERANK_ENABLED", "no"),
-        ] {
-            let error = config_from(&[&base[..], &[(name, value)]].concat())
-                .expect_err("unknown retrieval switch must fail before startup");
-            assert!(error.to_string().contains(name));
+        for value in ["0", "no", "False"] {
+            let error = config_from(&[&base[..], &[("RERANK_ENABLED", value)]].concat())
+                .expect_err("unknown rerank switch must fail before startup");
+            assert!(error.to_string().contains("RERANK_ENABLED"));
         }
     }
 
@@ -2924,9 +2868,6 @@ mod tests {
                 needs_vision: true,
                 dense_rank: Some(1),
                 dense_score: Some(0.9),
-                bm25_rank: None,
-                bm25_score: None,
-                rrf_score: 0.1,
                 rerank_score: Some(0.8),
                 rerank_rank: Some(1),
             },
@@ -2942,9 +2883,6 @@ mod tests {
                 needs_vision: false,
                 dense_rank: Some(2),
                 dense_score: Some(0.8),
-                bm25_rank: Some(1),
-                bm25_score: Some(2.0),
-                rrf_score: 0.09,
                 rerank_score: Some(0.7),
                 rerank_rank: Some(2),
             },
