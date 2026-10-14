@@ -378,6 +378,11 @@
   display: none;
 }
 
+.msg-stopped {
+  font-size: 14px;
+  color: var(--color-text-muted);
+}
+
 @keyframes typing {
   0%,
   60%,
@@ -445,7 +450,9 @@
 }
 
 .composer-actions {
+  display: flex;
   flex: none;
+  gap: 8px;
   padding-bottom: 1px;
 }
 
@@ -484,6 +491,33 @@
 
 .composer-btn-stop:hover:not(:disabled) {
   background: #000;
+}
+
+.composer-btn-mic {
+  background: var(--color-surface-sunken);
+  color: var(--color-text-secondary);
+}
+
+.composer-btn-mic:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.composer-btn-listening,
+.composer-btn-listening:hover:not(:disabled) {
+  background: var(--color-accent-weak);
+  color: var(--color-accent);
+  box-shadow: 0 0 0 0 var(--color-accent-ring);
+  animation: listening 1.6s infinite ease-out;
+}
+
+@keyframes listening {
+  0% {
+    box-shadow: 0 0 0 0 var(--color-accent-ring);
+  }
+  100% {
+    box-shadow: 0 0 0 10px transparent;
+  }
 }
 
 .composer-hint {
@@ -1717,6 +1751,7 @@
     transition: none;
   }
   .typing span,
+  .composer-btn-listening,
   .status-processing .status-dot,
   .aui-md[data-status="running"] > :last-child::after,
   .spinner {

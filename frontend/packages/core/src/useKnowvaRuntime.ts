@@ -5,7 +5,11 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { useLocalRuntime, useRemoteThreadListRuntime } from "@assistant-ui/react";
+import {
+  useLocalRuntime,
+  useRemoteThreadListRuntime,
+  WebSpeechDictationAdapter,
+} from "@assistant-ui/react";
 import type { AssistantRuntime } from "@assistant-ui/react";
 import { BackendAdapter } from "./BackendAdapter";
 import { ConversationSync } from "./conversationAdapter";
@@ -58,8 +62,18 @@ export type KnowvaRuntime = {
   history: ConversationHistory;
 };
 
+/**
+ * The browser's own speech recognition, or undefined where it has none; the
+ * thread then reports no dictation capability. One utterance per session: a
+ * continuous session joins its segments with spaces, which zh-TW text never has.
+ */
+const dictation = WebSpeechDictationAdapter.isSupported()
+  ? new WebSpeechDictationAdapter({ language: "zh-TW", continuous: false })
+  : undefined;
+
 // Every conversation still runs the local runtime against /api/chat.
-const useBackendThreadRuntime = () => useLocalRuntime(BackendAdapter);
+const useBackendThreadRuntime = () =>
+  useLocalRuntime(BackendAdapter, { adapters: { dictation } });
 
 const openConversationId = (runtime: AssistantRuntime): string | undefined => {
   const { mainThreadId, threadItems } = runtime.threads.getState();

@@ -1,4 +1,5 @@
 import {
+  AuiIf,
   ThreadPrimitive,
   ComposerPrimitive,
   MessagePrimitive,
@@ -11,6 +12,7 @@ import {
   BrandMark,
   SendIcon,
   StopIcon,
+  MicIcon,
   CompassIcon,
   ListIcon,
   UserIcon,
@@ -262,13 +264,26 @@ const AssistantMessage = () => {
             <ErrorPrimitive.Message />
           </ErrorPrimitive.Root>
         </MessagePrimitive.Error>
-        <MessagePrimitive.If hasContent={false}>
+        <AuiIf
+          condition={(s) =>
+            s.message.status?.type === "running" && s.message.parts.length === 0
+          }
+        >
           <div className="typing" aria-label="思考中">
             <span />
             <span />
             <span />
           </div>
-        </MessagePrimitive.If>
+        </AuiIf>
+        <AuiIf
+          condition={(s) =>
+            s.message.status?.type === "incomplete" &&
+            s.message.status.reason === "cancelled" &&
+            s.message.parts.length === 0
+          }
+        >
+          <p className="msg-stopped">已停止回覆</p>
+        </AuiIf>
       </div>
     </MessagePrimitive.Root>
   );
@@ -283,6 +298,24 @@ const Composer = ({ placeholder }: { placeholder: string }) => (
       maxRows={8}
     />
     <div className="composer-actions">
+      <AuiIf condition={(s) => s.thread.capabilities.dictation}>
+        <AuiIf condition={(s) => s.composer.dictation == null}>
+          <ComposerPrimitive.Dictate
+            className="composer-btn composer-btn-mic"
+            aria-label="語音輸入"
+          >
+            <MicIcon />
+          </ComposerPrimitive.Dictate>
+        </AuiIf>
+        <AuiIf condition={(s) => s.composer.dictation != null}>
+          <ComposerPrimitive.StopDictation
+            className="composer-btn composer-btn-mic composer-btn-listening"
+            aria-label="停止語音輸入"
+          >
+            <MicIcon />
+          </ComposerPrimitive.StopDictation>
+        </AuiIf>
+      </AuiIf>
       <ThreadPrimitive.If running={false}>
         <ComposerPrimitive.Send className="composer-btn" aria-label="送出">
           <SendIcon />

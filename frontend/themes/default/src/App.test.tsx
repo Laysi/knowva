@@ -17,7 +17,7 @@ const summary = (id: string, title: string, updatedAt: string) => ({
   updatedAt,
 });
 
-type Route = (init?: RequestInit) => Response;
+type Route = (init?: RequestInit) => Response | Promise<Response>;
 let routes: Record<string, Route>;
 
 beforeEach(() => {
@@ -141,5 +141,41 @@ describe("navigation rail", () => {
 
     await waitFor(() => expect(listedTitles()).toEqual([OLDER_TITLE, TITLE]));
     expect(conversationNamed(OLDER_TITLE).textContent).toContain("剛剛");
+  });
+});
+
+const ask = async (question: string) => {
+  const composer = await screen.findByRole("textbox");
+  fireEvent.change(composer, { target: { value: question } });
+  const send = await screen.findByRole("button", { name: "送出" });
+  await waitFor(() => expect((send as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(send);
+};
+
+describe("composer", () => {
+  it("stops thinking once an answer that has not started is stopped", async () => {
+    routes[`POST /api/conversations/${ID}/messages`] = () =>
+      Response.json({ conversation: summary(ID, TITLE, new Date().toISOString()) });
+    // Like fetch, the request rejects with the abort reason once stopped.
+    routes["POST /api/chat"] = (init) =>
+      new Promise((_, reject) => {
+        const signal = init?.signal;
+        signal?.addEventListener("abort", () => reject(signal.reason));
+      });
+    render(<App />);
+
+    await ask("倉儲有哪些規定？");
+    await screen.findByLabelText("思考中");
+    fireEvent.click(screen.getByRole("button", { name: "停止生成" }));
+
+    await screen.findByText("已停止回覆");
+    expect(screen.queryByLabelText("思考中")).toBeNull();
+  });
+
+  it("offers no voice input where the browser has no speech recognition", async () => {
+    render(<App />);
+
+    await screen.findByRole("textbox");
+    expect(screen.queryByRole("button", { name: "語音輸入" })).toBeNull();
   });
 });
