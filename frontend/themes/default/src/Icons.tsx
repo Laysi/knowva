@@ -70,6 +70,14 @@ export const StopIcon = ({ className }: IconProps) => (
   </svg>
 );
 
+export const MicIcon = ({ className }: IconProps) => (
+  <svg {...base} className={className}>
+    <rect x="9" y="3" width="6" height="11" rx="3" />
+    <path d="M5.5 11a6.5 6.5 0 0 0 13 0" />
+    <path d="M12 17.5V21" />
+  </svg>
+);
+
 export const UploadIcon = ({ className }: IconProps) => (
   <svg {...base} className={className}>
     <path d="M21 15v3.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V15" />
